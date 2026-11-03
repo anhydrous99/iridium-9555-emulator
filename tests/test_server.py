@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock
 
 from iridium.firmware import parse_firmware
 from iridium.__main__ import arguments
@@ -61,6 +62,78 @@ class ServerTests(unittest.TestCase):
                 {"Content-Type": "application/json"})
             self.assertEqual(status, 400)
 
+    def key_request(self, client_id, sequence, pressed, epoch=None):
+        status, data, _ = self.request("POST", "/api/key", json.dumps({
+            "key": "1", "pressed": pressed, "client_id": client_id, "sequence": sequence,
+            "epoch": self.session.key_epoch if epoch is None else epoch,
+        }), {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        return json.loads(data)
+
+    def test_two_http_clients_share_ownership_and_pagehide_only_releases_its_owner(self):
+        self.session.engines["bc5"] = self.session.engines["avr"]
+        self.session.engines["bc5"].request = Mock(return_value={"values": [1, 2]})
+        self.session.ui_initialized = True
+        self.session._idle = Mock()
+        self.session._call = Mock()
+        barrier = threading.Barrier(2)
+
+        def press(client):
+            barrier.wait(timeout=2)
+            return self.key_request(client, 1, True)
+
+        with ThreadPoolExecutor(max_workers=2) as clients:
+            results = list(clients.map(press, ("tab-a", "tab-b")))
+        self.assertEqual(sum(result["delivered"] for result in results), 1)
+        # Pagehide sends a newer release even while the original response may be pending.
+        self.assertFalse(self.key_request("tab-a", 3, False)["delivered"])
+        self.key_request("tab-a", 2, True)
+        self.assertEqual(self.session.keys, {"1"})
+        self.assertTrue(self.key_request("tab-b", 2, False)["delivered"])
+        self.assertEqual(self.session.keys, set())
+        self.assertTrue(self.key_request("fresh-tab", 1, True)["delivered"])
+        self.assertTrue(self.key_request("fresh-tab", 2, False)["delivered"])
+        self.assertEqual([call.kwargs["ah"] for call in self.session._call.call_args_list], [1, 4, 1, 4])
+
+    def test_http_release_before_delayed_press_and_reset_epoch(self):
+        epoch = self.session.key_epoch
+        self.key_request("tab-a", 2, False)
+        self.key_request("tab-a", 1, True)
+        self.assertEqual(self.session.keys, set())
+        self.key_request("tab-b", 1, True)
+        self.key_request("tab-a", 3, True)
+        status, data, _ = self.request("POST", "/api/control", '{"action":"reset"}',
+                                       {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["key_epoch"], epoch + 1)
+        self.key_request("tab-a", 4, True, epoch)
+        self.assertEqual(self.session.keys, set())
+        self.key_request("tab-b", 2, True)
+        self.key_request("tab-b", 3, False, epoch)
+        self.assertEqual(self.session.keys, {"1"})
+        status, data, _ = self.request("GET", "/api/state")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["key_epoch"], epoch + 1)
+
+    def test_browser_key_request_bounds_and_client_capacity(self):
+        valid = {"key": "1", "pressed": True, "client_id": "tab", "sequence": 1, "epoch": 0}
+        for invalid in ({"client_id": ""}, {"client_id": "a" * 65}, {"client_id": "ü"},
+                        {"client_id": "bad id"}, {"client_id": []}, {"sequence": True},
+                        {"sequence": 0}, {"sequence": 2**53}, {"sequence": 1.5},
+                        {"sequence": None}, {"epoch": -1}, {"epoch": True},
+                        {"epoch": 2**53}, {"epoch": None}, {"generation": 0}):
+            with self.subTest(invalid=invalid):
+                status, data, _ = self.request("POST", "/api/key", json.dumps(valid | invalid),
+                                               {"Content-Type": "application/json"})
+                self.assertEqual(status, 400, data)
+        for client in range(128):
+            self.key_request(f"tab-{client}", 2, False)
+        status, data, _ = self.request("POST", "/api/key", json.dumps(valid),
+                                       {"Content-Type": "application/json"})
+        self.assertEqual(status, 400, data)
+        self.assertIn("128", json.loads(data)["error"])
+        self.assertEqual(self.session.keys, set())
+
     def test_network_binding_and_matching_origin_use_the_connection_destination(self):
         self.assertEqual(arguments([]).host, "0.0.0.0")
         self.assertEqual(arguments(["--host", "127.0.0.1"]).host, "127.0.0.1")
@@ -112,3 +185,4 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+from concurrent.futures import ThreadPoolExecutor

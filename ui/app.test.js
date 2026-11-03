@@ -2,6 +2,7 @@
 
 // Input and rendering checks without a browser or third-party DOM implementation.
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto").webcrypto;
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -45,7 +46,17 @@ class Element {
   }
 }
 
-async function fixture(keyResponse) {
+function emptyState() {
+  return { firmware: null, images: [], processors: [], satellite: null, events: [], running: false, key_epoch: 0 };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function fixture(keyResponse, stateResponse) {
   const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map((match) => [match[1], new Element()]));
   const buttons = [...html.matchAll(/data-key="([^"]+)"/g)].map((match) => {
     const button = new Element();
@@ -72,23 +83,32 @@ async function fixture(keyResponse) {
   document.activeElement = null;
   const calls = [];
   const requests = [];
+  const stateCalls = [];
   const context = vm.createContext({
-    document, window, Intl, AbortSignal: { timeout: () => undefined },
+    document, window, Intl, crypto, AbortSignal: { timeout: () => undefined },
     setTimeout: () => 1, clearTimeout() {},
     fetch: async (url, options = {}) => {
-      if (url === "/api/state") return { ok: true, json: async () => ({ firmware: null, processors: [], satellite: null, events: [], running: false }) };
-      const body = JSON.parse(options.body);
+      if (url === "/api/state") {
+        stateCalls.push(url);
+        const state = stateResponse ? await stateResponse() : emptyState();
+        return { ok: true, json: async () => state };
+      }
+      const body = url === "/api/firmware" ? options.body : JSON.parse(options.body);
       calls.push({ url, body });
       requests.push(options);
-      const response = keyResponse ? await keyResponse(body) : null;
+      const response = keyResponse ? await keyResponse(body, url) : null;
       const result = response || { message: "Recorded; wiring unresolved", delivered: false };
       return { ok: true, json: async () => url === "/api/key"
-        ? { generation: body.generation + (body.pressed ? 0 : 1), ...result } : result };
+        ? { key_epoch: body.epoch, ...result } : result };
     },
   });
   vm.runInContext(source, context);
   await vm.runInContext("refreshState()", context);
-  return { context, calls, requests, window, elements, buttons, run: (code) => vm.runInContext(code, context) };
+  return { context, calls, requests, stateCalls, window, document, elements, buttons, run: (code) => vm.runInContext(code, context) };
+}
+
+function keyEvent(app, key, pressed, sequence, epoch = 0) {
+  return { key, pressed, client_id: app.run("clientId"), sequence, epoch };
 }
 
 test("markup has one of every physical handset control and unique IDs", () => {
@@ -104,12 +124,12 @@ test("keyboard and pointer ownership prevent premature key release", async () =>
   const app = await fixture();
   app.run("pressKey('2', 'pointer:1'); pressKey('2', 'keyboard:Digit2'); releaseKey('pointer:1')");
   await app.run("keyQueue");
-  assert.deepEqual(app.calls.map((call) => call.body), [{ key: "2", pressed: true, generation: 0 }]);
+  assert.deepEqual(app.calls.map((call) => call.body), [keyEvent(app, "2", true, 1)]);
   assert.ok(app.buttons.find((button) => button.dataset.key === "2").classes.has("held"));
   app.run("releaseKey('keyboard:Digit2')");
   await app.run("keyQueue");
   assert.deepEqual(app.calls.map((call) => call.body), [
-    { key: "2", pressed: true, generation: 0 }, { key: "2", pressed: false, generation: 0 },
+    keyEvent(app, "2", true, 1), keyEvent(app, "2", false, 2),
   ]);
 });
 
@@ -132,23 +152,24 @@ test("pagehide cancels queued presses and immediately releases an in-flight pres
   app.run("pressKey('1', 'keyboard:Digit1')");
   await Promise.resolve();
   app.run("pressKey('2', 'keyboard:Digit2')");
+  const oldQueue = app.run("keyQueue");
   app.window.listeners.get("pagehide")();
   assert.deepEqual(app.calls.map((call) => call.body), [
-    { key: "1", pressed: true, generation: 0 },
-    { key: "1", pressed: false, generation: 0 },
+    keyEvent(app, "1", true, 1),
+    keyEvent(app, "1", false, 3),
   ], "Cleanup is sent before the pending press promise settles");
   assert.ok(app.requests.every((options) => options.keepalive === true));
   assert.ok(app.buttons.every((button) => !button.classes.has("held")));
   // Restoring the page must not revive the old queued press.
   app.window.listeners.get("pageshow")({ persisted: true });
   finishPress();
-  await app.run("keyQueue");
+  await oldQueue;
   assert.equal(app.calls.length, 2);
   app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
   await app.run("keyQueue");
   assert.deepEqual(app.calls.slice(2).map((call) => call.body), [
-    { key: "1", pressed: true, generation: 1 },
-    { key: "1", pressed: false, generation: 1 },
+    keyEvent(app, "1", true, 4),
+    keyEvent(app, "1", false, 5),
   ]);
 });
 
@@ -159,23 +180,143 @@ test("pagehide releases submitted keys even after blur cleared their local owner
   app.run("pressKey('1', 'keyboard:Digit1')");
   await Promise.resolve();
   app.window.listeners.get("blur")();
+  const oldQueue = app.run("keyQueue");
   app.window.listeners.get("pagehide")();
   assert.deepEqual(app.calls.map((call) => call.body.pressed), [true, false]);
   assert.equal(app.requests[1].keepalive, true);
   finishPress();
-  await app.run("keyQueue");
+  await oldQueue;
   assert.equal(app.calls.length, 2);
 });
 
-test("key generations follow server state and never regress on an older poll", async () => {
+test("pagehide cleanup keeps the submitted epoch and a newer sequence", async () => {
+  const press = deferred();
+  const app = await fixture((body) => body.pressed ? press.promise : undefined);
+  app.run("renderState({key_epoch:7}); pressKey('1', 'keyboard:Digit1')");
+  await Promise.resolve();
+  app.window.listeners.get("blur")();
+  const oldQueue = app.run("keyQueue");
+  app.window.listeners.get("pagehide")();
+  assert.deepEqual(app.calls.map((call) => call.body), [
+    keyEvent(app, "1", true, 1, 7), keyEvent(app, "1", false, 3, 7),
+  ]);
+  press.resolve();
+  await oldQueue;
+});
+
+test("an epoch advance cancels old queued and submitted keys without waiting or reviving them", async () => {
+  const press = deferred();
+  const app = await fixture((body) => body.sequence === 1 ? press.promise : undefined);
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await Promise.resolve();
+  app.run("pressKey('2', 'keyboard:Digit2'); releaseKey('keyboard:Digit1')");
+  const oldQueue = app.run("keyQueue");
+  app.run("renderState({key_epoch:1}); renderState({key_epoch:0})");
+  assert.equal(app.run("keyEpoch"), 1, "An older poll cannot regress the epoch");
+  assert.ok(app.buttons.every((button) => !button.classes.has("held")));
+  assert.equal(app.run("heldSources.size + submittedKeys.size"), 0);
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.map((call) => call.body), [
+    keyEvent(app, "1", true, 1), keyEvent(app, "1", true, 4, 1),
+  ], "A fresh press uses the new epoch while the old response is still pending");
+  press.resolve({ key_epoch: 0 });
+  await oldQueue;
+  assert.equal(app.calls.length, 2, "Old queued events stay cancelled after the delayed response arrives");
+  app.window.listeners.get("pagehide")();
+  assert.deepEqual(app.calls.at(-1).body, keyEvent(app, "1", false, 5, 1), "The old response cannot remove the fresh held press");
+});
+
+test("a stale key response advances the epoch and cancels the queued tap without resubmitting", async () => {
+  const app = await fixture(() => ({ key_epoch: 1, delivered: false, message: "Stale key epoch ignored" }));
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1'); pressKey('2', 'keyboard:Digit2')");
+  const queued = app.run("keyQueue");
+  await queued;
+  assert.deepEqual(app.calls.map((call) => call.body), [keyEvent(app, "1", true, 1)]);
+  assert.equal(app.run("keyEpoch"), 1);
+  assert.equal(app.run("heldSources.size + submittedKeys.size"), 0);
+  assert.ok(app.buttons.every((button) => !button.classes.has("held")));
+});
+
+test("pages have independent IDs and sequences regardless of other clients' generations", async () => {
   const app = await fixture();
-  app.run("renderState({key_generations:{'1':7}}); renderState({key_generations:{'1':6}})");
+  app.run("renderState({key_generations:{'1':7},key_epoch:0})");
   app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
   await app.run("keyQueue");
-  assert.deepEqual(app.calls.map((call) => call.body.generation), [7, 7]);
+  const fresh = await fixture(undefined, () => ({ ...emptyState(), key_generations: { 1: 999 } }));
+  assert.notEqual(app.run("clientId"), fresh.run("clientId"));
+  fresh.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await fresh.run("keyQueue");
+  assert.deepEqual(fresh.calls.map((call) => call.body), [keyEvent(fresh, "1", true, 1), keyEvent(fresh, "1", false, 2)]);
   app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
   await app.run("keyQueue");
-  assert.deepEqual(app.calls.slice(2).map((call) => call.body.generation), [8, 8]);
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 3, 4]);
+  assert.ok([...app.calls, ...fresh.calls].every((call) => !("generation" in call.body)));
+});
+
+test("actions wait for a state request issued after a delayed older poll", async () => {
+  let nextState;
+  const app = await fixture(undefined, () => nextState ? nextState() : emptyState());
+  const old = deferred();
+  const fresh = deferred();
+  nextState = () => old.promise;
+  const poll = app.run("refreshState()");
+  const getCount = app.stateCalls.length;
+  let completed = false;
+  const mutation = app.run("action(element('run-button'), () => post('/api/control', {action:'run'}))").then(() => { completed = true; });
+  await new Promise(setImmediate);
+  assert.equal(app.calls.at(-1).url, "/api/control");
+  assert.equal(app.stateCalls.length, getCount, "The action waits for the older GET before requesting another");
+  assert.equal(app.elements.get("run-button").disabled, true);
+  nextState = () => fresh.promise;
+  old.resolve(emptyState());
+  await poll;
+  await new Promise(setImmediate);
+  assert.equal(app.stateCalls.length, getCount + 1, "The old poll is followed by a new GET");
+  assert.equal(completed, false, "The action cannot finish on the older state");
+  assert.equal(app.elements.get("run-button").disabled, true);
+  fresh.resolve({ ...emptyState(), running: true });
+  await mutation;
+  assert.equal(completed, true);
+  assert.equal(app.elements.get("run-button").disabled, false);
+  assert.equal(app.elements.get("runtime-status").textContent, "RUNNING");
+  assert.equal(app.elements.get("run-button").dataset.action, "pause");
+});
+
+test("all loaded image identities update when an auxiliary processor image changes", async () => {
+  const app = await fixture();
+  const images = ["bc5", "avr", "trx", "ptt"].map((image) => ({ image, name: `${image}.bin`, sha256: image.repeat(64).slice(0, 64) }));
+  const initial = { ...emptyState(), firmware: images[0], images, processors: images.map(({ image }) => ({ image })) };
+  app.context.state = initial;
+  app.run("renderState(state)");
+  const list = app.elements.get("firmware-images");
+  assert.match(html, /<ul[^>]+id="firmware-images"[^>]+aria-label="Loaded firmware images"/);
+  assert.equal(list.children.length, 4);
+  for (const [index, item] of list.children.entries()) {
+    assert.equal(item.children[0].textContent, `${images[index].name} (${images[index].image})`);
+    assert.equal(item.children[1].textContent, `SHA-256: ${images[index].sha256}`);
+  }
+  const updated = { ...images[1], name: "avr-patched.bin", sha256: "f".repeat(64) };
+  app.context.state = { ...initial, images: images.map((image) => image.image === "avr" ? updated : image) };
+  app.run("renderState(state)");
+  assert.equal(app.elements.get("firmware-name").textContent, "bc5.bin");
+  assert.equal(list.children[1].children[0].textContent, "avr-patched.bin (avr)");
+  assert.equal(list.children[1].children[1].textContent, `SHA-256: ${updated.sha256}`);
+  assert.equal(list.children[0].children[1].textContent, `SHA-256: ${images[0].sha256}`);
+});
+
+test("an auxiliary upload preserves local held keys until an epoch actually changes", async () => {
+  const app = await fixture((body, url) => url === "/api/firmware" ? { message: "Loaded avr.bin", key_epoch: 0 } : undefined);
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("keyQueue");
+  const input = app.elements.get("firmware-input");
+  input.files = [{ name: "avr.bin", size: 8678 }];
+  await input.listeners.get("change")({ currentTarget: input });
+  assert.deepEqual(app.calls.filter((call) => call.url === "/api/key").map((call) => call.body), [keyEvent(app, "1", true, 1)]);
+  assert.ok(app.buttons.find((button) => button.dataset.key === "1").classes.has("held"));
+  app.run("releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.at(-1).body, keyEvent(app, "1", false, 2));
 });
 
 test("serial capture loss is visible in the processor row", async () => {
@@ -192,8 +333,8 @@ test("lost window focus releases all keys exactly once", async () => {
   app.run("releaseKey('keyboard:Digit1'); releaseKey('pointer:7')");
   await app.run("keyQueue");
   assert.deepEqual(app.calls.map((call) => call.body), [
-    { key: "1", pressed: true, generation: 0 }, { key: "up", pressed: true, generation: 0 },
-    { key: "1", pressed: false, generation: 0 }, { key: "up", pressed: false, generation: 0 },
+    keyEvent(app, "1", true, 1), keyEvent(app, "up", true, 2),
+    keyEvent(app, "1", false, 3), keyEvent(app, "up", false, 4),
   ]);
 });
 
@@ -208,7 +349,7 @@ test("shifted number key uses the physical code for release; forms keep their ty
   down({ key: "5", code: "Digit5", target, preventDefault() { assert.fail("Form input was intercepted"); } });
   await app.run("keyQueue");
   assert.deepEqual(app.calls.map((call) => call.body), [
-    { key: "*", pressed: true, generation: 0 }, { key: "*", pressed: false, generation: 0 },
+    keyEvent(app, "*", true, 1), keyEvent(app, "*", false, 2),
   ]);
 });
 

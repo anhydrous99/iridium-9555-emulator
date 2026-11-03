@@ -163,13 +163,26 @@ Mutations use `POST` with `Content-Type: application/json`:
 | `/api/satellite` | `{"action":"incoming_call","number":"+881612345678"}`; also `answer`, `hangup` |
 | `/api/satellite` | `{"action":"incoming_sms","number":"123","text":"Test"}` |
 
-Browser key requests include the key's `generation` from `key_generations` in
-state. Responses return its current generation. A successful release advances
-that number, even if the key was already up, so an older press arriving later
-is ignored. Reset and image replacement advance all key generations. The browser
-cancels unsent events on navigation and immediately sends keepalive releases for
-submitted presses, including ones still waiting for a response. Omitting
+Browser key requests add `client_id`, `sequence` and `epoch`, for example
+`{"key":"1","pressed":true,"client_id":"page-abc","sequence":1,"epoch":0}`.
+Each page generates a unique ID and increasing sequence; each queued event
+captures `key_epoch` from state. The host compares sequences per client and key,
+including releases that arrive before their press. Only the first owner presses
+the guest key and only the last owner's release releases it. State, key, control
+and firmware responses expose `key_epoch`. Reset or loading BC5 advances the epoch,
+clears owners and cancels older requests; auxiliary image loads preserve keypad
+state. A page cancels queued events and local held sources when the epoch advances,
+without retrying stale events. Navigation cancels unsent events and immediately
+sends keepalive releases with newer sequences and the submitted presses' epochs.
+Client IDs contain 1–64 ASCII letters, digits, underscores or hyphens; sequences
+are integers from 1 to 2^53−1 and epochs from 0 to 2^53−1. The host retains at most
+128 clients until reset (or BC5 load), returning an explicit error at that limit.
+
+Debugger callers may instead send the legacy `generation` from `key_generations`.
+A legacy release advances that key's generation even when already up, cancelling
+older legacy presses. Reset and BC5 loading advance all generations. Omitting
 `generation` retains the simple debugger API without stale-request protection.
+Legacy requests own a separate source and cannot release browser-owned keys.
 Held-key state changes only after the original key routine returns; a failure
 before injection can be retried, while a later scheduler failure does not cause
 the same transition to be injected twice.
