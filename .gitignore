@@ -3,6 +3,8 @@ zig-out/
 __pycache__/
 *.pyc
 .venv/
+# User-supplied firmware and upgrade packages stay outside version control.
+firmware/
 *.bin
 *.dfu
 *.hex
