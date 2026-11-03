@@ -212,6 +212,14 @@ application LCD output without application probes after that reset. They also
 exercise the actual interrupt wrapper, nested interrupts and debugger probes
 with hardware enabled on both models.
 
+Debugger argument blocks also reserve the wrapper's two saves at `Y-34` and
+`Y-35`, below the CPU interrupt frame. Probes leave `35 + argument_count`
+words below the supervisor stack. Original-wrapper regressions verify three
+and 32 arguments on both profiles. REA decoder capture
+`ev_d19c3fba099f4d63602a900666c8bcdd2655a8a72db039002f0c14221c338c29`
+records the original stores at image bytes `0x0A` and `0x20`; it observes
+instruction decoding, while the regressions independently execute the wrapper.
+
 The power-button input is active-low: logical AVR PC0 maps to physical PC0
 on 9555 and PJ3 on 9575. The adjacent logical PC1/PD4 inputs map to PC1/PD4
 and PJ4/PJ5 respectively. Inactive fixtures are PC0=1, PC1=0, PD4=1 in the

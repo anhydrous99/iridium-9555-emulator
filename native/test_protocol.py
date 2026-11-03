@@ -714,6 +714,32 @@ class OriginalBc5HardwareTests(unittest.TestCase):
                 self.assertEqual(engine.request("read", address=label, count=4)["values"], list(map(ord, "GRev")))
                 self.assertGreater(lcd_bytes, 43)
 
+    def test_original_irq_wrapper_preserves_short_and_maximum_probe_argument_lists(self):
+        import sys
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from iridium.engine import Engine
+
+        for model, directory, _, _ in self.profiles():
+            entry = 0xDC040 if model == "9555" else 0xFEF92
+            for count in (3, 32):
+                with self.subTest(model=model, count=count), tempfile.TemporaryDirectory() as temporary:
+                    data = bytearray((directory / "bc5_main.bin").read_bytes())
+                    data[entry:entry + 4] = (((count - 1) << 8) | 0x17).to_bytes(2, "little") + b"\xe2\0"
+                    path = Path(temporary) / "probe.bin"
+                    path.write_bytes(data)
+                    with Engine(ENGINE, "bc5", path, model=model) as engine:
+                        self.reach_idle(engine)
+                        for target, ah in ((0x6590, 3), (0x65E6, 1)):
+                            self.assertTrue(engine.request("call", entry=target, al=1, ah=ah,
+                                                           steps=10000)["last_call"]["returned"])
+                        arguments = [0x1100 + n for n in range(count)]
+                        engine.request("irq", source=1)
+                        result = engine.request("call", entry=entry, stack=arguments, steps=10000)
+                        self.assertTrue(result["last_call"]["returned"])
+                        self.assertEqual(result["last_call"]["al"], arguments[-1])
+                        self.assertIsNone(result["halt"])
+
     def test_original_debugger_ui_initialization_keeps_probe_stack_below_irq_frame(self):
         # Function probes and hardware interrupts must use separate supervisor-stack space.
         import sys

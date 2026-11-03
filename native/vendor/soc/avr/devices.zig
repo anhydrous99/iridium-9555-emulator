@@ -280,7 +280,6 @@ pub const State = extern struct {
     adc_held: u16 = 0,
     adc_sampled: u8 = 0,
     adc_mux: u8 = 0,
-    adc_left: u8 = 0,
     adc_locked: u8 = 0,
     /// Timer2 output compare B (the OC2B waveform, PD6 while COM2B drives the pin).
     oc2b: u8 = 0,
@@ -776,6 +775,13 @@ pub const Devices = struct {
                 port = (port & ~bit) | (d.st.timer[n].output[c] << out.bit);
             }
         };
+        if (d.mega and p == 1 and d.output8Enabled(0, 0) and d.output16Enabled(0, 2)) {
+            const level = if (d.st.io[port_bases[1] + 2] & 0x80 != 0)
+                d.st.oc0[0] | d.st.timer[0].output[2]
+            else
+                d.st.oc0[0] & d.st.timer[0].output[2];
+            port = (port & 0x7F) | (level << 7);
+        }
         return (ddr & port) | (~ddr & d.st.pins_in[p]);
     }
 
@@ -854,10 +860,18 @@ pub const Devices = struct {
         switch (d.registerAccess(a)) {
             .tape => return,
             .store => {
+                const previous = d.st.io[a];
                 d.st.io[a] = v;
+                if (a == ADMUX and (previous ^ v) & 0x20 != 0) {
+                    const encoded = @as(u16, d.st.io[ADCL]) | @as(u16, d.st.io[ADCH]) << 8;
+                    const sample = if (previous & 0x20 != 0) encoded >> 6 else encoded;
+                    const adjusted = if (v & 0x20 != 0) sample << 6 else sample;
+                    d.st.io[ADCL] = @truncate(adjusted);
+                    d.st.io[ADCH] = @truncate(adjusted >> 8);
+                }
                 if (a == PCMSK0 or a == 0x6C or a == 0x6D or a == PCMSK3) d.pinChange();
                 if (a == EICRA or a == EICRB) d.externalInterrupts();
-                if (a == ADMUX or a == ADCSRB) d.comparatorRefresh();
+                if (a == ADMUX or a == ADCSRB or (a == PRR and (previous ^ v) & PRADC != 0)) d.comparatorRefresh();
                 if (a == TCCR0A or a == TCCR2A) {
                     d.pinChange();
                     d.owDrive();
@@ -1202,16 +1216,18 @@ pub const Devices = struct {
     fn timerPinEdges(d: *Devices) void {
         if (!d.ioRunning()) return;
         const level0 = d.timerClockLevel(0);
-        const clock0 = d.st.io[TCCR0B] & 7;
-        if (level0 != d.st.external0 and (clock0 == 6 or clock0 == 7) and level0 == clock0 - 6 and d.st.io[PRR] & PRTIM0 == 0) d.timer8(0, 1);
+        const previous0 = d.st.external0;
         d.st.external0 = level0;
+        const clock0 = d.st.io[TCCR0B] & 7;
+        if (level0 != previous0 and (clock0 == 6 or clock0 == 7) and level0 == clock0 - 6 and d.st.io[PRR] & PRTIM0 == 0) d.timer8(0, 1);
         for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
             const t = &d.st.timer[n];
             const level = d.timerClockLevel(n + 1);
-            const clock = d.st.io[base + 1] & 7;
-            const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
-            if (level != t.external_last and (clock == 6 or clock == 7) and level == clock - 6 and d.st.io[if (n == 0) @as(usize, PRR) else 0x65] & power == 0) d.timer16(n, 1);
+            const previous = t.external_last;
             t.external_last = level;
+            const clock = d.st.io[base + 1] & 7;
+            if (level != previous and (clock == 6 or clock == 7) and level == clock - 6 and d.timerPowered(n)) d.timer16(n, 1);
+            if (!d.timerPowered(n)) continue;
             const capture = d.captureLevel(n);
             if (capture != t.capture_candidate) {
                 t.capture_candidate = capture;
@@ -1219,6 +1235,11 @@ pub const Devices = struct {
             }
             if (d.st.io[base + 1] & 0x80 == 0) d.captureEdge(n, capture);
         }
+    }
+
+    fn timerPowered(d: *const Devices, n: usize) bool {
+        const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
+        return d.st.io[if (n == 0) @as(usize, PRR) else 0x65] & power == 0;
     }
 
     fn captureEdge(d: *Devices, n: usize, level: u8) void {
@@ -1324,7 +1345,6 @@ pub const Devices = struct {
         const conv: u32, const sh: u32 = if (d.st.adc_first != 0) .{ 50, 27 } else if (auto) .{ 27, 4 } else .{ 26, 3 };
         const half = ps[io[ADCSRA] & 7] / 2;
         d.st.adc_mux = (io[ADMUX] & 0x1F) | (if (d.mega) (io[ADCSRB] & 8) << 2 else @as(u8, 0));
-        d.st.adc_left = io[ADMUX] & 0x20;
         d.st.adc_first = 0;
         d.st.adc_busy = conv * half;
         d.st.adc_hold = (conv - sh) * half;
@@ -1335,7 +1355,7 @@ pub const Devices = struct {
     fn adcDone(d: *Devices) void {
         const io = &d.st.io;
         const v = d.st.adc_held;
-        const res: u16 = if (d.st.adc_left != 0) v << 6 else v;
+        const res: u16 = if (io[ADMUX] & 0x20 != 0) v << 6 else v;
         if (d.st.adc_locked == 0) {
             io[ADCL] = @truncate(res);
             io[ADCH] = @truncate(res >> 8);
@@ -1600,13 +1620,12 @@ pub const Devices = struct {
         const flags1 = io[TIFR1];
         if (io[PRR] & PRTIM0 == 0) d.timer8(0, ticks(old01, d.st.pre01, div01[io[TCCR0B] & 7]));
         for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
-            const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
-            if (io[if (n == 0) @as(usize, PRR) else 0x65] & power == 0)
+            if (d.timerPowered(n))
                 d.timer16(n, ticks(old01, d.st.pre01, div01[io[base + 1] & 7]));
         }
         if (d.timer2Running() and io[PRR] & PRTIM2 == 0 and io[ASSR] & 0x20 == 0) d.timer8(2, ticks(old2, d.st.pre2, div2[io[TCCR2B] & 7]));
         for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
-            if (d.ioRunning() and io[base + 1] & 0x80 != 0) {
+            if (d.ioRunning() and d.timerPowered(n) and io[base + 1] & 0x80 != 0) {
                 const t = &d.st.timer[n];
                 t.capture_cycles +|= @intCast(@min(cycles, 4));
                 if (t.capture_cycles >= 4) d.captureEdge(n, t.capture_candidate);
@@ -1881,6 +1900,7 @@ pub const Devices = struct {
                         if (wgm == 8 or wgm == 9) t.compare = t.buffered;
                     }
                 }
+                if ((wgm == 8 or wgm == 10) and !was_down and t.count == top) flags |= 0x20;
             } else if (old == top) {
                 t.count = 0;
                 if (!ctc or top == 0xFFFF) flags |= 1;
@@ -2645,6 +2665,168 @@ test "external timer clocks and noise-cancelled capture use actual model pins" {
     small.setPinsIn(1, 3);
     small.setPinsIn(1, 1);
     try testing.expectEqual(@as(u16, 1), small.st.timer[0].count);
+}
+
+test "external compare outputs consume each clock edge once, including zero-TOP CTC" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]bool{ false, true }) |ctc| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            const clock_port: u4 = if (mega) 3 else 1;
+            const clock_bit: u8 = if (mega) 0x80 else 1;
+            const out = d.output8Pin(0, 0);
+            const out_bit = @as(u8, 1) << out.bit;
+            d.write(port_bases[out.port] + 1, out_bit);
+            d.write(TCCR0A, if (ctc) 0x42 else 0x40);
+            d.write(OCR0A, 0);
+            d.write(TCCR0B, 7);
+            d.setPinsIn(clock_port, clock_bit);
+            try testing.expectEqual(@as(u8, if (ctc) 0 else 1), d.read(TCNT0));
+            try testing.expectEqual(out_bit, d.pin(out.port) & out_bit);
+            d.setPinsIn(clock_port, clock_bit);
+            try testing.expectEqual(@as(u8, if (ctc) 0 else 1), d.read(TCNT0));
+            for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
+                var timer: Devices = .{ .mega = mega };
+                timer.reset();
+                const port: u4 = if (!mega) 1 else ([_]u4{ 3, 4, 7, 10 })[n];
+                const bit: u8 = if (!mega) 2 else ([_]u8{ 0x40, 0x40, 0x80, 4 })[n];
+                const output = timer.output16Pin(n, 0);
+                const output_bit = @as(u8, 1) << output.bit;
+                timer.write(port_bases[output.port] + 1, output_bit);
+                timer.write(base, 0x40);
+                timer.write(base + 1, if (ctc) 0x0F else 7);
+                timer.setPinsIn(port, bit);
+                try testing.expectEqual(@as(u16, if (ctc) 0 else 1), timer.st.timer[n].count);
+                try testing.expectEqual(output_bit, timer.pin(output.port) & output_bit);
+                timer.setPinsIn(port, bit);
+                try testing.expectEqual(@as(u16, if (ctc) 0 else 1), timer.st.timer[n].count);
+            }
+        }
+    }
+}
+
+test "power reduction stops both capture paths on every available 16-bit timer" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]bool{ false, true }) |noise| {
+            const count: usize = if (mega) 4 else 1;
+            for (timer16_bases[0..count], 0..) |base, n| {
+                var d: Devices = .{ .mega = mega };
+                d.reset();
+                const port: u4 = if (!mega) 3 else ([_]u4{ 3, 4, 10, 10 })[n];
+                const bit: u8 = if (!mega) 0x40 else ([_]u8{ 0x10, 0x80, 1, 2 })[n];
+                const power_register: u16 = if (n == 0) PRR else 0x65;
+                const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
+                d.write(base + 1, if (noise) 0xC1 else 0x41);
+                d.write(timer16_masks[n], 0x20);
+                d.write(power_register, power);
+                d.setPinsIn(port, bit);
+                d.tick(10);
+                try testing.expectEqual(@as(u8, 0), d.read(timer16_flags[n]) & 0x20);
+                try testing.expectEqual(@as(?u8, null), d.pending());
+                d.write(power_register, 0);
+                d.setPinsIn(port, 0);
+                d.tick(4);
+                d.setPinsIn(port, bit);
+                d.tick(4);
+                try testing.expectEqual(@as(u8, 0x20), d.read(timer16_flags[n]) & 0x20);
+                try testing.expectEqual(@as(?u8, d.timerVector(n)), d.pending());
+            }
+        }
+    }
+}
+
+test "ADC alignment is live during and after conversion without changing the latched channel" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.setAnalog(0, 0x2AB);
+        d.setAnalog(1, 1);
+        d.write(ADCSRA, 0xC0);
+        d.write(ADMUX, 0x21); // Change alignment and select the next channel.
+        d.tick(50);
+        try testing.expectEqual(@as(u8, 0xC0), d.read(ADCL));
+        try testing.expectEqual(@as(u8, 0xAA), d.read(ADCH));
+        d.write(ADMUX, 1);
+        try testing.expectEqual(@as(u8, 0xAB), d.read(ADCL));
+        d.write(ADCSRA, 0xC0);
+        d.tick(26); // The prior ADCL read blocks publication of the new sample.
+        try testing.expectEqual(@as(u8, 2), d.read(ADCH));
+        d.write(ADMUX, 0x21);
+        try testing.expectEqual(@as(u8, 0xC0), d.read(ADCL));
+        try testing.expectEqual(@as(u8, 0xAA), d.read(ADCH));
+        d.write(ADCSRA, 0xC0);
+        d.tick(26);
+        try testing.expectEqual(@as(u8, 0x40), d.read(ADCL));
+        try testing.expectEqual(@as(u8, 0), d.read(ADCH));
+    }
+}
+
+test "comparator follows the ADC mux when its power-reduction clock is restored or removed" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.setAnalog(0, 100);
+        d.setComparatorInputs(500, 900);
+        d.write(PRR, PRADC);
+        d.write(ADCSRB, 0x40);
+        d.write(ACSR, 0x0B); // Rising-edge comparator interrupt.
+        try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x30);
+        d.write(PRR, 0);
+        d.tick(2);
+        try testing.expectEqual(@as(u8, 0x30), d.read(ACSR) & 0x30);
+        try testing.expect(d.pending() != null);
+        d.write(ACSR, 0x1B);
+        d.write(PRR, PRADC);
+        d.tick(2);
+        try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x30);
+    }
+}
+
+test "ICR-TOP phase PWM signals capture at TOP once per cycle on all 16-bit timers" {
+    for ([_]bool{ false, true }) |mega| {
+        const count: usize = if (mega) 4 else 1;
+        for (timer16_bases[0..count], 0..) |base, n| {
+            for ([_]u8{ 8, 10 }) |mode| {
+                var d: Devices = .{ .mega = mega };
+                d.reset();
+                d.write(base + 7, 0);
+                d.write(base + 6, 3);
+                d.write(base, mode & 3);
+                d.write(base + 1, ((mode & 12) << 1) | 1);
+                d.write(timer16_masks[n], 0x20);
+                d.tick(2);
+                try testing.expectEqual(@as(?u8, null), d.pending());
+                d.tick(1);
+                try testing.expectEqual(@as(?u8, d.timerVector(n)), d.pending());
+                d.write(timer16_flags[n], 0x20);
+                d.tick(1);
+                try testing.expectEqual(@as(?u8, null), d.pending());
+                d.tick(5);
+                try testing.expectEqual(@as(?u8, d.timerVector(n)), d.pending());
+            }
+        }
+    }
+}
+
+test "640/1280 PB7 modulates both enabled compare outputs using PORTB7" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(0x24, 0x80);
+    for ([_]u8{ 0, 1 }) |a| for ([_]u8{ 0, 1 }) |c| {
+        d.write(TCCR0A, if (a == 0) 0x80 else 0xC0);
+        d.write(TCCR0B, 0x80); // Force OC0A.
+        d.write(TCCR1A, if (c == 0) 8 else 12);
+        d.write(TCCR1A + 2, 0x20); // Force OC1C.
+        d.write(0x25, 0);
+        try testing.expectEqual((a & c) << 7, d.pin(1) & 0x80);
+        d.write(0x25, 0x80);
+        try testing.expectEqual((a | c) << 7, d.pin(1) & 0x80);
+    };
+    d.write(TCCR1A, 0);
+    try testing.expectEqual(@as(u8, 0x80), d.pin(1) & 0x80);
+    d.write(TCCR0A, 0);
+    d.write(0x25, 0);
+    try testing.expectEqual(@as(u8, 0), d.pin(1) & 0x80);
 }
 
 test "ADC extended mux is latched, differential conversion signed, and ADCL locks paired results" {

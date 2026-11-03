@@ -41,6 +41,9 @@ electrical `key`/`pins`, coupled `serial`, AVR `pin_state`/`adc`/`comparator`/
 `uart_io` on AVR or modem ports. See the [protocol examples](../docs/inferred-hardware.md).
 `hardware.enabled` selects the BC5 IRQ/bank/ADC model and performs a warm reset
 when changed; normal execution enables it by default.
+Probe stack placement reserves the interrupt frame and all supplied arguments.
+Serial MMU faults end suspended probes and restore their saved CPU/stack;
+`last_call.stopped` retains the failing function's state.
 
 Memory requests are capped at 4096 units and input lines at 64 KiB. CPU fuel bounds block-copy work and XAP2 instruction-word decoding independently of the instruction count. Access logs are flushed every 1024 steps. SPARC register latches are capped at 65,536 entries. These are host resource limits, reported as stops where relevant.
 

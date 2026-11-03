@@ -250,8 +250,15 @@ class Session:
                 self._reset_display()
                 self.modem_link = None
                 self.spi_link = None
+                reset_error = None
                 for worker in self.engines.values():
-                    worker.request("reset")
+                    try:
+                        worker.request("reset")
+                    except EngineError as error:
+                        if reset_error is None:
+                            reset_error = error
+                if reset_error is not None:
+                    raise reset_error
                 self._connect_modem()
             elif action == "initialize_ui":
                 self.running = False
@@ -382,7 +389,11 @@ class Session:
                 raise ValueError("Pause execution before a debugger probe")
             if image not in self.engines:
                 raise ValueError("Processor image is not loaded")
-            response = self._request(self.engines[image], operation, **arguments)
+            worker = self.engines[image]
+            if image == "bc5" and operation in ("call", "call_resume"):
+                response = self._probe_operation(worker, operation, arguments)
+            else:
+                response = self._request(worker, operation, **arguments)
             self.log("probe", f"{image}: {operation}")
             return response
 
@@ -492,18 +503,32 @@ class Session:
         return response
 
     def _probe_call(self, worker, entry, **arguments):
-        budget = arguments.get("steps", 100000)
-        if self.spi_link:
-            arguments["quantum"] = self._board_quantum(budget)
-        response = self._request(worker, "call", entry=entry, **arguments)
+        return self._probe_operation(worker, "call", {"entry": entry, **arguments})
+
+    def _probe_operation(self, worker, operation, arguments):
+        arguments = dict(arguments)
+        budget = arguments.get("steps", 100000 if operation == "call" else 100000000)
+        if operation == "call" and self.spi_link and type(budget) is int and budget > 0:
+            arguments.setdefault("quantum", self._board_quantum(budget))
+        before = (worker.state.get("last_call") or {}).get("steps", 0) if operation == "call_resume" else 0
+        # Native validation must run before any peripheral processor advances.
+        response = self._request(worker, operation, **arguments)
+        peripheral_budget = budget
         while (response.get("last_call") or {}).get("pending"):
+            remaining = budget - (response["last_call"]["steps"] - before)
+            if remaining <= 0:
+                return response
             if not self.spi_link:
+                if not response.get("serial_waiting"):
+                    return response
                 raise EngineError("Function probe is waiting for a connected serial peer")
-            quantum = self._board_quantum(budget)
+            if not self.spi_link.pending:
+                self.spi_link.exchange()
+            quantum = self._board_quantum(min(remaining, peripheral_budget))
             if quantum <= 0:
                 raise EngineError("Peripheral wait exceeded the function-probe budget; reset before retrying")
             self._service_board(quantum)
-            budget -= quantum
+            peripheral_budget -= quantum
             response = self._request(worker, "call_resume", steps=quantum)
         return response
 
@@ -516,6 +541,8 @@ class Session:
             raise ValueError("Load BC5 firmware before initializing the handset application")
         if not self.spi_link:
             raise ValueError("Load AVR firmware with BC5 firmware before powering on the handset")
+        if "power" in self.keys:
+            raise ValueError("Release the power button before powering on the handset")
         self.ui_attempted = True
         worker = self.engines["bc5"]
         self._request(worker, "warm_reset")

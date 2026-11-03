@@ -301,6 +301,26 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(transitions, [True, False])
         self.assertEqual(self.session.keys, set())
 
+    def test_power_on_rejects_owned_power_before_mutating_the_board(self):
+        worker = self.initialize_key_handler()
+        self.session._power_input = Mock()
+        self.session._step = Mock()
+        self.browser_key("tab-a", 1, True, key="power")
+        self.session.ui_initialized = False
+        worker.request.reset_mock()
+        epoch = self.session.key_epoch
+        with self.assertRaisesRegex(ValueError, "Release the power button"):
+            self.session.control("initialize_ui")
+        self.assertFalse(self.session.ui_attempted)
+        self.assertEqual(self.session.key_epoch, epoch)
+        self.assertEqual(self.session.keys, {"power"})
+        worker.request.assert_not_called()
+        self.assertEqual([call.args[0] for call in self.session._power_input.call_args_list], [True])
+        self.assertFalse(self.browser_key("tab-b", 1, True, key="power")["delivered"])
+        self.assertFalse(self.browser_key("tab-a", 2, False, key="power")["delivered"])
+        self.assertTrue(self.browser_key("tab-b", 2, False, key="power")["delivered"])
+        self.assertEqual(self.session.keys, set())
+
     def test_shared_power_input_changes_only_for_first_press_and_last_release(self):
         self.initialize_key_handler()
         self.session._power_input = Mock()

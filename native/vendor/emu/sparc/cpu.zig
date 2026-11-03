@@ -546,7 +546,7 @@ pub const Cpu = struct {
         if (addr & (kind.bits / 8 - 1) != 0) return c.trap(tt.mem_address_not_aligned);
         const space: Space = if (asi) |x| spaceOf(x) orelse return c.trap(tt.data_access_exception) else .memory;
         // Reserve both bus accesses before a side-effecting atomic read; fuel is a host limit.
-        if (kind.atomic and (space == .memory or (space == .miss and c.asi1 == null)) and c.bus.fuel < 2)
+        if (kind.atomic and (space == .memory or space == .miss) and c.bus.fuel < 2)
             return c.halt(.fuel_exhausted);
         if (kind.load) {
             const v: u64 = switch (space) {
@@ -779,6 +779,56 @@ test "atomic fuel exhaustion and failed stores preserve the faulting pc and dest
     b.map = &rom_map;
     try testing.expectEqual(Exit{ .stop = .{ .fault = 0x4000_0800 } }, s.cpu.step().?);
     try testing.expectEqual(@as(u32, 0x4000_0004), TS.regs.pc);
+}
+
+test "ASI1 forwarded atomics reserve reads and writes before consuming device input" {
+    const Forward = struct {
+        fn read(ctx: *anyopaque, address: u32, bits: u8) u64 {
+            const bus: *Bus = @ptrCast(@alignCast(ctx));
+            return bus.read(address, bits);
+        }
+        fn write(ctx: *anyopaque, address: u32, bits: u8, value: u64) void {
+            const bus: *Bus = @ptrCast(@alignCast(ctx));
+            bus.write(address, bits, value);
+        }
+    };
+    const Input = struct {
+        reads: usize = 0,
+        writes: usize = 0,
+        fn read(ctx: *anyopaque, _: u32, _: u8) u64 {
+            const input: *@This() = @ptrCast(@alignCast(ctx));
+            input.reads += 1;
+            return 0x41;
+        }
+        fn write(ctx: *anyopaque, _: u32, _: u8, _: u64) void {
+            const input: *@This() = @ptrCast(@alignCast(ctx));
+            input.writes += 1;
+        }
+    };
+    for ([_]u6{ 0x1D, 0x1F }) |op3| {
+        var b: Bus = undefined;
+        var s = try setup(&b, &.{testFormat3(3, op3, 2, 1, 1 << 5, false)});
+        defer b.deinit();
+        const map = TS.map ++ [_]bus_mod.Range{.{ .lo = 0x80000200, .hi = 0x80000203, .kind = .mmio }};
+        b.map = &map;
+        var input: Input = .{};
+        b.dev = .{ .ctx = &input, .read = Input.read, .write = Input.write };
+        s.cpu.asi1 = .{ .ctx = &b, .read = Forward.read, .write = Forward.write };
+        s.cpu.set(1, if (op3 == 0x1D) 0x80000203 else 0x80000200);
+        s.cpu.set(2, 99);
+        b.fuel = 2;
+        try testing.expectEqual(Exit{ .stop = .fuel_exhausted }, s.cpu.step().?);
+        try testing.expectEqual(@as(usize, 0), input.reads);
+        try testing.expectEqual(@as(usize, 0), input.writes);
+        try testing.expectEqual(@as(u32, 0x40000000), TS.regs.pc);
+        try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
+        b.resetRun(3);
+        try testing.expectEqual(@as(?Exit, null), s.cpu.step());
+        try testing.expectEqual(@as(usize, 1), input.reads);
+        try testing.expectEqual(@as(usize, 1), input.writes);
+        try testing.expectEqual(@as(u32, 0x41), s.cpu.get(2));
+        try testing.expectEqual(@as(u32, 0x40000004), TS.regs.pc);
+    }
 }
 
 test "external interrupts respect ET and PIL; level 15 bypasses PIL and preserves delayed pc" {

@@ -152,6 +152,9 @@ power button released HIGH. Guest IRQs, ADC completion, GRev classification,
 application setup and power polling perform the rest of startup. No application
 start, charging-state or animation-completion callback is injected after reset.
 AIO0=640 is an explicit virtual GRev board-ID fixture.
+Power-on is rejected while a client still owns the power button; release the
+button before starting a new boot. Reset attempts every loaded processor before
+reporting a worker failure, so surviving processors release their contacts.
 
 The AVR executes every SPI command and produces the handshake/attention GPIO
 levels. The host services both processors during bounded probes; `last_call.pending`
@@ -218,6 +221,10 @@ the same transition to be injected twice.
 
 `/api/probe` accepts the native `read`, `write`, `call`, `state`, `pins`,
 `uart_rx`, `uart_tx` and `spi` operations. Numeric addresses are JSON integers.
+BC5 `call` and `call_resume` service the connected board while the function
+waits for SPI. Continuations retain their requested instruction limit. Native
+validation runs before peripheral execution, and serial MMU faults finalize the
+probe and restore its paused CPU/stack while preserving the fault diagnostics.
 
 `POST /api/firmware` accepts the raw file body with an `X-Filename` header. It
 validates and starts the replacement worker before disposing of the prior one.

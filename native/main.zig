@@ -916,6 +916,7 @@ fn serial(out: *std.Io.Writer, obj: std.json.ObjectMap) !void {
                     if (dma.receive) {
                         bc5_mmu.writeBuffer(Bc.dev.ext[0x93], serial_rx_cursor, value) catch |err| {
                             modelFault(0xFDC1, "serial-write", err);
+                            if (callPending()) continueCall(0);
                             return state(out);
                         };
                         serial_rx_cursor +%= 1;
@@ -936,6 +937,7 @@ fn serial(out: *std.Io.Writer, obj: std.json.ObjectMap) !void {
             if (!dma.in_flight) {
                 value = if (dma.receive) 0 else bc5_mmu.readBuffer(Bc.dev.ext[0x94], serial_cursor) catch |err| {
                     modelFault(0xFDC1, "serial-read", err);
+                    if (callPending()) continueCall(0);
                     return state(out);
                 };
                 serial_sequence +%= 1;
@@ -1061,8 +1063,10 @@ fn call(obj: std.json.ObjectMap) !void {
     for (stack) |v| if (v != .integer or v.integer < 0 or v.integer > 65535) return error.BadStack;
     var probe_y: u16 = 0xFCC0;
     if (Bc.core.banked_interrupts and Bc.core.cpu.flags & 0x10 != 0) {
-        if (Bc.core.cpu.uy < probe_stack_base + 35) return error.BadProbeStack;
-        probe_y = @min(probe_y, Bc.core.cpu.uy - 35);
+        // The original wrapper saves X/UY below the CPU's 33-word interrupt frame.
+        const separation: u16 = @intCast(35 + stack.len);
+        if (Bc.core.cpu.uy <= probe_stack_base + separation) return error.BadProbeStack;
+        probe_y = @min(probe_y, Bc.core.cpu.uy - separation);
     }
     call_context = .{ .saved = Bc.core, .stack_before = undefined, .before_steps = total_steps, .remaining = steps };
     @memcpy(&call_context.?.stack_before, BcMem.data[probe_stack_base..][0..0x380]);
@@ -1183,6 +1187,34 @@ const CallTest = struct {
         waiting.* = true;
     }
 };
+
+test "banked probes keep all stack arguments below a pending interrupt frame" {
+    for ([_]usize{ 3, 32 }) |count| {
+        var rig: CallTest = .{};
+        const words = [_]u16{ 0x0014, (@as(u16, @intCast(count - 1)) << 8) | 0x17, 0x00E2, 0x0004, 0xDF0D };
+        try rig.init(&words);
+        defer rig.deinit();
+        Bc.core.banked_interrupts = true;
+        Bc.core.cpu.flags = 0x10;
+        Bc.core.cpu.uy = 0xFCE0;
+        var arguments = std.json.Array.init(std.testing.allocator);
+        defer arguments.deinit();
+        for (0..count) |n| try arguments.append(.{ .integer = @intCast(0x1100 + n) });
+        var probe_input = try std.json.ObjectMap.init(std.testing.allocator, &.{ "entry", "steps", "quantum", "stack" }, &.{ .{ .integer = 0x100 }, .{ .integer = 100 }, .{ .integer = 1 }, .{ .array = arguments } });
+        defer probe_input.deinit(std.testing.allocator);
+        const saved = Bc.core.cpu;
+        try call(probe_input);
+        try std.testing.expect(callPending());
+        try std.testing.expect(Bc.core.interrupt(xap.cpu.progAddr(0x104)));
+        continueCall(100);
+        try std.testing.expect(last_call.?.returned);
+        try std.testing.expectEqual(@as(u16, @intCast(0x1100 + count - 1)), last_call.?.al);
+        try std.testing.expectEqual(saved, Bc.core.cpu);
+        Bc.core.cpu.uy = probe_stack_base + @as(u16, @intCast(35 + count));
+        try std.testing.expectError(error.BadProbeStack, call(probe_input));
+        try std.testing.expect(!callPending());
+    }
+}
 
 test "BC5 probe yields for serial service and restores paused registers/stack only after return" {
     var rig: CallTest = .{};

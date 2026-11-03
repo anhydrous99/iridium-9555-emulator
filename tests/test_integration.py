@@ -130,6 +130,27 @@ class OriginalFirmwareChecks:
             self.assertFalse(session.ui_initialized)
             self.assertIsNone(session.state()["lcd"])
 
+    def test_power_on_preserves_a_browser_held_power_input(self):
+        with Session(EXECUTABLE, self.handset_firmware()) as session:
+            session.control("initialize_ui")
+            epoch = session.key_epoch
+            session.key("power", True, client_id="tab-a", sequence=1, epoch=epoch)
+            self.assertFalse(session.ui_initialized)
+            port, bit = session.profile.power_pin
+            before = [worker.state["steps"] for worker in session.engines.values()]
+            with self.assertRaisesRegex(ValueError, "Release the power button"):
+                session.control("initialize_ui")
+            self.assertEqual([worker.state["steps"] for worker in session.engines.values()], before)
+            self.assertFalse(session.ui_attempted)
+            self.assertEqual(session.key_epoch, epoch)
+            self.assertEqual(session.keys, {"power"})
+            self.assertEqual(session.engines["avr"].request("pin_state")["inputs"][port] & (1 << bit), 0)
+            self.assertFalse(session.key("power", True, client_id="tab-b", sequence=1, epoch=epoch)["delivered"])
+            self.assertFalse(session.key("power", False, client_id="tab-a", sequence=2, epoch=epoch)["delivered"])
+            self.assertTrue(session.key("power", False, client_id="tab-b", sequence=2, epoch=epoch)["delivered"])
+            self.assertNotEqual(session.engines["avr"].request("pin_state")["inputs"][port] & (1 << bit), 0)
+            self.assertEqual(session.keys, set())
+
     def test_original_animation_reaches_readable_home_and_navigable_menu(self):
         firmware = self.handset_firmware()
         with Session(EXECUTABLE, firmware) as session:
