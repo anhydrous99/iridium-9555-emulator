@@ -6,6 +6,7 @@ checksum; their SHA-256 identifies exactly which experiment was executed.
 """
 
 from dataclasses import dataclass
+from functools import cached_property
 from hashlib import sha256
 from pathlib import Path
 import struct
@@ -34,9 +35,13 @@ class Firmware:
     format: str
     warnings: tuple[str, ...] = ()
 
+    @cached_property
+    def payload_sha256(self) -> str:
+        return sha256(self.data).hexdigest()
+
     def describe(self) -> dict:
         return {"image": self.image, "name": self.name, "sha256": self.sha256,
-                "payload_sha256": sha256(self.data).hexdigest(), "format": self.format,
+                "payload_sha256": self.payload_sha256, "format": self.format,
                 "size": len(self.data), "warnings": list(self.warnings)}
 
 

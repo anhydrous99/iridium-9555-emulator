@@ -358,8 +358,8 @@ fn observeBc5() void {
     }
 }
 
-fn step() void {
-    switch (current_image) {
+fn step(comptime image: Image) void {
+    switch (image) {
         .bc5 => {
             observeBc5();
             if (milestones.panic != null) {
@@ -401,19 +401,26 @@ fn step() void {
 fn run(steps: u64) void {
     if (halt_reason != null) return;
     refillFuel(steps);
+    // Each worker owns one image; select its instruction loop once per request.
+    switch (current_image) {
+        inline else => |image| runSteps(image, steps),
+    }
+    flushLog();
+}
+
+fn runSteps(comptime image: Image, steps: u64) void {
     for (0..steps) |n| {
-        step();
+        step(image);
         if (n % 1024 == 0) flushLog();
         if (halt_reason != null) break;
     }
-    flushLog();
 }
 
 fn runToIdle(steps: u64) void {
     if (halt_reason != null) return;
     refillFuel(steps);
     for (0..steps) |n| {
-        step();
+        step(.bc5);
         if (n % 1024 == 0) flushLog();
         if (halt_reason != null) break;
         if (Bc.core.cpu.pc == xap.cpu.progAddr(0xB774)) {

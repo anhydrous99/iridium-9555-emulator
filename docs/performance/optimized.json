@@ -1,0 +1,248 @@
+{
+  "environment": {
+    "python": "3.14.4",
+    "platform": "Linux-7.0.0-42-generic-x86_64-with-glibc2.43",
+    "node": "v22.22.1",
+    "zig": "0.17.0",
+    "revision": "484a759b292c58cb38dcef9a4da8a2b5dc274c68",
+    "source_sha256": {
+      "iridium/firmware.py": "59d655b01b93057c66d3b2e23bd77c8a317710ad92b2fa08f33240d8569481c7",
+      "iridium/lcd.py": "156ed47b9fcf78f286abfbeedc494cf9c09ce391b37abb338728ecb2a31c7e84",
+      "ui/app.js": "ec62b408f502caddc7d8b9ddf3299368c79c2981d67be6a32f19156c76ef2b79",
+      "native/vendor/common/bus.zig": "c9bd4c60745f9c3a983591f36d03f52aa368d63355342f9b5c03172cbaaa9156",
+      "native/main.zig": "ebb4ea75f8ca0d2fbd27defccf5c171ec54428bdbed60f0cf0d6ffd79e54909e"
+    },
+    "engine_sha256": "7748def756af18da258e94c4fea9841134e19188a2b7eb42b62070ff085fcafa"
+  },
+  "metrics": {
+    "lcd_unchanged": {
+      "median_ms": 0.03080264,
+      "samples_ms": [
+        0.03084843,
+        0.03081416,
+        0.03075695,
+        0.03082158,
+        0.03080264,
+        0.03077769,
+        0.03076647
+      ],
+      "iterations_per_sample": 100
+    },
+    "lcd_changed": {
+      "median_ms": 3.9103726,
+      "samples_ms": [
+        3.9828432666666664,
+        4.045169466666667,
+        3.903510633333333,
+        3.9002314,
+        3.9103726,
+        3.902415866666667,
+        3.9115691666666663
+      ],
+      "iterations_per_sample": 30
+    },
+    "session_state": {
+      "median_ms": 0.03936503,
+      "samples_ms": [
+        0.03945851,
+        0.039743839999999996,
+        0.039400199999999996,
+        0.03936503,
+        0.03909743,
+        0.03930171,
+        0.0389773
+      ],
+      "iterations_per_sample": 100
+    },
+    "state_json": {
+      "median_ms": 0.63951517,
+      "samples_ms": [
+        0.63951517,
+        0.63668832,
+        0.63949303,
+        0.6424386,
+        0.6380451899999999,
+        0.63951637,
+        0.6539853299999999
+      ],
+      "iterations_per_sample": 100
+    },
+    "http_poll": {
+      "median_ms": 1.9437176,
+      "samples_ms": [
+        1.9451673500000002,
+        1.9167847,
+        1.9437176,
+        1.93295775,
+        1.9158013500000002,
+        1.94845255,
+        1.99937585
+      ],
+      "iterations_per_sample": 20
+    },
+    "bc5_boot_7m": {
+      "median_ms": 174.384039,
+      "samples_ms": [
+        173.757965,
+        175.415229,
+        174.233765,
+        174.384039,
+        174.519465,
+        173.636346,
+        174.720555
+      ],
+      "iterations_per_sample": 1
+    },
+    "avr_boot_7m": {
+      "median_ms": 256.584571,
+      "samples_ms": [
+        259.116378,
+        256.431722,
+        257.05508,
+        256.047334,
+        256.584571,
+        256.194333,
+        256.709717
+      ],
+      "iterations_per_sample": 1
+    },
+    "trx_boot_7m": {
+      "median_ms": 220.637544,
+      "samples_ms": [
+        220.181161,
+        220.828173,
+        219.396186,
+        218.934263,
+        223.863503,
+        220.637544,
+        222.226307
+      ],
+      "iterations_per_sample": 1
+    },
+    "ptt_boot_7m": {
+      "median_ms": 222.440201,
+      "samples_ms": [
+        222.462524,
+        225.38001,
+        218.713756,
+        222.139453,
+        222.628607,
+        221.479716,
+        222.440201
+      ],
+      "iterations_per_sample": 1
+    },
+    "application_initialize": {
+      "median_ms": 971.748556,
+      "samples_ms": [
+        971.99395,
+        971.96223,
+        967.957187,
+        968.140153,
+        968.602036,
+        971.748556,
+        972.5069
+      ],
+      "iterations_per_sample": 1
+    },
+    "original_session_state": {
+      "median_ms": 0.07595191,
+      "samples_ms": [
+        0.07595191,
+        0.07794878999999999,
+        0.07659553,
+        0.07471407000000001,
+        0.08262101,
+        0.06827329,
+        0.05880399
+      ],
+      "iterations_per_sample": 100
+    },
+    "original_state_json": {
+      "median_ms": 0.97544193,
+      "samples_ms": [
+        0.9980415600000001,
+        0.97544193,
+        0.9663110600000001,
+        0.96740113,
+        0.96760791,
+        0.97547339,
+        0.9765337900000001
+      ],
+      "iterations_per_sample": 100
+    },
+    "ui_unchanged": {
+      "median_ms": 0.254765772,
+      "samples_ms": [
+        0.256794077,
+        0.256949701,
+        0.255868117,
+        0.254616569,
+        0.254548451,
+        0.254765772,
+        0.254390321
+      ],
+      "iterations_per_sample": 1000
+    },
+    "ui_redraw": {
+      "median_ms": 4.56167785,
+      "samples_ms": [
+        4.59763925,
+        4.6070005499999995,
+        4.54050602,
+        4.50181687,
+        4.57220926,
+        4.56167785,
+        4.53780371
+      ],
+      "iterations_per_sample": 100
+    }
+  },
+  "response_bytes": 117085,
+  "firmware": [
+    {
+      "image": "bc5",
+      "name": "main.dfu",
+      "sha256": "229ff386d1fc764d651403eb68a0bfdcd4902934e0e4b0bedc3b0ba9a0c5f3f2",
+      "payload_sha256": "38a12b9994456ebb9b2dc1b8afc8aad2dd903370bb282f01af925164bf44a98e",
+      "format": "CSR-dfu2",
+      "size": 3215290,
+      "warnings": []
+    },
+    {
+      "image": "avr",
+      "name": "avr.bin",
+      "sha256": "84801ab15a81fb208fac95001004ed8bff4c3d625224b764fa58f1bce3b9df5b",
+      "payload_sha256": "84801ab15a81fb208fac95001004ed8bff4c3d625224b764fa58f1bce3b9df5b",
+      "format": "raw",
+      "size": 8678,
+      "warnings": []
+    },
+    {
+      "image": "trx",
+      "name": "trx_seg1_0x10000.bin",
+      "sha256": "4f7939844993b28cae3031fa3da1b5bdb5c9546045cae1e0f6e42dd2d591e54b",
+      "payload_sha256": "4f7939844993b28cae3031fa3da1b5bdb5c9546045cae1e0f6e42dd2d591e54b",
+      "format": "raw",
+      "size": 2492256,
+      "warnings": []
+    },
+    {
+      "image": "ptt",
+      "name": "trx_seg2.bin",
+      "sha256": "1a4f78525e9b474946b21c4aba287dbd7e076c72acb534a0b0a7439daefb28ca",
+      "payload_sha256": "1a4f78525e9b474946b21c4aba287dbd7e076c72acb534a0b0a7439daefb28ca",
+      "format": "raw",
+      "size": 687096,
+      "warnings": []
+    }
+  ],
+  "native_states": {
+    "bc5": "96452a2a51e9d85eee733977e9e45d9abe3c4bb5f170658404ea25bb55d05ebf",
+    "avr": "646401ed7f08cdab6e00b9b8a41808db75d770fb853dac414ba27c4e8cd71d5a",
+    "trx": "0d164eb65781ef0426d287bd590ddf107c1ba8387030d1ed90b8cb74d1f9c384",
+    "ptt": "738d457fd2ec0ff21526b08b848b8c8781600ef3ee65347ed2513b8e9206d2cd"
+  },
+  "animation_120m_ms": 3406.110407,
+  "home_pixels_sha256": "3950bdcac33f96b3735eec97f676a686ff88035e2b983ebb77927a02f869808d"
+}

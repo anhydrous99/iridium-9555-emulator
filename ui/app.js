@@ -152,7 +152,12 @@ function drawDisplay(state) {
   const bufferContext = buffer.getContext("2d");
   const frame = bufferContext.createImageData(width, height);
   for (let index = 0; index < pixels.length; index += 1) {
-    frame.data.set([...palette[pixels[index]], 255], index * 4);
+    const color = palette[pixels[index]];
+    const offset = index * 4;
+    frame.data[offset] = color[0];
+    frame.data[offset + 1] = color[1];
+    frame.data[offset + 2] = color[2];
+    frame.data[offset + 3] = 255;
   }
   bufferContext.putImageData(frame, 0, 0);
   const scale = Math.min(128 / width, 128 / height);

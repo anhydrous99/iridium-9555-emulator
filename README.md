@@ -119,3 +119,6 @@ for a guest halt or panic. Exit 0 does not mean a complete handset boot.
 
 See [architecture and debugger API](docs/architecture.md) to extend the models
 or reproduce original-function probes.
+
+See [performance evaluation](docs/performance.md) for measured optimizations,
+raw benchmark samples and commands to reproduce the host, UI and CPU workloads.

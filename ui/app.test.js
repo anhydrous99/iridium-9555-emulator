@@ -253,6 +253,16 @@ test("live LCD follows changing firmware pixels and stays distinct from asset pr
   assert.deepEqual(Array.from(canvas.frame.data), [33, 48, 21, 255, 123, 140, 102, 255], "Asset pixels keep their original order independently of handset wiring");
 });
 
+test("live LCD paints all four shades with opaque alpha", async () => {
+  const app = await fixture();
+  app.context.frame = liveState();
+  app.context.frame.lcd.pixels.splice(0, 4, 0, 1, 2, 3);
+  app.run("drawDisplay(frame)");
+  assert.deepEqual(Array.from(app.elements.get("lcd").frame.data.slice(0, 16)), [
+    169, 184, 145, 255, 123, 140, 102, 255, 77, 94, 60, 255, 33, 48, 21, 255,
+  ]);
+});
+
 test("incomplete, faulty, off, and unverified captures never present a live frame", async () => {
   const app = await fixture();
   const canvas = app.elements.get("lcd");
