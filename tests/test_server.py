@@ -46,6 +46,21 @@ class ServerTests(unittest.TestCase):
         status, data, _ = self.request("GET", "/api/state")
         self.assertEqual(json.loads(data)["processors"][0]["steps"], 42)
 
+    def test_key_release_cancels_an_older_press_over_http(self):
+        generation = self.session.state()["key_generations"]["1"]
+        for pressed in (False, True):
+            status, data, _ = self.request("POST", "/api/key", json.dumps(
+                {"key": "1", "pressed": pressed, "generation": generation}),
+                {"Content-Type": "application/json"})
+            self.assertEqual(status, 200, data)
+            self.assertEqual(json.loads(data)["generation"], generation + 1)
+        self.assertEqual(self.session.keys, set())
+        for generation in (True, -1, "1", 1.5):
+            status, _, _ = self.request("POST", "/api/key", json.dumps(
+                {"key": "1", "pressed": True, "generation": generation}),
+                {"Content-Type": "application/json"})
+            self.assertEqual(status, 400)
+
     def test_network_binding_and_matching_origin_use_the_connection_destination(self):
         self.assertEqual(arguments([]).host, "0.0.0.0")
         self.assertEqual(arguments(["--host", "127.0.0.1"]).host, "127.0.0.1")

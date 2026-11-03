@@ -9,4 +9,6 @@ Local adaptations: slim module export roots omit external harnesses and tests re
 
 The BC5 flash model now uses an explicitly inferred Am29LV320DB-compatible profile, replacing the upstream inconsistent ID/geometry stub. Its CFI values and sector layout follow [AMD publication 23579, revision C+6](https://www.insidegadgets.com/wp-content/uploads/2012/12/AM29LV320D.pdf). The actual handset part is unidentified; command timing, erase suspend and protection changes are incomplete. No persistent-store values or handset application instructions are supplied by the model.
 
+The AVR UART model records cumulative per-port output-capture losses when its bounded host queue fills. This adds host diagnostics without changing guest serial timing or status flags. The native adapter also stops when the existing AVR watchdog model requests a reset.
+
 These are instruction interpreters with partially inferred device models. BC5 IRQs, keypad wiring, LCD transfers, SPARC ASIC/interrupts and radio DSP behavior are incomplete. Reaching scheduler milestones does not establish full handset functionality. AVR device timing is deterministic but includes the documented upstream assumptions. Original `shortcut:` comments and model qualifications are retained.

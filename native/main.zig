@@ -287,6 +287,10 @@ fn state(out: *std.Io.Writer) !void {
         .unclassified_accesses = unclassified,
         .lcd_bytes = lcd_numbers[0..lcd_len],
         .lcd_dropped = lcd_dropped,
+        .uart_tx_dropped = if (current_image == .avr)
+            [2]u64{ avr_dev.st.usart[0].out_dropped, avr_dev.st.usart[1].out_dropped }
+        else
+            null,
         .last_call = last_call,
         .model = "partial-peripherals",
         .mmu_assumption = if (current_image == .bc5) mmu.assumption else null,
@@ -377,6 +381,8 @@ fn step() void {
             total_steps += 1;
             if (avr_cpu.stop) |h| setHalt(h);
             if (avr_bus.stop) |h| setHalt(h);
+            if (halt_reason == null and avr_dev.st.reset_request != 0)
+                halt_reason = "firmware-reset-requested";
         },
         .trx, .ptt => {
             if (trx_model.latch.count() >= 65536) {
@@ -466,7 +472,8 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
         if (!avr_dev.uartPush(try number(u1, obj, "port", null), try number(u8, obj, "value", null))) return error.UartFull;
     } else if (std.mem.eql(u8, op.string, "uart_tx")) {
         if (current_image != .avr) return error.AvrOnly;
-        return json(out, .{ .value = avr_dev.uartPop(try number(u1, obj, "port", null)) });
+        const port = try number(u1, obj, "port", null);
+        return json(out, .{ .value = avr_dev.uartPop(port), .dropped = avr_dev.st.usart[port].out_dropped });
     } else if (std.mem.eql(u8, op.string, "spi")) {
         if (current_image != .avr) return error.AvrOnly;
         return json(out, .{ .value = avr_dev.spiTransfer(try number(u8, obj, "value", null)) });

@@ -81,6 +81,9 @@ routine reaches byte `0x184F0` with its watchdog armed (`0x76 == 1` and bit 0 of
 it does not infer watchdog timing. The initialization scenario handles this stop
 with an explicit warm reset; other occurrences remain visible as debugger halts.
 
+The AVR worker reports the same halt when its watchdog model requests a reset.
+It stays stopped until an explicit `reset`; no automatic AVR reboot is performed.
+
 `read` observes raw memory without consuming MMIO events. `write` accepts RAM
 only, checks all values before mutation and rejects ROM/MMIO writes. Neither
 operation changes the original file. The AVR also exposes device stimuli:
@@ -95,6 +98,10 @@ operation changes the original file. The AVR also exposes device stimuli:
 
 UART queues and SPI replies require intervening CPU execution. These interfaces
 are not yet wired to the BC5 or SPARC workers.
+Each AVR UART output capture holds 255 bytes. Overflow increments cumulative
+per-port `uart_tx_dropped` counts in processor state; `uart_tx` also returns the
+selected port's `dropped` count. Draining the queue preserves the counts, and
+reset clears them. The browser displays any capture loss in the AVR row.
 
 BC5 state includes `lcd_bytes`: low bytes observed at original sender `0x68E48`,
 with a bounded buffer and `lcd_dropped` counter. Observation does not skip its
@@ -155,6 +162,17 @@ Mutations use `POST` with `Content-Type: application/json`:
 | `/api/satellite` | `{"action":"register"}` then `{"action":"advance","milliseconds":1000}` |
 | `/api/satellite` | `{"action":"incoming_call","number":"+881612345678"}`; also `answer`, `hangup` |
 | `/api/satellite` | `{"action":"incoming_sms","number":"123","text":"Test"}` |
+
+Browser key requests include the key's `generation` from `key_generations` in
+state. Responses return its current generation. A successful release advances
+that number, even if the key was already up, so an older press arriving later
+is ignored. Reset and image replacement advance all key generations. The browser
+cancels unsent events on navigation and immediately sends keepalive releases for
+submitted presses, including ones still waiting for a response. Omitting
+`generation` retains the simple debugger API without stale-request protection.
+Held-key state changes only after the original key routine returns; a failure
+before injection can be retried, while a later scheduler failure does not cause
+the same transition to be injected twice.
 
 `/api/probe` accepts the native `read`, `write`, `call`, `state`, `pins`,
 `uart_rx`, `uart_tx` and `spi` operations. Numeric addresses are JSON integers.

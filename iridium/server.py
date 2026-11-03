@@ -121,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/control":
             return session.control(data.get("action"), data.get("steps", 10000))
         if self.path == "/api/key":
-            return session.key(data.get("key"), data.get("pressed"))
+            return session.key(data.get("key"), data.get("pressed"), data.get("generation"))
         if self.path == "/api/satellite":
             action = data.pop("action", None)
             return session.satellite_action(action, data)

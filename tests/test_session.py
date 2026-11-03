@@ -1,6 +1,7 @@
 from pathlib import Path
 import threading
 import unittest
+from unittest.mock import Mock
 
 from iridium.engine import EngineError
 from iridium.firmware import parse_firmware
@@ -66,6 +67,70 @@ class SessionTests(unittest.TestCase):
             self.session.probe("avr", "write", {"address": 0x100, "values": [1]})
         self.session.control("pause")
         self.session.probe("avr", "write", {"address": 0x100, "values": [1]})
+
+    def test_failed_key_delivery_preserves_state_and_allows_retry(self):
+        self.session.engines["bc5"] = self.session.engines["avr"]
+        self.session.ui_initialized = True
+        worker = self.session.engines["bc5"]
+        worker.request = Mock(return_value={"values": [1, 2]})
+        self.session._call = Mock(return_value={})
+        for pressed in (True, False):
+            with self.subTest(pressed=pressed):
+                self.session.keys = set() if pressed else {"1"}
+                # All three idle budgets expire before the key routine is called.
+                worker.request.side_effect = [
+                    {"halt": None, "at_idle": False},
+                    {"halt": None, "at_idle": False},
+                    {"halt": None, "at_idle": False},
+                ]
+                before = set(self.session.keys)
+                self.session._call.reset_mock()
+                with self.assertRaisesRegex(EngineError, "instruction budget exhausted"):
+                    self.session.key("1", pressed)
+                self.assertEqual(self.session.keys, before)
+                self.session._call.assert_not_called()
+                worker.request.side_effect = None
+                self.session._idle = Mock()
+                self.assertTrue(self.session.key("1", pressed)["delivered"])
+                self.session._call.assert_called_once()
+                self.assertEqual("1" in self.session.keys, pressed)
+                del self.session._idle
+
+    def test_post_delivery_idle_failure_does_not_repeat_the_key_routine(self):
+        self.session.engines["bc5"] = self.session.engines["avr"]
+        self.session.ui_initialized = True
+        self.session.engines["bc5"].request = Mock(return_value={"values": [1, 2]})
+        self.session._call = Mock(return_value={})
+        for pressed in (True, False):
+            with self.subTest(pressed=pressed):
+                self.session.keys = set() if pressed else {"1"}
+                self.session._idle = Mock(side_effect=[None, EngineError("idle budget exhausted")])
+                self.session._call.reset_mock()
+                with self.assertRaises(EngineError):
+                    self.session.key("1", pressed)
+                self.assertEqual("1" in self.session.keys, pressed)
+                self.assertFalse(self.session.key("1", pressed)["delivered"])
+                self.session._call.assert_called_once()
+
+    def test_release_cancels_late_press_and_cannot_release_a_new_generation(self):
+        generation = self.session.state()["key_generations"]["1"]
+        released = self.session.key("1", False, generation)
+        self.assertEqual(released["generation"], generation + 1)
+        self.assertFalse(self.session.key("1", True, generation)["delivered"])
+        self.assertEqual(self.session.keys, set())
+        self.session.key("1", True, generation + 1)
+        self.session.key("1", False, generation)
+        self.assertEqual(self.session.keys, {"1"})
+        self.session.key("1", False, generation + 1)
+        self.assertEqual(self.session.keys, set())
+
+    def test_reset_and_firmware_replacement_cancel_prior_key_generations(self):
+        for reset in (lambda: self.session.control("reset"), lambda: self.session.load(self.firmware)):
+            generation = self.session.state()["key_generations"]["1"]
+            self.session.key("1", True, generation)
+            reset()
+            self.session.key("1", True, generation)
+            self.assertEqual(self.session.keys, set())
 
     def test_unsupported_lcd_command_is_reported_without_inventing_cpu_fault(self):
         engine = self.session.engines["avr"]

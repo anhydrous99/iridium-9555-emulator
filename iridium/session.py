@@ -43,6 +43,7 @@ class Session:
         self.firmware = {}
         self.events = deque(maxlen=200)
         self.keys = set()
+        self.key_generations = {key: 0 for key in ALL_KEYS}
         self.satellite = Satellite()
         self.running = False
         self.asset = None
@@ -78,7 +79,7 @@ class Session:
             if old:
                 old.close()
             self.running = False
-            self.keys.clear()
+            self._clear_keys()
             if firmware.image == "bc5":
                 self._reset_display()
                 self.asset = None
@@ -139,7 +140,7 @@ class Session:
                 self._step(steps)
             elif action == "reset":
                 self.running = False
-                self.keys.clear()
+                self._clear_keys()
                 self.satellite = Satellite()
                 self._reset_display()
                 for worker in self.engines.values():
@@ -153,37 +154,54 @@ class Session:
             self.log("control", action)
             return {"ok": True, "message": action}
 
-    def key(self, key: str, pressed: bool) -> dict:
+    def _clear_keys(self) -> None:
+        self.keys.clear()
+        for key in self.key_generations:
+            self.key_generations[key] += 1
+
+    def key(self, key: str, pressed: bool, generation: int | None = None) -> dict:
         if key not in ALL_KEYS or type(pressed) is not bool:
             raise ValueError("Unknown key or invalid pressed state")
+        if generation is not None and (type(generation) is not int or generation < 0):
+            raise ValueError("generation must be a nonnegative integer")
         with self._lock:
             self._ensure_open()
+            if generation is not None and generation != self.key_generations[key]:
+                return {"ok": True, "delivered": False, "message": "Stale key event ignored",
+                        "generation": self.key_generations[key]}
             if (key in self.keys) == pressed:
-                return {"ok": True, "delivered": False, "message": "Unchanged key state"}
-            if pressed:
-                self.keys.add(key)
-            else:
-                self.keys.discard(key)
+                if not pressed:
+                    # A release arriving first cancels a press still in flight.
+                    self.key_generations[key] += 1
+                return {"ok": True, "delivered": False, "message": "Unchanged key state",
+                        "generation": self.key_generations[key]}
             delivered = False
-            if self.ui_initialized and key in KEY_CODES:
-                worker = self.engines["bc5"]
-                try:
+            try:
+                if self.ui_initialized and key in KEY_CODES:
+                    worker = self.engines["bc5"]
                     self._idle(worker)
                     callback = worker.request("read", address=0xF6FB, count=2)["values"]
                     if callback == [0, 0]:
                         self.ui_initialized = False
                         raise EngineError("Firmware key handler is absent; reset before reinitializing")
                     self._call(worker, 0x67F04, al=KEY_CODES[key], ah=1 if pressed else 4, steps=100000)
-                    self._idle(worker)
                     delivered = True
-                except EngineError:
-                    self.running = False
-                    raise
+                if pressed:
+                    self.keys.add(key)
+                else:
+                    self.keys.discard(key)
+                    self.key_generations[key] += 1
+                if delivered:
+                    self._idle(worker)
+            except EngineError:
+                self.running = False
+                raise
             message = f"{key} {'down' if pressed else 'up'} " + (
                 "delivered through original software key routine" if delivered else
                 "recorded; initialize the application first or use a mapped key")
             self.log("key", message)
-            return {"ok": True, "delivered": delivered, "message": message}
+            return {"ok": True, "delivered": delivered, "message": message,
+                    "generation": self.key_generations[key]}
 
     def probe(self, image: str, operation: str, arguments: dict) -> dict:
         if operation not in ("read", "write", "call", "state", "pins", "uart_rx", "uart_tx", "spi"):
@@ -231,6 +249,7 @@ class Session:
             return {"firmware": primary.describe(), "images": [item.describe() for item in self.firmware.values()],
                     "processors": [dict(worker.state) for worker in self.engines.values()],
                     "running": self.running, "keys": sorted(self.keys),
+                    "key_generations": dict(self.key_generations),
                     "satellite": self.satellite.state(), "events": list(self.events),
                     "asset": self.asset, "lcd": lcd, "ui_initialized": self.ui_initialized,
                     "fidelity": {"complete": False, "limitations": LIMITATIONS}}

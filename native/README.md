@@ -24,10 +24,12 @@ The worker emits an initial JSON state, then one response for each newline-delim
 | `{"op":"call","entry":476,"al":40960,"ah":123,"stack":[1],"steps":10000}` | BC5-only explicit debugger function probe at a byte address. Execute the original routine with AL/AH/stack arguments. Return state with `last_call`. |
 | `{"op":"pins","port":0,"value":255}` | AVR external input levels, ports 0–3. Return state. |
 | `{"op":"uart_rx","port":0,"value":65}` | Queue one AVR UART input byte, port 0 or 1. Return state, or `UartFull`. |
-| `{"op":"uart_tx","port":0}` | Pop a transmitted AVR byte; return `{value: byte_or_null}`. |
+| `{"op":"uart_tx","port":0}` | Pop a transmitted AVR byte; return `{value: byte_or_null, dropped: cumulative_lost_bytes}`. |
 | `{"op":"spi","value":0}` | Clock one AVR slave transfer; return `{value: byte_or_null}`. |
 
 Memory requests are capped at 4096 units and input lines at 64 KiB. CPU fuel bounds block-copy work independently of the instruction count. Access logs are flushed every 1024 steps. SPARC register latches are capped at 65,536 entries. These are host resource limits, reported as stops where relevant.
+
+AVR watchdog reset requests stop execution with `halt: "firmware-reset-requested"` until an explicit `reset`. The host does not perform an automatic watchdog reboot. Each AVR UART output capture holds 255 bytes; additional completed transmissions increment that port's dropped-byte count. State reports both counts as `uart_tx_dropped: [port0, port1]` (`null` for other processors). Reading captured bytes does not clear these counts; `reset` clears them.
 
 The state includes `image`, `pc`, `program_pc`, `steps`, `at_idle`, `halt`, `registers`, `register_names`, `flags`, `sp`, `cycles`, `milestones`, `unclassified_accesses`, `lcd_bytes`, `lcd_dropped`, `last_call`, `mmu_assumption`, `flash_assumption`, `model_error` and `model`. `pc` uses BC5 registry byte offsets, AVR byte offsets or SPARC virtual addresses; `program_pc` retains each CPU's native addressing. `cycles` is implemented for AVR only. Milestones mark entries at the known profile addresses; they do not certify successful hardware initialization. The BC5 panic entry at 0x70A0 is a diagnostic breakpoint that stops before executing that routine. The known watchdog wait loop at 0x184F0 is reported as `firmware-reset-requested` when its watchdog enable registers match the original reset sequence; the host can then issue `warm_reset` without inventing watchdog timing.
 
