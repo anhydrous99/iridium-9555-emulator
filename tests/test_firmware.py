@@ -7,18 +7,20 @@ import zlib
 
 from iridium.firmware import (BC5_CODE_BYTES, BC5_DATA_BYTES, BC5_PAYLOAD_BYTES,
                               FirmwareError, load_firmware, parse_firmware)
+from iridium.profiles import PROFILES
 
 
-def make_dfu():
+def make_dfu(model="9555"):
+    profile = PROFILES[model]
     header = 0x3C8
-    end = header + 24 + BC5_PAYLOAD_BYTES
+    end = header + 24 + profile.payload_bytes
     data = bytearray(end + 20)
     struct.pack_into("<8sHIH", data, 0, b"CSR-dfu2", 2, len(data) - 16, header)
     struct.pack_into("<8s4I", data, header, b"CSRbcfw1", 0,
-                     BC5_CODE_BYTES + 4, BC5_DATA_BYTES + 0x10000, 0)
+                     profile.code_bytes + 4, profile.data_bytes + 0x10000, 0)
     struct.pack_into("<I", data, header + 8, zlib.crc32(data[header + 12:end]) ^ 0xFFFFFFFF)
     struct.pack_into("<I", data, end, zlib.crc32(data[:end]) ^ 0xFFFFFFFF)
-    struct.pack_into("<HHHH3sBI", data, end + 4, 0xFB23, 0xA555, 0x1EDD, 0x100, b"UFD", 16, 0)
+    struct.pack_into("<HHHH3sBI", data, end + 4, 0xFB23, profile.product, 0x1EDD, 0x100, b"UFD", 16, 0)
     struct.pack_into("<I", data, end + 16, zlib.crc32(data[:-4]) ^ 0xFFFFFFFF)
     return bytes(data)
 
@@ -92,6 +94,49 @@ class FirmwareTests(unittest.TestCase):
             path.write_bytes(self.dfu)
             self.assertEqual(load_firmware(Path(directory))[0].format, "CSR-dfu2")
             self.assertEqual(path.read_bytes(), self.dfu)
+
+    def test_extreme_container_selects_its_own_layout_and_checks_device(self):
+        dfu = make_dfu("9575")
+        image = parse_firmware(dfu, "renamed.dfu")
+        self.assertEqual(image.model, "9575")
+        self.assertEqual(image.describe()["firmware_version"], "HL25003")
+        self.assertEqual(len(image.data), 0x36BB22)
+        self.assertEqual(image.warnings, ())
+        with self.assertRaisesRegex(FirmwareError, "not the selected"):
+            parse_firmware(dfu, "main.dfu", model="9555")
+        wrong_device = bytearray(dfu)
+        struct.pack_into("<H", wrong_device, len(dfu) - 14, 0xA555)
+        with self.assertRaisesRegex(FirmwareError, "suffix"):
+            parse_firmware(wrong_device, "main.dfu", allow_invalid_crc=True)
+        patched = bytearray(dfu)
+        patched[0x3E0] = 4
+        with self.assertRaisesRegex(FirmwareError, "CRC mismatch"):
+            parse_firmware(patched, "main.dfu")
+        self.assertEqual(len(parse_firmware(patched, "main.dfu", allow_invalid_crc=True).warnings), 3)
+
+    def test_extreme_raw_images_and_explicit_model_validation(self):
+        for processor in ("bc5", "avr"):
+            raw = bytes(PROFILES["9575"].image_sizes[processor])
+            image = parse_firmware(raw, "patched.bin")
+            self.assertEqual((image.model, image.image), ("9575", processor))
+            with self.assertRaises(FirmwareError):
+                parse_firmware(raw, "patched.bin", model="9555")
+        image = parse_firmware(bytes(0x36BB22) + b"CRC!", "patch.bin")
+        self.assertEqual(len(image.data), 0x36BB22)
+        with self.assertRaises(FirmwareError):
+            parse_firmware(bytes(8678), "avr.bin", model="9575")
+        with self.assertRaises(FirmwareError):
+            parse_firmware(bytes(8678), "avr.bin", model="invalid")
+
+    def test_directory_propagates_primary_model_to_shared_modem_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.dfu").write_bytes(make_dfu("9575"))
+            (root / "avr.bin").write_bytes(bytes(14296))
+            (root / "trx_seg1_0x10000.bin").write_bytes(bytes(0x260760))
+            self.assertEqual([image.model for image in load_firmware(root)], ["9575"] * 3)
+            self.assertEqual(load_firmware(root, "trx")[0].model, "9575")
+            self.assertEqual(len(load_firmware(root, "bc5")), 1)
 
 
 if __name__ == "__main__":

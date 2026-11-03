@@ -1,18 +1,18 @@
-//! avr5 CPU core for the ATmega164P (ARCHITECTURE §6.1): a switch interpreter over `decode`, exact
+//! avr5 CPU core for ATmega164P and the 640/1280 family (ARCHITECTURE §6.1): a switch interpreter over `decode`, exact
 //! SREG semantics (AVR Instruction Set Manual flag formulas), AVRe cycle counts for a 16-bit PC,
 //! interrupt entry, and hooks for calls/returns/accesses (harness E5, HLE, snippet filters).
 //!
 //! Data space: r0..r31 live in `data[0..32]` (the register file *is* data 0x00-0x1F, so stray
 //! pointer writes into it reproduce), SP and SREG live in `st` (data 0x5D-0x5F), every other data
 //! access goes through the bus (classification, E4 log, tape/device, fuel). Program memory is
-//! `prog` (16 KiB, little-endian words); the PC is a 13-bit word address.
+//! `prog` (up to 128 KiB, little-endian words); the default PC is a 13-bit word address.
 const std = @import("std");
 const common = @import("common");
 const dec = @import("decode.zig");
 
 pub const Bus = common.bus.Bus(common.bus.avr);
-pub const Data = [0x500]u8;
-pub const Prog = [0x4000]u8;
+pub const Data = [0x2200]u8;
+pub const Prog = [0x20000]u8;
 
 pub const pc_mask: u16 = 0x1FFF; // 8 Ki words = 16 KiB flash
 
@@ -83,6 +83,8 @@ pub const Cpu = struct {
     hooks: Hooks = .{},
     sys: ?Sys = null,
     stop: ?Stop = null,
+    /// ATmega164P by default; the Extreme's 640/1280-family profile uses a 16-bit PC.
+    program_mask: u16 = pc_mask,
     /// Charge one bus fuel unit per instruction (harness runs), as the bus charges per access.
     charge_fuel: bool = true,
     /// Executed instructions per op (snippet coverage); null when not counting.
@@ -121,7 +123,7 @@ pub const Cpu = struct {
     }
 
     pub fn fetch(c: *const Cpu, pc: u16) u16 {
-        const a = @as(usize, pc & pc_mask) * 2;
+        const a = @as(usize, pc & c.program_mask) * 2;
         return std.mem.readInt(u16, c.prog[a..][0..2], .little);
     }
 
@@ -167,7 +169,7 @@ pub const Cpu = struct {
     pub fn popPc(c: *Cpu) u16 {
         const hi: u16 = c.pop();
         const lo: u16 = c.pop();
-        return (hi << 8 | lo) & pc_mask;
+        return (hi << 8 | lo) & c.program_mask;
     }
 
     /// True when the run must end (bus stop or CPU stop).
@@ -381,7 +383,7 @@ pub const Cpu = struct {
             },
             .lpm_r0, .lpm, .lpm_inc => {
                 const z = c.reg16(30);
-                const v = c.prog[z & 0x3FFF];
+                const v = c.prog[@as(u32, z) & (@as(u32, c.program_mask) * 2 + 1)];
                 if (i.op == .lpm_r0) c.setReg(0, v) else c.setReg(d, v);
                 if (i.op == .lpm_inc) c.setReg16(30, z +% 1);
                 cyc = 3;
@@ -450,7 +452,7 @@ pub const Cpu = struct {
                     else => .icall,
                 };
                 cyc = if (i.op == .call) 4 else 3;
-                const action: CallAction = if (c.hooks.on_call) |f| f(c, @as(u32, target & pc_mask) * 2, next & pc_mask, kind) else .enter;
+                const action: CallAction = if (c.hooks.on_call) |f| f(c, @as(u32, target & c.program_mask) * 2, next & c.program_mask, kind) else .enter;
                 switch (action) {
                     .enter => {
                         c.pushPc(next);
@@ -471,7 +473,7 @@ pub const Cpu = struct {
             },
         }
         if (i.op == .bset and r == I) c.st.irq_hold = 1; // SEI: the next instruction runs first
-        c.st.pc = next & pc_mask;
+        c.st.pc = next & c.program_mask;
         return cyc;
     }
 
@@ -603,6 +605,25 @@ pub const TestRig = struct {
         }
     }
 };
+
+test "larger AVR profile preserves high program addresses and LPM byte addresses" {
+    var t: TestRig = .{};
+    try t.init(&.{0x0000});
+    defer t.deinit();
+    std.mem.writeInt(u16, t.prog[0x4000..][0..2], 0xE007, .little); // LDI r16,7
+    std.mem.writeInt(u16, t.prog[0x4002..][0..2], 0x95C8, .little); // LPM r0,Z
+    t.prog[0x4004] = 0xA5;
+    try testing.expectEqual(@as(u16, 0), t.cpu.fetch(0x2000)); // 164P wraps at 16 KiB.
+    t.cpu.program_mask = 0xFFFF;
+    t.cpu.st.pc = 0x2000;
+    t.cpu.setReg16(30, 0x4004);
+    try t.steps(2);
+    try testing.expectEqual(@as(u8, 7), t.cpu.reg(16));
+    try testing.expectEqual(@as(u8, 0xA5), t.cpu.reg(0));
+    try testing.expectEqual(@as(u16, 0x2002), t.cpu.st.pc);
+    t.cpu.pushPc(0x4321);
+    try testing.expectEqual(@as(u16, 0x4321), t.cpu.popPc());
+}
 
 test "ADD/ADC/SUB/SBC/CP flags (instruction set manual formulas)" {
     var t: TestRig = .{};

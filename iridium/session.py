@@ -10,20 +10,17 @@ from .assets import AssetError, BC5Assets
 from .engine import Engine, EngineError
 from .firmware import Firmware
 from .lcd import ST7541
+from .profiles import KEY_CODES, PROFILES
 from .satellite import Satellite
 
 
-KEY_CODES = {str(n): 0x64 + n for n in range(10)} | {
-    "*": 0x79, "#": 0x78, "up": 0x82, "down": 0x83,
-    "soft_left": 0x96, "soft_right": 0x97, "green": 0x8D,
-    "red": 0x8C, "volume_up": 0xA0, "volume_down": 0xA1, "power": 0xAA,
-}
-ALL_KEYS = set(KEY_CODES) | {"convenience"}
+ALL_KEYS = set(KEY_CODES) | {"power", "convenience", "sos"}
 LIMITATIONS = [
-    "Partial hardware model: this is not yet a complete Iridium 9555 emulator.",
+    "Partial hardware model: this is not yet a complete handset emulator.",
     "Processors execute independently; BC5–AVR–modem board links are not coupled.",
     "Natural handset startup is unresolved; experimental initialization calls original firmware routines.",
     "Keys use the original software input entry after explicit initialization; electrical wiring is unresolved.",
+    "The physical power control is recorded only; its board power circuit is not connected.",
     "LCD output uses an inferred controller model; resource previews remain separate from live output.",
     "Satellite service scenarios are offline and are not connected to the modem firmware.",
     "Modem boot ROM, DSP/RF behavior, SIM/provisioning and hardware timing are incomplete.",
@@ -32,9 +29,12 @@ LIMITATIONS = [
 
 class Session:
     def __init__(self, executable: Path, firmware: list[Firmware], engine_factory=Engine):
+        if not firmware or len({item.model for item in firmware}) != 1:
+            raise ValueError("Load at least one image, all for the same handset model")
+        self.model = firmware[0].model
         self._executable = executable
         self._engine_factory = engine_factory
-        self._temporary = tempfile.TemporaryDirectory(prefix="iridium-9555-")
+        self._temporary = tempfile.TemporaryDirectory(prefix="iridium-")
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
@@ -62,17 +62,31 @@ class Session:
     def log(self, kind: str, message: str) -> None:
         self.events.append({"time": time.strftime("%H:%M:%S"), "kind": kind, "message": message})
 
+    @property
+    def profile(self):
+        return PROFILES[self.model]
+
     def load(self, firmware: Firmware) -> None:
         with self._lock:
             self._ensure_open()
+            if firmware.model != self.model and firmware.image != "bc5":
+                raise ValueError("Load the new handset's BC5 image before its auxiliary processors")
             # A replacement worker is ready before the previous experiment is discarded.
             with tempfile.NamedTemporaryFile(dir=self._temporary.name, suffix=".bin", delete=False) as out:
                 out.write(firmware.data)
                 path = Path(out.name)
             try:
-                worker = self._engine_factory(self._executable, firmware.image, path)
+                worker = self._engine_factory(self._executable, firmware.image, path, model=firmware.model)
             finally:
                 path.unlink(missing_ok=True)
+            if firmware.model != self.model:
+                # The new primary image starts a separate board experiment.
+                for old in self.engines.values():
+                    old.close()
+                self.engines.clear()
+                self.firmware.clear()
+                self.model = firmware.model
+                self.satellite = Satellite()
             old = self.engines.get(firmware.image)
             self.engines[firmware.image] = worker
             self.firmware[firmware.image] = firmware
@@ -84,10 +98,11 @@ class Session:
                 self._reset_display()
                 self.asset = None
                 try:
-                    bitmap = BC5Assets(firmware.data).bitmap(19, 49)
+                    file_id = firmware.profile.animation_file
+                    bitmap = BC5Assets(firmware.data, firmware.profile).bitmap(file_id, 49)
                     self.asset = {"width": bitmap.width, "height": bitmap.height,
                                   "pixels": list(bitmap.pixels), "frame": 49,
-                                  "frames": bitmap.frame_count, "source": "firmware resource 19",
+                                  "frames": bitmap.frame_count, "source": f"firmware resource {file_id}",
                                   "live": False}
                 except AssetError as error:
                     self.log("asset", str(error))
@@ -160,12 +175,14 @@ class Session:
             self.key_generations[key] += 1
 
     def key(self, key: str, pressed: bool, generation: int | None = None) -> dict:
-        if key not in ALL_KEYS or type(pressed) is not bool:
+        if not isinstance(key, str) or type(pressed) is not bool:
             raise ValueError("Unknown key or invalid pressed state")
         if generation is not None and (type(generation) is not int or generation < 0):
             raise ValueError("generation must be a nonnegative integer")
         with self._lock:
             self._ensure_open()
+            if key not in self.profile.keys:
+                raise ValueError("Unknown key for this handset")
             if generation is not None and generation != self.key_generations[key]:
                 return {"ok": True, "delivered": False, "message": "Stale key event ignored",
                         "generation": self.key_generations[key]}
@@ -177,14 +194,15 @@ class Session:
                         "generation": self.key_generations[key]}
             delivered = False
             try:
-                if self.ui_initialized and key in KEY_CODES:
+                key_code = self.profile.key_codes.get(key)
+                if self.ui_initialized and key_code is not None:
                     worker = self.engines["bc5"]
                     self._idle(worker)
-                    callback = worker.request("read", address=0xF6FB, count=2)["values"]
+                    callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
                     if callback == [0, 0]:
                         self.ui_initialized = False
                         raise EngineError("Firmware key handler is absent; reset before reinitializing")
-                    self._call(worker, 0x67F04, al=KEY_CODES[key], ah=1 if pressed else 4, steps=100000)
+                    self._call(worker, self.profile.key_entry, al=key_code, ah=1 if pressed else 4, steps=100000)
                     delivered = True
                 if pressed:
                     self.keys.add(key)
@@ -198,7 +216,8 @@ class Session:
                 raise
             message = f"{key} {'down' if pressed else 'up'} " + (
                 "delivered through original software key routine" if delivered else
-                "recorded; initialize the application first or use a mapped key")
+                "recorded; this control's hardware input is not connected" if key_code is None else
+                "recorded; initialize the application first")
             self.log("key", message)
             return {"ok": True, "delivered": delivered, "message": message,
                     "generation": self.key_generations[key]}
@@ -246,13 +265,17 @@ class Session:
             lcd = self.lcd.state() if self.lcd_seen else None
             if lcd and self.lcd_capture_error:
                 lcd["error"] = self.lcd_capture_error
-            return {"firmware": primary.describe(), "images": [item.describe() for item in self.firmware.values()],
+            limitations = list(LIMITATIONS)
+            if self.model == "9575":
+                limitations.append("9575 GPS receiver, location reports and SOS service transport are not connected.")
+            return {"handset": self.profile.describe(),
+                    "firmware": primary.describe(), "images": [item.describe() for item in self.firmware.values()],
                     "processors": [dict(worker.state) for worker in self.engines.values()],
                     "running": self.running, "keys": sorted(self.keys),
                     "key_generations": dict(self.key_generations),
                     "satellite": self.satellite.state(), "events": list(self.events),
                     "asset": self.asset, "lcd": lcd, "ui_initialized": self.ui_initialized,
-                    "fidelity": {"complete": False, "limitations": LIMITATIONS}}
+                    "fidelity": {"complete": False, "limitations": limitations}}
 
     def _reset_display(self) -> None:
         self.ui_initialized = False
@@ -307,20 +330,22 @@ class Session:
         self.ui_attempted = True
         worker = self.engines["bc5"]
         self._idle(worker)
-        if worker.request("read", address=0xF719, count=1)["values"] == [0]:
-            self._call(worker, 0x6365E, steps=10000000)
-        setup = self._request(worker, "call", entry=0x8CC8C, steps=10000000)
+        if worker.request("read", address=self.profile.graphics_pointer, count=1)["values"] == [0]:
+            self._call(worker, self.profile.graphics_init, steps=10000000)
+        setup = self._request(worker, "call", entry=self.profile.application_setup, steps=10000000)
         if setup.get("halt") == "firmware-reset-requested":
             # Blank settings make the original factory routine program defaults and reboot.
             self._request(worker, "warm_reset")
             self._idle(worker)
             self.log("firmware", "Original factory defaults retained across the requested warm reset")
-            self._call(worker, 0x8CC8C, steps=10000000)
+            self._call(worker, self.profile.application_setup, steps=10000000)
         elif setup.get("halt") or not (setup.get("last_call") or {}).get("returned"):
             raise EngineError(f"Original application setup did not return: {setup.get('halt')}")
-        self._call(worker, 0x8CC5E, steps=10000000)
+        # Follow the original power-on branch; bypassing it lets the charging UI cover the animation.
+        self._call(worker, self.profile.power_on, al=0, steps=10000000)
+        self._call(worker, 0x6A092, al=3, steps=10000000)
         self._idle(worker)
-        callback = worker.request("read", address=0xF6FB, count=2)["values"]
+        callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
         if callback == [0, 0]:
             raise EngineError("Original initialization did not install a key handler")
         if self.lcd_capture_error:

@@ -15,7 +15,8 @@ class EngineError(RuntimeError):
 
 
 class Engine:
-    def __init__(self, executable: Path, image: str, firmware: Path, timeout: float = 30):
+    def __init__(self, executable: Path, image: str, firmware: Path, timeout: float = 30,
+                 *, model: str = "9555"):
         self._lock = threading.Lock()
         self._buffer = bytearray()
         self._timeout = timeout
@@ -24,7 +25,7 @@ class Engine:
         self._process = None
         try:
             self._process = subprocess.Popen(
-                [str(executable), "--image", image, "--firmware", str(firmware)],
+                [str(executable), "--image", image, "--firmware", str(firmware), "--model", model],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
             self._selector.register(self._process.stdout, selectors.EVENT_READ)
             self.state = self._receive()

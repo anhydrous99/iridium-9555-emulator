@@ -1,4 +1,5 @@
-//! ATmega164P peripheral models for system runs (ARCHITECTURE §6.1, §7.4; avr-full §2, §3, §8-§10):
+//! ATmega164P peripheral models with a 640/1280-family profile for system runs
+//! (ARCHITECTURE §6.1, §7.4; avr-full §2, §3, §8-§10; docs/9575-native.md):
 //! GPIO ports A-D with pin-change interrupts, Timer0/1/2 (normal, CTC, fast PWM, phase-correct,
 //! TEMP-latched 16-bit access), USART0/1 (frame timing from UBRR/U2X/UCSRnC, 2-byte RX FIFO, DOR),
 //! SPI (slave transfers driven by the host side, master transfers), EEPROM (EEMPE/EEPE sequence,
@@ -70,6 +71,10 @@ pub const OCR2A = 0xB3;
 pub const OCR2B = 0xB4;
 pub const UCSR0A = 0xC0;
 pub const UCSR1A = 0xC8;
+pub const UCSR2A = 0xD0;
+pub const UCSR3A = 0x130;
+const uart_bases = [_]u16{ UCSR0A, UCSR1A, UCSR2A, UCSR3A };
+const port_bases = [_]u16{ 0x20, 0x23, 0x26, 0x29, 0x2C, 0x2F, 0x32, 0x100, 0x103, 0x106, 0x109 };
 
 // PRR bits
 const PRADC = 0x01;
@@ -165,9 +170,9 @@ pub const State = extern struct {
     ocr1b_buf: u16 = 0,
     analog: [8]u16 = @splat(0x3FF),
     /// I/O registers by data address (index < 0x20 unused).
-    io: [0x100]u8 = @splat(0),
-    pins_in: [4]u8 = @splat(0),
-    pin_last: [4]u8 = @splat(0),
+    io: [0x200]u8 = @splat(0),
+    pins_in: [11]u8 = @splat(0),
+    pin_last: [11]u8 = @splat(0),
     ocr0a_buf: u8 = 0,
     ocr0b_buf: u8 = 0,
     ocr2a_buf: u8 = 0,
@@ -184,8 +189,8 @@ pub const State = extern struct {
     adc_first: u8 = 1,
     reset_request: u8 = 0,
     _pad: [5]u8 = @splat(0),
-    usart: [2]Usart = .{ .{}, .{} },
-    ee: [512]u8 = @splat(0xFF),
+    usart: [4]Usart = .{ .{}, .{}, .{}, .{} },
+    ee: [4096]u8 = @splat(0xFF),
     /// Cycles of the running conversion left when it samples (sample-and-hold), and the sampled value.
     adc_hold: u32 = 0,
     adc_held: u16 = 0,
@@ -238,6 +243,8 @@ pub const Devices = struct {
     /// A17, hypothesis AV-open-bus (API.md): a read above SRAM or of a register without a model and with
     /// an exhausted or no tape returns 0 instead of ending the run. Set for system runs (`enableSystem`).
     open_bus: bool = false,
+    /// HL25003 uses the 8 KiB-SRAM ATmega640/1280 family register/vector layout.
+    mega: bool = false,
 
     /// Power-on reset (EEPROM keeps its contents; the 1-Wire slave and its memory are on the board).
     pub fn reset(d: *Devices) void {
@@ -254,7 +261,11 @@ pub const Devices = struct {
         d.st.io[MCUSR] = 0x01; // PORF
         d.st.io[0x66] = 0x80; // OSCCAL: factory value unknown [unk]
         d.st.io[ADCSRA] = 0;
-        for (0..4) |p| d.st.pin_last[p] = d.pin(@intCast(p));
+        for (0..d.portCount()) |p| d.st.pin_last[p] = d.pin(@intCast(p));
+        if (d.mega) for (uart_bases[2..]) |base| {
+            d.st.io[base] = 0x20;
+            d.st.io[base + 2] = 0x06;
+        };
     }
 
     pub fn device(d: *Devices) common.bus.Device {
@@ -267,14 +278,14 @@ pub const Devices = struct {
 
     // ---- host side (scenario stimulus) ------------------------------------------------------
 
-    /// Levels the outside world drives on port `p` (0 = A .. 3 = D) input pins.
-    pub fn setPinsIn(d: *Devices, p: u2, levels: u8) void {
+    /// Input levels, A–D for 164P; A–H/J/K/L for the 640/1280 profile.
+    pub fn setPinsIn(d: *Devices, p: u4, levels: u8) void {
         d.st.pins_in[p] = levels;
         d.pinChange();
     }
 
     /// One byte arrives on USARTn's RXD line (queued behind earlier ones; false if the queue is full).
-    pub fn uartPush(d: *Devices, n: u1, b: u8) bool {
+    pub fn uartPush(d: *Devices, n: u2, b: u8) bool {
         const u = &d.st.usart[n];
         const next: u8 = (u.in_tail + 1) % @as(u8, u.in_ring.len);
         if (next == u.in_head) return false;
@@ -284,7 +295,7 @@ pub const Devices = struct {
     }
 
     /// Next byte USARTn finished transmitting, if any.
-    pub fn uartPop(d: *Devices, n: u1) ?u8 {
+    pub fn uartPop(d: *Devices, n: u2) ?u8 {
         const u = &d.st.usart[n];
         if (u.out_head == u.out_tail) return null;
         defer u.out_head +%= 1;
@@ -338,8 +349,8 @@ pub const Devices = struct {
         // OC2B has the pin for COM2B 2/3, and for COM2B 1 (toggle) outside PWM; else PORTD6 does
         const com = (io[TCCR2A] >> 4) & 3;
         const wgm = ((io[TCCR2B] >> 1) & 4) | (io[TCCR2A] & 3);
-        const level = if (com >= 2 or (com == 1 and (wgm == 0 or wgm == 2))) d.st.oc2b != 0 else io[0x2B] & 0x40 != 0;
-        const low: u8 = @intFromBool(io[0x2A] & 0x40 != 0 and level);
+        const level = if (com >= 2 or (com == 1 and (wgm == 0 or wgm == 2))) d.st.oc2b != 0 else io[if (d.mega) @as(usize, 0x102) else 0x2B] & 0x40 != 0;
+        const low: u8 = @intFromBool(io[if (d.mega) @as(usize, 0x101) else 0x2A] & 0x40 != 0 and level);
         if (low == ow.master_low) return;
         ow.master_low = low;
         if (ow.connected == 0 or ow.present == 0) return;
@@ -403,6 +414,52 @@ pub const Devices = struct {
         return f_osc >> @intCast(@min(d.st.io[CLKPR] & 0x0F, 8));
     }
 
+    pub fn uartCount(d: *const Devices) usize {
+        return if (d.mega) 4 else 2;
+    }
+    pub fn portCount(d: *const Devices) usize {
+        return if (d.mega) 11 else 4;
+    }
+
+    fn uartIndex(base: u16) u2 {
+        return switch (base) {
+            UCSR0A => 0,
+            UCSR1A => 1,
+            UCSR2A => 2,
+            UCSR3A => 3,
+            else => unreachable,
+        };
+    }
+
+    fn portFor(d: *const Devices, a: u16) ?u4 {
+        for (port_bases[0..d.portCount()], 0..) |base, i| {
+            if (a >= base and a < base + 3) return @intCast(i);
+        }
+        return null;
+    }
+
+    fn registerAccess(d: *const Devices, a: u16) Access {
+        if (d.mega) {
+            for (uart_bases[2..]) |base| {
+                if (a == base or a == base + 6) return .model;
+                if (a > base and a < base + 6 and a != base + 3) return .store;
+            }
+            if (a == 0x65) return .store; // PRR1
+        }
+        return if (a < access.len) access[a] else .tape;
+    }
+
+    fn vector(d: *const Devices, v: u8) u8 {
+        if (!d.mega) return v;
+        return switch (v) {
+            4...6 => v + 5,
+            8...14 => v + 4,
+            15...22, 24...25 => v + 5,
+            28...30 => v + 8,
+            else => 255,
+        };
+    }
+
     // ---- register access ----------------------------------------------------------------------
 
     fn busRead(ctx: *anyopaque, addr: u32, bits: u8) u64 {
@@ -425,15 +482,16 @@ pub const Devices = struct {
         return 0;
     }
 
-    pub fn pin(d: *const Devices, p: u2) u8 {
-        const ddr = d.st.io[PINA + 3 * @as(u16, p) + 1];
-        const port = d.st.io[PINA + 3 * @as(u16, p) + 2];
+    pub fn pin(d: *const Devices, p: u4) u8 {
+        const ddr = d.st.io[port_bases[p] + 1];
+        const port = d.st.io[port_bases[p] + 2];
         return (ddr & port) | (~ddr & d.st.pins_in[p]);
     }
 
     pub fn read(d: *Devices, a: u16) u8 {
-        if (a >= 0x100) return d.tapeRead(a);
-        switch (access[a]) {
+        if (a >= (if (d.mega) @as(u16, 0x200) else 0x100)) return d.tapeRead(a);
+        if (d.portFor(a)) |p| return if (a == port_bases[p]) d.pin(p) else d.st.io[a];
+        switch (d.registerAccess(a)) {
             .tape => return d.tapeRead(a),
             .store => return d.st.io[a],
             .model => {},
@@ -462,16 +520,16 @@ pub const Devices = struct {
                 d.spiClearSeen();
                 return d.st.spi_rx;
             },
-            UCSR0A, UCSR1A => {
-                const u = &d.st.usart[if (a == UCSR0A) 0 else 1];
+            UCSR0A, UCSR1A, UCSR2A, UCSR3A => {
+                const u = &d.st.usart[uartIndex(a)];
                 var v = io[a] & 0x43; // TXC, U2X, MPCM
                 if (u.rx_n > 0) v |= 0x80;
                 if (u.tx_full == 0) v |= 0x20;
                 if (u.dor != 0) v |= 0x08;
                 return v;
             },
-            UCSR0A + 6, UCSR1A + 6 => {
-                const u = &d.st.usart[if (a == UCSR0A + 6) 0 else 1];
+            UCSR0A + 6, UCSR1A + 6, UCSR2A + 6, UCSR3A + 6 => {
+                const u = &d.st.usart[uartIndex(a - 6)];
                 const v = u.rx_fifo[0];
                 if (u.rx_n > 0) {
                     u.rx_fifo[0] = u.rx_fifo[1];
@@ -485,8 +543,14 @@ pub const Devices = struct {
     }
 
     pub fn write(d: *Devices, a: u16, v: u8) void {
-        if (a >= 0x100) return;
-        switch (access[a]) {
+        if (a >= (if (d.mega) @as(u16, 0x200) else 0x100)) return;
+        if (d.portFor(a)) |p| {
+            if (a == port_bases[p]) d.st.io[a + 2] ^= v else d.st.io[a] = v;
+            d.pinChange();
+            d.owDrive();
+            return;
+        }
+        switch (d.registerAccess(a)) {
             .tape => return,
             .store => {
                 d.st.io[a] = v;
@@ -531,12 +595,12 @@ pub const Devices = struct {
                     d.st.master_busy = 8 * spiDivider(io);
                 } else if (d.st.master_busy != 0) io[SPSR] |= 0x40; // WCOL
             },
-            UCSR0A, UCSR1A => {
+            UCSR0A, UCSR1A, UCSR2A, UCSR3A => {
                 io[a] = (io[a] & ~@as(u8, 0x43)) | (v & 0x03); // U2X, MPCM
                 if (v & 0x40 != 0) io[a] &= ~@as(u8, 0x40); // TXC is write-one-to-clear
             },
-            UCSR0A + 6, UCSR1A + 6 => {
-                const n: u1 = if (a == UCSR0A + 6) 0 else 1;
+            UCSR0A + 6, UCSR1A + 6, UCSR2A + 6, UCSR3A + 6 => {
+                const n: u2 = uartIndex(a - 6);
                 const u = &d.st.usart[n];
                 if (io[a - 6 + 1] & 0x08 == 0 or u.tx_full != 0) return; // TXEN off or buffer full: ignored
                 u.tx_buf = v;
@@ -584,8 +648,9 @@ pub const Devices = struct {
         }
     }
 
-    fn eeAddr(d: *const Devices) u9 {
-        return @truncate(@as(u16, d.st.io[EEARH] & 1) << 8 | d.st.io[EEARL]);
+    fn eeAddr(d: *const Devices) u12 {
+        const mask: u8 = if (d.mega) 15 else 1;
+        return @intCast(@as(u16, d.st.io[EEARH] & mask) << 8 | d.st.io[EEARL]);
     }
 
     fn spiClearSeen(d: *Devices) void {
@@ -595,13 +660,22 @@ pub const Devices = struct {
         }
     }
 
-    fn spiDivider(io: *const [0x100]u8) u32 {
+    fn spiDivider(io: *const [0x200]u8) u32 {
         const sel = (io[SPCR] & 3) | @as(u8, io[SPSR] & 1) << 2;
         const divs = [8]u32{ 4, 16, 64, 128, 2, 8, 32, 64 };
         return divs[sel];
     }
 
     fn pinChange(d: *Devices) void {
+        if (d.mega) {
+            const now = [_]u8{ d.pin(1), (d.pin(4) & 1) | (d.pin(8) << 1), d.pin(9) };
+            for (now, 0..) |value, p| {
+                if ((value ^ d.st.pin_last[p]) & d.st.io[PCMSK0 + p] != 0)
+                    d.st.io[PCIFR] |= @as(u8, 1) << @intCast(p);
+                d.st.pin_last[p] = value;
+            }
+            return;
+        }
         for (0..4) |p| {
             const now = d.pin(@intCast(p));
             const changed = now ^ d.st.pin_last[p];
@@ -658,7 +732,7 @@ pub const Devices = struct {
         io[ADCSRA] = (io[ADCSRA] & ~@as(u8, 0x40)) | 0x10;
     }
 
-    fn uartFrameCycles(io: *const [0x100]u8, base: u16) u32 {
+    fn uartFrameCycles(io: *const [0x200]u8, base: u16) u32 {
         const b = io[base + 1];
         const cc = io[base + 2];
         const ubrr: u32 = (@as(u32, io[base + 5] & 0x0F) << 8) | io[base + 4];
@@ -668,12 +742,12 @@ pub const Devices = struct {
         return bits * per_bit;
     }
 
-    fn uartShift(d: *Devices, n: u1) void {
+    fn uartShift(d: *Devices, n: u2) void {
         const u = &d.st.usart[n];
         if (u.tx_busy != 0 or u.tx_full == 0) return;
         u.tx_shift = u.tx_buf;
         u.tx_full = 0;
-        u.tx_busy = uartFrameCycles(&d.st.io, if (n == 0) UCSR0A else UCSR1A);
+        u.tx_busy = uartFrameCycles(&d.st.io, uart_bases[n]);
     }
 
     // ---- time ------------------------------------------------------------------------------
@@ -717,7 +791,10 @@ pub const Devices = struct {
         if (ocf0a == 0 and io[TIFR0] & 2 != 0 and io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == 3 and d.st.adc_busy == 0 and io[PRR] & PRADC == 0) d.adcStart(true);
         if (io[PRR] & PRTIM1 == 0) d.timer16(ticks(old01, d.st.pre01, div01[io[TCCR1B] & 7]));
         if (io[PRR] & PRTIM2 == 0) d.timer8(2, ticks(old2, d.st.pre2, div2[io[TCCR2B] & 7]));
-        for (0..2) |k| if (io[PRR] & @as(u8, if (k == 0) PRUSART0 else PRUSART1) == 0) d.uartTick(@intCast(k), cycles);
+        for (0..d.uartCount()) |k| {
+            const mask: u8 = if (k == 0) PRUSART0 else if (d.mega) @as(u8, 1) << @intCast(k - 1) else PRUSART1;
+            if (io[if (d.mega and k > 0) 0x65 else PRR] & mask == 0) d.uartTick(@intCast(k), cycles);
+        }
         if (d.st.master_busy > 0) {
             d.st.master_busy -|= cycles;
             if (d.st.master_busy == 0) {
@@ -753,9 +830,9 @@ pub const Devices = struct {
         return new / div - old / div;
     }
 
-    fn uartTick(d: *Devices, n: u1, cycles: u32) void {
+    fn uartTick(d: *Devices, n: u2, cycles: u32) void {
         const u = &d.st.usart[n];
-        const base: u16 = if (n == 0) UCSR0A else UCSR1A;
+        const base: u16 = uart_bases[n];
         const io = &d.st.io;
         var left = cycles;
         while (left > 0 and u.tx_busy > 0) {
@@ -863,7 +940,7 @@ pub const Devices = struct {
         if (d.st.oc2b != was) d.owDrive();
     }
 
-    fn t1Pwm(io: *const [0x100]u8) bool {
+    fn t1Pwm(io: *const [0x200]u8) bool {
         const wgm = ((io[TCCR1B] >> 1) & 0xC) | (io[TCCR1A] & 3);
         return wgm != 0 and wgm != 4 and wgm != 12 and wgm != 13;
     }
@@ -928,6 +1005,15 @@ pub const Devices = struct {
 
     /// Lowest pending and enabled vector.
     pub fn pending(d: *const Devices) ?u8 {
+        if (d.pendingBase()) |vec| return d.vector(vec);
+        if (d.mega) {
+            if (d.usartPending(2)) |vec| return vec;
+            return d.usartPending(3);
+        }
+        return null;
+    }
+
+    fn pendingBase(d: *const Devices) ?u8 {
         const io = &d.st.io;
         const pc = io[PCIFR] & io[PCICR];
         if (pc != 0) return Vec.pcint0 + @as(u8, @ctz(pc));
@@ -952,9 +1038,9 @@ pub const Devices = struct {
         return d.usartPending(1);
     }
 
-    fn usartPending(d: *const Devices, n: u1) ?u8 {
-        const base: u16 = if (n == 0) UCSR0A else UCSR1A;
-        const v0: u8 = if (n == 0) Vec.usart0_rx else Vec.usart1_rx;
+    fn usartPending(d: *const Devices, n: u2) ?u8 {
+        const base: u16 = uart_bases[n];
+        const v0: u8 = ([_]u8{ Vec.usart0_rx, Vec.usart1_rx, 51, 54 })[n];
         const u = &d.st.usart[n];
         const b = d.st.io[base + 1];
         if (u.rx_n > 0 and b & 0x80 != 0) return v0;
@@ -963,9 +1049,22 @@ pub const Devices = struct {
         return null;
     }
 
-    fn sysAck(ctx: *anyopaque, vec: u8) void {
+    fn sysAck(ctx: *anyopaque, actual_vec: u8) void {
         const d: *Devices = @ptrCast(@alignCast(ctx));
         const io = &d.st.io;
+        if (d.mega and (actual_vec == 53 or actual_vec == 56)) {
+            io[if (actual_vec == 53) UCSR2A else UCSR3A] &= ~@as(u8, 0x40);
+            return;
+        }
+        var vec = actual_vec;
+        if (d.mega) {
+            for (4..31) |old| {
+                if (d.vector(@intCast(old)) == actual_vec) {
+                    vec = @intCast(old);
+                    break;
+                }
+            }
+        }
         switch (vec) {
             4...7 => io[PCIFR] &= ~(@as(u8, 1) << @intCast(vec - 4)),
             Vec.wdt => {
@@ -1256,4 +1355,57 @@ test "1-Wire: COM2B 1 (toggle) gives OC2B the pin outside PWM only" {
     try testing.expectEqual(@as(u8, 1), d.st.ow.master_low);
     d.write(TCCR2A, 0x13); // fast PWM: COM2B 1 is reserved (normal port operation)
     try testing.expectEqual(@as(u8, 0), d.st.ow.master_low);
+}
+
+test "640/1280 UARTs retain independent data and use the family interrupt vectors" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    for (uart_bases, [_]u8{ 25, 36, 51, 54 }, 0..) |base, vector_number, port| {
+        d.write(base + 1, 0x98); // RXCIE, RXEN, TXEN
+        const value: u8 = @intCast(65 + port);
+        try testing.expect(d.uartPush(@intCast(port), value));
+        d.tick(160);
+        try testing.expectEqual(@as(?u8, vector_number), d.pending());
+        try testing.expectEqual(value, d.read(base + 6));
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        d.write(base + 6, value + 8);
+        d.tick(160);
+        try testing.expectEqual(@as(?u8, value + 8), d.uartPop(@intCast(port)));
+    }
+    d.write(0x65, 2); // PRR1.PRUSART2
+    d.write(UCSR2A + 6, 0x55);
+    d.tick(1000);
+    try testing.expectEqual(@as(?u8, null), d.uartPop(2));
+    d.write(0x65, 0);
+    d.tick(160);
+    try testing.expectEqual(@as(?u8, 0x55), d.uartPop(2));
+}
+
+test "640/1280 extended GPIO, interrupt acknowledgement and full EEPROM addressing" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(PCMSK0 + 2, 1); // PCINT16 = PK0
+    d.write(PCICR, 4);
+    d.setPinsIn(9, 1);
+    try testing.expectEqual(@as(u8, 1), d.read(0x106));
+    try testing.expectEqual(@as(?u8, 11), d.pending());
+    const system = d.sys();
+    system.ack(system.ctx, 11);
+    try testing.expectEqual(@as(?u8, null), d.pending());
+    d.write(0x10A, 0x20); // DDRL5 output
+    d.write(0x109, 0x20); // PINL toggles PORTL
+    try testing.expectEqual(@as(u8, 0x20), d.read(0x109));
+    d.st.io[TIFR0] = 2;
+    d.st.io[TIMSK0] = 2;
+    try testing.expectEqual(@as(?u8, 21), d.pending());
+    system.ack(system.ctx, 21);
+    try testing.expectEqual(@as(?u8, null), d.pending());
+    d.write(EEARH, 0x0F);
+    d.write(EEARL, 0x80);
+    d.write(EEDR, 0x5A);
+    d.write(EECR, 4);
+    d.write(EECR, 2);
+    d.tick(@intCast(d.fCpu() * 34 / 10_000));
+    try testing.expectEqual(@as(u8, 0x5A), d.st.ee[0xF80]);
+    try testing.expectEqual(@as(u8, 0xFF), d.st.ee[0x180]);
 }
