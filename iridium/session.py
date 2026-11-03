@@ -2,6 +2,7 @@
 
 from collections import deque
 from pathlib import Path
+import re
 import tempfile
 import threading
 import time
@@ -44,6 +45,9 @@ class Session:
         self.events = deque(maxlen=200)
         self.keys = set()
         self.key_generations = {key: 0 for key in ALL_KEYS}
+        self.key_epoch = 0
+        self._key_clients = {}
+        self._key_sources = {key: set() for key in ALL_KEYS}
         self.satellite = Satellite()
         self.running = False
         self.asset = None
@@ -93,8 +97,8 @@ class Session:
             if old:
                 old.close()
             self.running = False
-            self._clear_keys()
             if firmware.image == "bc5":
+                self._clear_keys()
                 self._reset_display()
                 self.asset = None
                 try:
@@ -167,35 +171,61 @@ class Session:
             else:
                 raise ValueError("Unknown execution action")
             self.log("control", action)
-            return {"ok": True, "message": action}
+            return {"ok": True, "message": action, "key_epoch": self.key_epoch}
 
     def _clear_keys(self) -> None:
         self.keys.clear()
+        self.key_epoch += 1
+        self._key_clients.clear()
+        for sources in self._key_sources.values():
+            sources.clear()
         for key in self.key_generations:
             self.key_generations[key] += 1
 
-    def key(self, key: str, pressed: bool, generation: int | None = None) -> dict:
+    def key(self, key: str, pressed: bool, generation: int | None = None, *,
+            client_id: str | None = None, sequence: int | None = None,
+            epoch: int | None = None) -> dict:
         if not isinstance(key, str) or type(pressed) is not bool:
             raise ValueError("Unknown key or invalid pressed state")
         if generation is not None and (type(generation) is not int or generation < 0):
             raise ValueError("generation must be a nonnegative integer")
+        browser = any(value is not None for value in (client_id, sequence, epoch))
+        if browser:
+            if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
+                raise ValueError("client_id must contain 1 to 64 ASCII letters, digits, underscores or hyphens")
+            if type(sequence) is not int or not 1 <= sequence <= 2**53 - 1:
+                raise ValueError("sequence must be an integer from 1 to 9007199254740991")
+            if type(epoch) is not int or not 0 <= epoch <= 2**53 - 1:
+                raise ValueError("epoch must be a nonnegative safe integer")
+            if generation is not None:
+                raise ValueError("Use either browser sequencing or legacy generation")
         with self._lock:
             self._ensure_open()
             if key not in self.profile.keys:
                 raise ValueError("Unknown key for this handset")
+            response = {"ok": True, "delivered": False, "key_epoch": self.key_epoch,
+                        "generation": self.key_generations[key]}
+            if browser:
+                if epoch != self.key_epoch:
+                    return {**response, "message": "Stale key epoch ignored"}
+                if client_id not in self._key_clients:
+                    # shortcut: 128 clients until reset, add client leases if sessions need more pages.
+                    if len(self._key_clients) >= 128:
+                        raise ValueError("Key client limit (128) reached; reset the session before opening more clients")
+                    self._key_clients[client_id] = {}
+                sequences = self._key_clients[client_id]
+                if sequence <= sequences.get(key, 0):
+                    return {**response, "message": "Stale key sequence ignored"}
             if generation is not None and generation != self.key_generations[key]:
-                return {"ok": True, "delivered": False, "message": "Stale key event ignored",
-                        "generation": self.key_generations[key]}
-            if (key in self.keys) == pressed:
-                if not pressed:
-                    # A release arriving first cancels a press still in flight.
-                    self.key_generations[key] += 1
-                return {"ok": True, "delivered": False, "message": "Unchanged key state",
-                        "generation": self.key_generations[key]}
+                return {**response, "message": "Stale key event ignored"}
+            sources = self._key_sources[key]
+            source = client_id if browser else None
+            down = pressed or bool(sources - {source})
+            changed = (key in self.keys) != down
             delivered = False
             try:
                 key_code = self.profile.key_codes.get(key)
-                if self.ui_initialized and key_code is not None:
+                if changed and self.ui_initialized and key_code is not None:
                     worker = self.engines["bc5"]
                     self._idle(worker)
                     callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
@@ -205,9 +235,17 @@ class Session:
                     self._call(worker, self.profile.key_entry, al=key_code, ah=1 if pressed else 4, steps=100000)
                     delivered = True
                 if pressed:
+                    sources.add(source)
+                else:
+                    sources.discard(source)
+                if down:
                     self.keys.add(key)
                 else:
                     self.keys.discard(key)
+                if browser:
+                    # Record releases even when already up, cancelling older in-flight presses.
+                    sequences[key] = sequence
+                elif not pressed:
                     self.key_generations[key] += 1
                 if delivered:
                     self._idle(worker)
@@ -216,11 +254,12 @@ class Session:
                 raise
             message = f"{key} {'down' if pressed else 'up'} " + (
                 "delivered through original software key routine" if delivered else
+                "recorded; shared key state unchanged" if not changed else
                 "recorded; this control's hardware input is not connected" if key_code is None else
                 "recorded; initialize the application first")
             self.log("key", message)
             return {"ok": True, "delivered": delivered, "message": message,
-                    "generation": self.key_generations[key]}
+                    "generation": self.key_generations[key], "key_epoch": self.key_epoch}
 
     def probe(self, image: str, operation: str, arguments: dict) -> dict:
         if operation not in ("read", "write", "call", "state", "pins", "uart_rx", "uart_tx", "spi"):
@@ -273,6 +312,7 @@ class Session:
                     "processors": [dict(worker.state) for worker in self.engines.values()],
                     "running": self.running, "keys": sorted(self.keys),
                     "key_generations": dict(self.key_generations),
+                    "key_epoch": self.key_epoch,
                     "satellite": self.satellite.state(), "events": list(self.events),
                     "asset": self.asset, "lcd": lcd, "ui_initialized": self.ui_initialized,
                     "fidelity": {"complete": False, "limitations": limitations}}

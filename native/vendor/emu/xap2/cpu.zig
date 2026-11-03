@@ -236,8 +236,19 @@ pub const Core = struct {
         return null;
     }
 
+    fn executionWord(c: *Core, pc: usize) ?u16 {
+        if (c.bus.stop != null) return null;
+        if (c.bus.fuel == 0) {
+            c.bus.halt(.fuel_exhausted);
+            return null;
+        }
+        c.bus.fuel -= 1;
+        return c.word(pc);
+    }
+
     /// Decodes the instruction at `pc` over the whole 24-bit code space (bc5-isa §8 `fetch`: a prefix
     /// chain continues into the next segment), or null if one of its words is unmapped.
+    /// Observational: does not charge fuel or stop execution.
     pub fn fetch(c: *Core, pc: u32) ?Insn {
         return dec.decodeAt(c, word, 1 << 24, pc);
     }
@@ -271,11 +282,12 @@ pub const Core = struct {
         const cpu = &c.cpu;
         // The ABI return address, not an ISA rule: mapped code there runs.
         if (cpu.pc == sentinel and c.depth == 0 and c.word(sentinel) == null) return c.halt(.returned);
-        // Instruction fuel, charged to the bus like every data access (harness/isolate.zig).
+        // One fuel unit per instruction, plus each fetched codeword and data access.
         if (c.bus.fuel == 0) return c.bus.halt(.fuel_exhausted);
         c.bus.fuel -= 1;
         const pc = cpu.pc;
-        const i = c.fetch(pc) orelse return c.halt(.{ .fault = pc });
+        const i = dec.decodeAt(c, executionWord, 1 << 24, pc) orelse
+            return c.halt(if (c.bus.stop) |s| fromStop(s) else .{ .fault = pc });
         const cw = pc + i.n - 1;
         const nxt = (pc + i.n) & 0xFFFFFF;
         c.steps += 1;

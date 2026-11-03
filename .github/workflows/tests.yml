@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.10'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install Zig 0.17.0
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --max-time 180 \
+            https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz \
+            --output "$RUNNER_TEMP/zig.tar.xz"
+          # SHA-256 from https://ziglang.org/download/index.json (0.17.0, x86_64-linux).
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+          test "$("$RUNNER_TEMP/zig-x86_64-linux-0.17.0/zig" version)" = 0.17.0
+      - name: Run firmware-free tests
+        env:
+          IRIDIUM_TEST_FIRMWARE: ''
+          IRIDIUM_TEST_9575_FIRMWARE: ''
+          PYTHONWARNINGS: error::ResourceWarning
+        run: ./test

@@ -88,11 +88,20 @@ class OriginalFirmwareChecks:
         with Session(EXECUTABLE, firmware) as session:
             session.control("initialize_ui")
             self.assertTrue(session.ui_initialized)
-            response = session.key("soft_left", True)
+            epoch = session.state()["key_epoch"]
+            response = session.key("soft_left", True, client_id="browser-a", sequence=1, epoch=epoch)
             self.assertTrue(response["delivered"])
             self.assertEqual(session.engines["bc5"].request(
                 "read", address=self.profile.key_callback + 0x48, count=1)["values"], [0x96])
-            session.key("soft_left", False)
+            self.assertFalse(session.key("soft_left", True, client_id="browser-b", sequence=1, epoch=epoch)["delivered"])
+            bc5 = session.engines["bc5"]
+            session.load(load_firmware(Path(self.firmware_directory), "avr")[0])
+            self.assertIs(session.engines["bc5"], bc5)
+            self.assertEqual(session.state()["key_epoch"], epoch)
+            self.assertFalse(session.key("soft_left", False, client_id="browser-a", sequence=2, epoch=epoch)["delivered"])
+            self.assertEqual(session.keys, {"soft_left"})
+            self.assertTrue(session.key("soft_left", False, client_id="browser-b", sequence=2, epoch=epoch)["delivered"])
+            self.assertEqual(session.keys, set())
             for _ in range(40):
                 session.control("step", 50000)
             state = session.state()

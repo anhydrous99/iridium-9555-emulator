@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import threading
 import unittest
@@ -33,6 +34,19 @@ class SessionTests(unittest.TestCase):
         self.firmware = parse_firmware(bytes(8678), "avr.bin")
         self.session = Session(Path("unused"), [self.firmware], FakeEngine)
         self.addCleanup(self.session.close)
+
+    def initialize_key_handler(self):
+        self.session.load(replace(self.firmware, image="bc5", name="bc5_main.bin"))
+        worker = self.session.engines["bc5"]
+        worker.request = Mock(return_value={"values": [1, 2]})
+        self.session._idle = Mock()
+        self.session._call = Mock(return_value={})
+        self.session.ui_initialized = True
+        return worker
+
+    def browser_key(self, client, sequence, pressed, key="1", epoch=None):
+        return self.session.key(key, pressed, client_id=client, sequence=sequence,
+                                epoch=self.session.key_epoch if epoch is None else epoch)
 
     def test_patch_replacement_is_executed_and_closes_old_worker(self):
         old = self.session.engines["avr"]
@@ -114,10 +128,13 @@ class SessionTests(unittest.TestCase):
         factory.assert_not_called()
 
     def test_step_and_reset_preserve_truthful_fidelity(self):
+        epoch = self.session.key_epoch
         self.session.control("step", 100)
+        self.assertEqual(self.session.key_epoch, epoch)
         self.assertEqual(self.session.state()["processors"][0]["steps"], 100)
         self.assertFalse(self.session.state()["fidelity"]["complete"])
         self.session.control("reset")
+        self.assertEqual(self.session.key_epoch, epoch + 1)
         self.assertEqual(self.session.state()["processors"][0]["steps"], 0)
 
     def test_halted_firmware_not_silently_resumed(self):
@@ -196,12 +213,124 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.keys, set())
 
     def test_reset_and_firmware_replacement_cancel_prior_key_generations(self):
-        for reset in (lambda: self.session.control("reset"), lambda: self.session.load(self.firmware)):
+        bc5 = replace(self.firmware, image="bc5", name="bc5_main.bin")
+        for reset in (lambda: self.session.control("reset"), lambda: self.session.load(bc5)):
             generation = self.session.state()["key_generations"]["1"]
             self.session.key("1", True, generation)
             reset()
             self.session.key("1", True, generation)
             self.assertEqual(self.session.keys, set())
+
+    def test_auxiliary_load_preserves_bc5_held_keys_and_their_releases(self):
+        worker = self.initialize_key_handler()
+        for sequence, image in enumerate(("avr", "trx", "ptt", "avr"), start=1):
+            with self.subTest(image=image):
+                before = self.session.state()
+                generation = before["key_generations"]["1"]
+                self.assertTrue(self.session.key("1", True, generation)["delivered"])
+                self.browser_key("tab", sequence * 2, True)
+                self.session.load(replace(self.firmware, image=image))
+                after = self.session.state()
+                self.assertEqual(after["keys"], ["1"])
+                self.assertEqual(after["key_generations"], before["key_generations"])
+                self.assertEqual(after["key_epoch"], before["key_epoch"])
+                self.assertTrue(after["ui_initialized"])
+                self.assertIs(self.session.engines["bc5"], worker)
+                self.assertFalse(worker.closed)
+                self.assertFalse(self.session.key("1", False, generation)["delivered"])
+                self.assertEqual(self.session.keys, {"1"})
+                self.assertTrue(self.browser_key("tab", sequence * 2 + 1, False)["delivered"])
+                self.assertEqual(self.session.keys, set())
+        self.assertEqual([call.kwargs["ah"] for call in self.session._call.call_args_list], [1, 4] * 4)
+
+    def test_two_clients_inject_only_first_press_and_last_release(self):
+        self.initialize_key_handler()
+        self.assertTrue(self.browser_key("tab-a", 1, True)["delivered"])
+        self.assertFalse(self.browser_key("tab-b", 1, True)["delivered"])
+        self.assertFalse(self.browser_key("tab-a", 1, True)["delivered"])
+        self.assertFalse(self.browser_key("tab-a", 2, False)["delivered"])
+        self.assertEqual(self.session.keys, {"1"})
+        self.assertTrue(self.browser_key("tab-b", 2, False)["delivered"])
+        self.assertEqual(self.session.keys, set())
+        # A newly opened page starts at sequence one regardless of other pages' history.
+        self.assertTrue(self.browser_key("new-tab", 1, True)["delivered"])
+        self.assertTrue(self.browser_key("new-tab", 2, False)["delivered"])
+        self.assertEqual([call.kwargs["ah"] for call in self.session._call.call_args_list], [1, 4, 1, 4])
+
+    def test_client_release_before_press_is_a_tombstone_only_for_that_client_and_key(self):
+        self.initialize_key_handler()
+        self.browser_key("tab-a", 2, False)
+        self.assertTrue(self.browser_key("tab-b", 1, True)["delivered"])
+        self.assertIn("Stale", self.browser_key("tab-a", 1, True)["message"])
+        self.browser_key("tab-a", 3, True)
+        self.browser_key("tab-a", 2, False)
+        self.browser_key("tab-b", 2, False)
+        self.assertEqual(self.session.keys, {"1"})
+        self.assertTrue(self.browser_key("tab-a", 4, False)["delivered"])
+        # Sequences are compared per key, so independent requests may arrive out of order.
+        self.assertTrue(self.browser_key("tab-a", 1, True, key="2")["delivered"])
+        self.assertEqual(self.session.keys, {"2"})
+
+    def test_legacy_releases_cannot_clear_client_owned_keys(self):
+        self.initialize_key_handler()
+        for generation_api in (False, True):
+            with self.subTest(generation_api=generation_api):
+                generation = self.session.key_generations["1"] if generation_api else None
+                self.browser_key("tab", 1, True)
+                self.assertFalse(self.session.key("1", False, generation)["delivered"])
+                self.assertEqual(self.session.keys, {"1"})
+                generation = self.session.key_generations["1"] if generation_api else None
+                self.assertFalse(self.session.key("1", True, generation)["delivered"])
+                self.assertFalse(self.browser_key("tab", 2, False)["delivered"])
+                self.assertEqual(self.session.keys, {"1"})
+                self.assertTrue(self.session.key("1", False, generation)["delivered"])
+                self.assertEqual(self.session.keys, set())
+                self.session.control("reset")
+                self.session.ui_initialized = True
+
+    def test_reset_and_bc5_replacement_reject_old_client_presses_and_releases(self):
+        bc5 = replace(self.firmware, image="bc5", name="bc5_main.bin")
+        for reset in (lambda: self.session.control("reset"), lambda: self.session.load(bc5)):
+            epoch = self.session.key_epoch
+            self.browser_key("tab-a", 10, True)
+            self.assertEqual(self.session.keys, {"1"})
+            reset()
+            self.assertEqual(self.session.key_epoch, epoch + 1)
+            self.assertIn("epoch", self.browser_key("tab-a", 2, True, epoch=epoch)["message"])
+            self.assertEqual(self.session.keys, set())
+            self.browser_key("tab-a", 3, True)
+            stale = self.browser_key("tab-a", 4, False, epoch=epoch)
+            self.assertEqual(stale["key_epoch"], epoch + 1)
+            self.assertEqual(self.session.keys, {"1"})
+            self.browser_key("tab-a", 4, False)
+
+    def test_client_limit_keeps_tombstones_until_reset(self):
+        for client in range(128):
+            self.browser_key(f"tab-{client}", 2, False)
+        with self.assertRaisesRegex(ValueError, "128.*reset"):
+            self.browser_key("one-too-many", 1, True)
+        self.browser_key("tab-0", 1, True)
+        self.assertEqual(self.session.keys, set())
+        self.session.load(self.firmware)
+        with self.assertRaisesRegex(ValueError, "128.*reset"):
+            self.browser_key("one-too-many", 1, True)
+        self.session.control("reset")
+        self.browser_key("one-too-many", 1, True)
+        self.assertEqual(self.session.keys, {"1"})
+
+    def test_browser_delivery_failure_can_retry_without_repeating_a_delivered_event(self):
+        self.initialize_key_handler()
+        for sequence, pressed in ((1, True), (2, False)):
+            self.session._idle = Mock(side_effect=EngineError("before injection"))
+            with self.assertRaisesRegex(EngineError, "before injection"):
+                self.browser_key("tab", sequence, pressed)
+            self.session._call.reset_mock()
+            self.session._idle = Mock(side_effect=[None, EngineError("after injection")])
+            with self.assertRaisesRegex(EngineError, "after injection"):
+                self.browser_key("tab", sequence, pressed)
+            self.assertEqual("1" in self.session.keys, pressed)
+            self.assertFalse(self.browser_key("tab", sequence, pressed)["delivered"])
+            self.session._call.assert_called_once()
 
     def test_unsupported_lcd_command_is_reported_without_inventing_cpu_fault(self):
         engine = self.session.engines["avr"]

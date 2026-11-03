@@ -172,7 +172,64 @@ test "bc whose destination keeps crossing 0xFFE1/0xFFE3/0xFFE4 traps illegal aft
     const before = c.cpu;
     try testing.expectEqual(cpu.Halt{ .trap = .illegal }, c.run(5));
     try testing.expectEqual(before, c.cpu);
-    try testing.expectEqual(@as(u64, cpu.Core.copy_limit) * 2 + 1, std.math.maxInt(u64) - t.m.bus.fuel);
+    try testing.expectEqual(@as(u64, cpu.Core.copy_limit) * 2 + 2, std.math.maxInt(u64) - t.m.bus.fuel);
+}
+
+test "codeword fuel bounds modifier chains without charging observational fetch; refilling recovers" {
+    var code: [4096]u16 = @splat(0x0009);
+    code[code.len - 1] = w(0xA, 1, 0, 1); // lsr #1
+    var t: T = .{};
+    const c = try t.init(&code, true);
+    defer t.m.deinit();
+    c.cpu.al = 0x8000;
+    const before = c.cpu;
+    t.m.bus.resetRun(4); // One instruction unit, then three modifier codewords.
+    try testing.expectEqual(cpu.Halt.fuel_exhausted, c.run(1));
+    try testing.expectEqual(common.bus.Stop.fuel_exhausted, t.m.bus.stop.?);
+    try testing.expectEqual(@as(u64, 0), t.m.bus.fuel);
+    try testing.expectEqual(@as(u64, 0), c.steps);
+    try testing.expectEqual(before, c.cpu);
+
+    // Observation still works after exhaustion and preserves the stop and budget.
+    const insn = c.fetch(base).?;
+    try testing.expectEqual(@as(u32, code.len), insn.n);
+    try testing.expectEqual(@as(u64, 0), t.m.bus.fuel);
+    try testing.expectEqual(common.bus.Stop.fuel_exhausted, t.m.bus.stop.?);
+
+    t.m.bus.resetRun(code.len + 1); // Exactly enough for the instruction and all its codewords.
+    try testing.expectEqual(cpu.Halt.steps, c.run(1));
+    try testing.expectEqual(@as(?common.bus.Stop, null), t.m.bus.stop);
+    try testing.expectEqual(@as(u64, 0), t.m.bus.fuel);
+    try testing.expectEqual(@as(u64, 1), c.steps);
+    try testing.expectEqual(@as(u16, 0x4000), c.cpu.al);
+    try testing.expectEqual(base + code.len, c.cpu.pc);
+    try testing.expectEqual(cpu.Halt.fuel_exhausted, c.run(1));
+}
+
+test "codeword fuel boundaries distinguish an exhausted budget from an unmapped word" {
+    for ([_]u64{ 0, 1, 2, 3 }) |fuel| {
+        var t: T = .{};
+        const c = try t.init(&.{w(1, AL, 0, 7)}, true);
+        defer t.m.deinit();
+        t.m.bus.resetRun(fuel);
+        const expected: cpu.Halt = if (fuel < 2) .fuel_exhausted else .steps;
+        try testing.expectEqual(expected, c.run(1));
+        try testing.expectEqual(@as(u16, if (fuel < 2) 0 else 7), c.cpu.al);
+        try testing.expectEqual(@as(u64, if (fuel < 2) 0 else 1), c.steps);
+        try testing.expectEqual(fuel - @min(fuel, 2), t.m.bus.fuel);
+    }
+    for ([_]u64{ 2, 3 }) |fuel| {
+        var t: T = .{};
+        const c = try t.init(&.{0x0009}, true);
+        defer t.m.deinit();
+        t.m.bus.resetRun(fuel);
+        // Trying the unmapped word costs fuel too; no fuel takes precedence over a fetch fault.
+        const expected: cpu.Halt = if (fuel == 2) .fuel_exhausted else .{ .fault = base };
+        try testing.expectEqual(expected, c.run(1));
+        try testing.expectEqual(@as(u64, 0), c.steps);
+        try testing.expectEqual(base, c.cpu.pc);
+        try testing.expectEqual(@as(u64, 0), t.m.bus.fuel);
+    }
 }
 
 test "enter re-reads Y after each store (bc5-isa §8 order): M[Y-1] is the Y alias" {

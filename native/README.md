@@ -30,7 +30,7 @@ The worker emits an initial JSON state, then one response for each newline-delim
 | `{"op":"uart_tx","port":0}` | Pop a transmitted AVR byte on a model-supported port; return `{value: byte_or_null, dropped: cumulative_lost_bytes}`. |
 | `{"op":"spi","value":0}` | Clock one AVR slave transfer; return `{value: byte_or_null}`. |
 
-Memory requests are capped at 4096 units and input lines at 64 KiB. CPU fuel bounds block-copy work independently of the instruction count. Access logs are flushed every 1024 steps. SPARC register latches are capped at 65,536 entries. These are host resource limits, reported as stops where relevant.
+Memory requests are capped at 4096 units and input lines at 64 KiB. CPU fuel bounds block-copy work and XAP2 instruction-word decoding independently of the instruction count. Access logs are flushed every 1024 steps. SPARC register latches are capped at 65,536 entries. These are host resource limits, reported as stops where relevant.
 
 AVR watchdog reset requests stop execution with `halt: "firmware-reset-requested"` until an explicit `reset`. The host does not perform an automatic watchdog reboot. Each AVR UART output capture holds 255 bytes; additional completed transmissions increment that port's dropped-byte count. State reports `uart_tx_dropped` with two counters for 9555 and four for 9575 (`null` for other processors). Reading captured bytes does not clear these counts; `reset` clears them.
 

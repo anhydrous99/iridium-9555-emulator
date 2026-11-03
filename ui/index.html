@@ -76,7 +76,7 @@
             <section class="panel firmware-panel" aria-labelledby="firmware-heading">
               <div class="panel-heading"><h2 id="firmware-heading"><span class="section-number">01</span> Firmware source</h2><span class="micro-label">ORIGINAL BINARY</span></div>
               <div class="firmware-file"><span class="file-icon" aria-hidden="true">BIN</span><div class="file-details"><strong id="firmware-name">No firmware loaded</strong><span id="firmware-format">Load a supported original firmware image</span></div><label class="button button-small file-button">Load image<input id="firmware-input" type="file" accept=".bin,.dfu,application/octet-stream" aria-label="Load original firmware image"></label></div>
-              <div class="hash-row"><span>SHA-256</span><code id="firmware-hash">—</code></div>
+              <ul id="firmware-images" class="firmware-images" aria-label="Loaded firmware images"></ul>
               <p id="firmware-profile" class="small-note">Handset model is identified from the firmware image.</p>
               <p class="small-note">Changes are executed from the supplied bytes. Source files remain unchanged.</p>
             </section>
