@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Local Iridium 9555 original-firmware execution and hardware research bench.">
+    <title>9555 · Firmware lab</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="9555 firmware lab home">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>9555<span class="brand-divider">/</span><span class="brand-subtitle">FIRMWARE LAB</span></span>
+        </a>
+        <div class="connection"><span id="connection-dot" class="status-dot"></span><span id="connection-status">Connecting to local engine</span></div>
+      </header>
+
+      <main>
+        <div class="page-heading">
+          <div><p class="eyebrow">IRIDIUM 9555 · RESEARCH BENCH</p><h1>Inside the handset.</h1><p class="intro">Original firmware, observable execution, and a hardware model you can inspect.</p></div>
+          <span class="fidelity-tag"><span aria-hidden="true">◒</span> Partial hardware model</span>
+        </div>
+
+        <div class="workspace">
+          <section class="handset-panel" aria-labelledby="handset-heading">
+            <div class="panel-heading"><h2 id="handset-heading">Handset</h2><span class="micro-label">XAP2 / BC5</span></div>
+            <div class="handset-stage">
+              <div class="stage-grid" aria-hidden="true"></div>
+              <div class="handset">
+                <div class="antenna" aria-hidden="true"><span></span></div>
+                <button class="phone-key power-key" data-key="power" aria-label="Power" title="Power (P)">⏻</button>
+                <div class="phone-body">
+                  <div class="speaker" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+                  <div class="phone-brand">iridium<span class="orbit" aria-hidden="true"></span><span class="phone-model">9555</span></div>
+                  <div class="screen-bezel"><div class="lcd-wrap"><canvas id="lcd" width="128" height="128" role="img" aria-label="Awaiting original firmware LCD output"></canvas><div id="lcd-placeholder" class="lcd-placeholder"><span class="lcd-cross" aria-hidden="true">+</span><span id="lcd-placeholder-text">AWAITING<br>FIRMWARE DISPLAY</span></div></div></div>
+                  <div class="soft-keys"><button class="phone-key soft-key" data-key="soft_left" aria-label="Left soft key" title="Left soft key (F1)"><span></span></button><button class="phone-key soft-key" data-key="soft_right" aria-label="Right soft key" title="Right soft key (F2)"><span></span></button></div>
+                  <div class="navigation">
+                    <button class="phone-key call-key" data-key="green" aria-label="Call" title="Call (C)"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4 9 3l2 5-3 2c1 3 3 5 6 6l2-3 5 2-1 4c-1 3-5 2-8 0C6 16 2 9 5 4Z"/></svg></button>
+                    <div class="dpad">
+                      <button class="phone-key direction up" data-key="up" aria-label="Up" title="Up (↑)">▴</button>
+                      <span class="navi-divider" aria-hidden="true"></span>
+                      <button class="phone-key direction down" data-key="down" aria-label="Down" title="Down (↓)">▾</button>
+                    </div>
+                    <button class="phone-key end-key" data-key="red" aria-label="End call or back" title="End / back (Escape)"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 9c5-4 13-4 18 0 2 2 1 4 0 5h-5l-1-3c-2-1-4-1-6 0l-1 3H3c-1-1-2-3 0-5Z"/></svg></button>
+                  </div>
+                  <div class="number-pad">
+                    <button class="phone-key number-key" data-key="1" aria-label="1"><b>1</b><span>● ●</span></button>
+                    <button class="phone-key number-key" data-key="2" aria-label="2 A B C"><b>2</b><span>ABC</span></button>
+                    <button class="phone-key number-key" data-key="3" aria-label="3 D E F"><b>3</b><span>DEF</span></button>
+                    <button class="phone-key number-key" data-key="4" aria-label="4 G H I"><b>4</b><span>GHI</span></button>
+                    <button class="phone-key number-key" data-key="5" aria-label="5 J K L"><b>5</b><span>JKL</span></button>
+                    <button class="phone-key number-key" data-key="6" aria-label="6 M N O"><b>6</b><span>MNO</span></button>
+                    <button class="phone-key number-key" data-key="7" aria-label="7 P Q R S"><b>7</b><span>PQRS</span></button>
+                    <button class="phone-key number-key" data-key="8" aria-label="8 T U V"><b>8</b><span>TUV</span></button>
+                    <button class="phone-key number-key" data-key="9" aria-label="9 W X Y Z"><b>9</b><span>WXYZ</span></button>
+                    <button class="phone-key number-key" data-key="*" aria-label="Star"><b>∗</b><span>SHIFT</span></button>
+                    <button class="phone-key number-key" data-key="0" aria-label="0 plus"><b>0</b><span>+</span></button>
+                    <button class="phone-key number-key" data-key="#" aria-label="Hash"><b>#</b><span>SPACE</span></button>
+                  </div>
+                  <div class="phone-bottom" aria-hidden="true"><i></i><span>9555</span><i></i></div>
+                </div>
+                <div class="volume-keys"><button class="phone-key" data-key="volume_up" aria-label="Volume up" title="Volume up (Page Up)">+</button><button class="phone-key" data-key="volume_down" aria-label="Volume down" title="Volume down (Page Down)">−</button><button class="phone-key convenience-key" data-key="convenience" aria-label="Side convenience key" title="Side convenience key — hardware wiring unresolved">◆</button></div>
+              </div>
+            </div>
+            <div class="display-controls"><label class="checkbox-label"><input id="asset-toggle" type="checkbox"> View embedded firmware asset</label><p id="display-mode" class="display-mode">Live LCD unavailable · initialize application to capture firmware output</p><p id="display-orientation" class="display-orientation" hidden>9555 panel mapping · SEG127 left, COM0 top</p></div>
+            <div class="key-status"><span class="micro-label">INPUT</span><div><p id="key-mode">Bench input only · application is not initialized</p><p id="key-feedback" role="status">Press a handset key to inspect delivery.</p></div></div>
+            <details class="keyboard-help"><summary>Keyboard controls<span aria-hidden="true">↗</span></summary><p>Digits, <kbd>*</kbd>, <kbd>#</kbd>, and <kbd>↑</kbd>/<kbd>↓</kbd> match the handset. <kbd>Esc</kbd> ends, <kbd>C</kbd> calls, <kbd>P</kbd> powers, <kbd>F1</kbd>/<kbd>F2</kbd> are soft keys, and <kbd>PgUp</kbd>/<kbd>PgDn</kbd> adjust volume. After experimental application initialization, supported keys call the original firmware handler. Electrical keypad wiring and the convenience-key mapping remain unresolved.</p></details>
+          </section>
+
+          <div class="instrument-panels">
+            <section class="panel firmware-panel" aria-labelledby="firmware-heading">
+              <div class="panel-heading"><h2 id="firmware-heading"><span class="section-number">01</span> Firmware source</h2><span class="micro-label">ORIGINAL BINARY</span></div>
+              <div class="firmware-file"><span class="file-icon" aria-hidden="true">BIN</span><div class="file-details"><strong id="firmware-name">No firmware loaded</strong><span id="firmware-format">Load a supported original firmware image</span></div><label class="button button-small file-button">Load image<input id="firmware-input" type="file" accept=".bin,.dfu,application/octet-stream" aria-label="Load original firmware image"></label></div>
+              <div class="hash-row"><span>SHA-256</span><code id="firmware-hash">—</code></div>
+              <p class="small-note">Changes are executed from the supplied bytes. Source files remain unchanged.</p>
+            </section>
+
+            <section class="panel execution-panel" aria-labelledby="execution-heading">
+              <div class="panel-heading"><h2 id="execution-heading"><span class="section-number">02</span> Execution</h2><span id="runtime-status" class="runtime-status">READY</span></div>
+              <div class="execution-controls"><button id="run-button" class="button button-primary" data-action="run"><span aria-hidden="true">▶</span> Run</button><button class="button" data-action="step"><span aria-hidden="true">▸│</span> Step <span class="button-detail">10k</span></button><button class="button button-quiet" data-action="reset"><span aria-hidden="true">↺</span> Reset</button></div>
+              <div class="application-controls">
+                <div class="application-heading">
+                  <button id="initialize-button" class="button button-small" data-action="initialize_ui" disabled>Initialize application</button>
+                  <span id="application-status" class="micro-label">NOT INITIALIZED</span>
+                </div>
+                <p><strong>Experimental:</strong> runs the original firmware to kernel idle, then invokes its application initialization routines. This is not a normal hardware boot.</p>
+              </div>
+              <div id="processors" class="processors"><p class="empty-state">Processor state will appear after an image is loaded.</p></div>
+              <p class="small-note">Instruction counts are deterministic model progress, not hardware timing.</p>
+            </section>
+
+            <section class="panel satellite-panel" aria-labelledby="satellite-heading">
+              <div class="panel-heading"><h2 id="satellite-heading"><span class="section-number">03</span> Satellite scenario</h2><span id="satellite-status" class="network-status">OFFLINE</span></div>
+              <p class="model-disclosure">Local scenario model. Modem firmware coupling is not implemented.</p>
+              <form id="satellite-form" class="satellite-form">
+                <div class="network-settings"><label class="checkbox-label"><input id="sat-visible" name="visible" type="checkbox" checked> Satellite visible</label><label class="latency-label">Latency <span><input id="sat-latency" name="latency_ms" type="number" min="0" max="60000" step="50" value="600"> <span class="unit">ms</span></span></label></div>
+                <label class="range-label" for="sat-signal"><span>Signal strength</span><span><output id="signal-value" for="sat-signal">4</output><span class="unit"> / 5</span></span></label><input id="sat-signal" name="signal" type="range" min="0" max="5" step="1" value="4"><div class="range-captions"><span>No signal</span><span>Clear sky</span></div>
+                <div class="network-actions"><button class="button button-small" type="submit">Apply conditions</button><button class="button button-small button-quiet" type="button" data-satellite="register">Register</button><button class="button button-small button-quiet" type="button" data-satellite="advance">Advance 1 s</button></div>
+                <p class="scenario-clock">Scenario clock <output id="scenario-time">0 ms</output></p>
+              </form>
+              <div class="scenario-inject"><div class="call-state"><span class="micro-label">CALL STATE</span><span id="call-state">Idle</span></div><label class="field-label" for="remote-number">Remote number</label><input id="remote-number" class="text-input" type="tel" value="+881600000001" maxlength="32" autocomplete="off"><div class="scenario-buttons"><button class="button button-small" data-satellite="incoming_call">Incoming call</button><button class="button button-small button-quiet" data-satellite="answer">Answer</button><button class="button button-small button-quiet" data-satellite="hangup">Hang up</button></div><label class="field-label" for="sms-text">Incoming SMS</label><div class="sms-compose"><input id="sms-text" class="text-input" type="text" value="Test message from the satellite model." maxlength="160" autocomplete="off"><button class="button button-small" data-satellite="incoming_sms">Inject</button></div></div>
+            </section>
+
+            <section class="panel fidelity-panel" aria-labelledby="fidelity-heading"><div class="panel-heading"><h2 id="fidelity-heading"><span class="section-number">04</span> Model boundaries</h2><span class="micro-label">EXPLICIT LIMITS</span></div><p>This is a firmware execution bench, not a complete 9555 hardware emulator. Application initialization and software key injection are explicit experimental scenarios.</p><ul id="limitations"><li>Normal handset startup and electrical keypad delivery remain incomplete.</li><li>Live display output comes from captured original firmware LCD traffic.</li><li>The satellite model is independent of the original modem firmware.</li><li>Hardware timing, DSP behavior, and radio protocols are not validated.</li></ul></section>
+          </div>
+        </div>
+
+        <section class="panel event-panel" aria-labelledby="events-heading"><div class="panel-heading"><h2 id="events-heading">Event log</h2><span id="event-count" class="micro-label">0 EVENTS</span></div><div class="event-table-wrap"><table class="event-table"><thead><tr><th scope="col">Time</th><th scope="col">Source</th><th scope="col">Event</th></tr></thead><tbody id="events"><tr><td colspan="3" class="empty-state">Waiting for engine events.</td></tr></tbody></table></div></section>
+        <div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div>
+      </main>
+      <footer><span><span class="status-dot" aria-hidden="true"></span> LOCAL EXECUTION</span><span>IRIDIUM 9555 <span class="footer-divider">/</span> FIRMWARE RESEARCH</span><span>No live satellite transmission</span></footer>
+    </div>
+    <noscript><p class="noscript">JavaScript is required for the handset controls. The engine can also be run from the command line.</p></noscript>
+  </body>
+</html>

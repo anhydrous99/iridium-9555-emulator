@@ -1,0 +1,87 @@
+from hashlib import sha256
+from pathlib import Path
+import struct
+import tempfile
+import unittest
+import zlib
+
+from iridium.firmware import (BC5_CODE_BYTES, BC5_DATA_BYTES, BC5_PAYLOAD_BYTES,
+                              FirmwareError, load_firmware, parse_firmware)
+
+
+def make_dfu():
+    header = 0x3C8
+    end = header + 24 + BC5_PAYLOAD_BYTES
+    data = bytearray(end + 20)
+    struct.pack_into("<8sHIH", data, 0, b"CSR-dfu2", 2, len(data) - 16, header)
+    struct.pack_into("<8s4I", data, header, b"CSRbcfw1", 0,
+                     BC5_CODE_BYTES + 4, BC5_DATA_BYTES + 0x10000, 0)
+    struct.pack_into("<I", data, header + 8, zlib.crc32(data[header + 12:end]) ^ 0xFFFFFFFF)
+    struct.pack_into("<I", data, end, zlib.crc32(data[:end]) ^ 0xFFFFFFFF)
+    struct.pack_into("<HHHH3sBI", data, end + 4, 0xFB23, 0xA555, 0x1EDD, 0x100, b"UFD", 16, 0)
+    struct.pack_into("<I", data, end + 16, zlib.crc32(data[:-4]) ^ 0xFFFFFFFF)
+    return bytes(data)
+
+
+class FirmwareTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dfu = make_dfu()
+
+    def test_dfu_validates_three_checksums_and_strips_container(self):
+        image = parse_firmware(self.dfu, "main.dfu")
+        self.assertEqual(image.data, bytes(BC5_PAYLOAD_BYTES))
+        self.assertEqual(image.sha256, sha256(self.dfu).hexdigest())
+        self.assertEqual(image.warnings, ())
+
+    def test_patched_dfu_requires_explicit_checksum_override(self):
+        patched = bytearray(self.dfu)
+        patched[0x3E0] = 0x91
+        with self.assertRaisesRegex(FirmwareError, "CRC mismatch"):
+            parse_firmware(bytes(patched), "patch.dfu")
+        image = parse_firmware(bytes(patched), "patch.dfu", allow_invalid_crc=True)
+        self.assertEqual(image.data[0], 0x91)
+        self.assertEqual(len(image.warnings), 3)
+
+    def test_invalid_crc_flag_does_not_relax_bounds_or_device_validation(self):
+        for offset, value in ((14, 0xFF), (0x3C8 + 12, 0), (len(self.dfu) - 12, 0)):
+            data = bytearray(self.dfu)
+            data[offset] = value
+            with self.assertRaises(FirmwareError):
+                parse_firmware(bytes(data), "main.dfu", allow_invalid_crc=True)
+
+    def test_truncated_and_unrecognized_images_rejected(self):
+        for data in (b"", b"CSR-dfu2", self.dfu[:-1], b"unrecognized"):
+            with self.assertRaises(FirmwareError):
+                parse_firmware(data, "firmware.bin")
+
+    def test_raw_patch_uses_exact_supplied_bytes_and_excludes_tail_crc(self):
+        data = bytearray(BC5_PAYLOAD_BYTES + 4)
+        data[0] = 4
+        data[-4:] = b"CRC!"
+        image = parse_firmware(bytes(data), "changed.bin")
+        self.assertEqual(image.image, "bc5")
+        self.assertEqual(image.data[0], 4)
+        self.assertEqual(len(image.data), BC5_PAYLOAD_BYTES)
+
+    def test_processor_flash_bounds_and_alignment(self):
+        for image, data in (("avr", b"123"), ("avr", bytes(0x4002)),
+                            ("trx", b"123"), ("ptt", bytes(0x400004))):
+            with self.assertRaises(FirmwareError):
+                parse_firmware(data, "patched.bin", image)
+        for image, size in (("avr", 8678), ("trx", 0x260760), ("ptt", 0xA7BF8)):
+            self.assertEqual(parse_firmware(bytes(size), "patched.bin", image).image, image)
+            self.assertEqual(parse_firmware(bytes(size), "patched.bin").image, image)
+            with self.assertRaises(FirmwareError):
+                parse_firmware(bytes(4), "patched.bin", image)
+
+    def test_loading_does_not_change_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "main.dfu"
+            path.write_bytes(self.dfu)
+            self.assertEqual(load_firmware(Path(directory))[0].format, "CSR-dfu2")
+            self.assertEqual(path.read_bytes(), self.dfu)
+
+
+if __name__ == "__main__":
+    unittest.main()

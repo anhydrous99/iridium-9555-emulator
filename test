@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+zig build test -j2
+zig build -j2
+node --check ui/app.js
+node --test ui/app.test.js
+python3 native/test_protocol.py
+python3 -m unittest discover -s tests -v

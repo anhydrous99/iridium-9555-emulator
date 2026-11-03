@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+__pycache__/
+*.pyc
+.venv/
+*.bin
+*.dfu
+*.hex
+*.exe
+*.dll
