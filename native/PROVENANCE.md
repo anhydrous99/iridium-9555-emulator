@@ -13,4 +13,6 @@ The BC5 flash model now uses an explicitly inferred Am29LV320DB-compatible profi
 
 The AVR UART model records cumulative per-port output-capture losses when its bounded host queue fills. This adds host diagnostics without changing guest serial timing or status flags. The native adapter also stops when the existing AVR watchdog model requests a reset.
 
+The UART status-register adapter preserves transmit-complete flags when software writes zero, and clears them when software writes one. The XAP2 executor charges each decoded instruction word to its execution fuel, so long modifier chains cannot bypass the host work limit.
+
 These are instruction interpreters with partially inferred device models. BC5 IRQs, keypad wiring, LCD transfers, SPARC ASIC/interrupts and radio DSP behavior are incomplete. Reaching scheduler milestones does not establish full handset functionality. AVR device timing is deterministic but includes the documented upstream assumptions. Original `shortcut:` comments and model qualifications are retained.

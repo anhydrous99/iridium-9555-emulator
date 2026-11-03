@@ -22,7 +22,9 @@ packages, or external services are needed to run it. Node 18+ is used for UI tes
 the native executor using Zig's cache, listens on all IPv4 interfaces
 (`0.0.0.0:9555`), and opens a browser at `http://127.0.0.1:9555`.
 From another device, open `http://<this-computer-IP>:9555`. Devices that can reach
-the port share control of the same emulator session. Use `--host 127.0.0.1` for
+the port share control of the same emulator session. Each browser owns its held
+keys; a key held in several browsers is released after its final owner releases it.
+Use `--host 127.0.0.1` for
 local-only access. Press Ctrl+C to stop the server and CPU workers. Use
 `--no-browser` to print the URL without opening it, or `--port 0` to choose a free port.
 
@@ -40,6 +42,7 @@ application** invokes the same scenario.
 Supply a directory to load BC5, AVR, telephony and PTT images. Telephony and PTT
 are alternative modem images, executed in **independent** workers for inspection;
 they are not two simultaneously active processors in a real handset.
+The source panel lists the filename and SHA-256 of every loaded processor image.
 
 ```sh
 ./run /path/to/main.dfu

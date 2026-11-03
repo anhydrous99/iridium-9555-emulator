@@ -25,7 +25,7 @@ const context = vm.createContext({
     createElement: element, createTextNode: (textContent) => ({ textContent }),
     querySelectorAll: () => [], addEventListener() {},
   },
-  window: { addEventListener() {} }, Intl,
+  window: { addEventListener() {} }, Intl, crypto: require("node:crypto").webcrypto,
   AbortSignal: { timeout() {} }, setTimeout() {}, clearTimeout() {},
   // Keep startup polling pending so it cannot mutate the benchmark fixture.
   fetch: () => new Promise(() => {}),
