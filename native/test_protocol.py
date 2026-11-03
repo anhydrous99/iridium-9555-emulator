@@ -38,6 +38,48 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_avr_watchdog_request_stops_execution_until_reset(self):
+        # Enable WDE, then keep reading MCUSR without servicing the watchdog.
+        words = (0xE008, 0x9300, 0x0060, 0x9110, 0x0054, 0xCFFD)
+        firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(8678, b"\xff")
+        states = exchange("avr", firmware, [
+            {"op": "run", "steps": 100000}, {"op": "run", "steps": 100},
+            {"op": "reset"}, {"op": "run", "steps": 10},
+        ])
+        self.assertEqual(states[1]["halt"], "firmware-reset-requested")
+        self.assertLess(states[1]["steps"], 100000)
+        self.assertEqual(states[2]["steps"], states[1]["steps"])
+        self.assertEqual(states[2]["halt"], states[1]["halt"])
+        self.assertEqual(states[3]["steps"], 0)
+        self.assertIsNone(states[3]["halt"])
+        self.assertEqual(states[4]["steps"], 10)
+        self.assertIsNone(states[4]["halt"])
+
+    def test_uart_output_reports_loss_per_port_and_reset_clears_it(self):
+        for port in (0, 1):
+            with self.subTest(port=port):
+                # Enable TX, poll UDRE, and transmit exactly 300 'A' bytes.
+                base = 0xC0 + port * 8
+                words = (0xE008, 0x9300, base + 1, 0xE401, 0xE28C, 0xE091,
+                         0x9110, base, 0xFF15, 0xCFFC, 0x9300, base + 6,
+                         0x9701, 0xF7C1, 0xCFFF)
+                firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(8678, b"\xff")
+                states = exchange("avr", firmware, [
+                    {"op": "run", "steps": 500000},
+                    *({"op": "uart_tx", "port": port} for _ in range(256)),
+                    {"op": "state"}, {"op": "reset"}, {"op": "uart_tx", "port": port},
+                ])
+                expected = [0, 0]
+                expected[port] = 45
+                self.assertIsNone(states[1]["halt"])
+                self.assertEqual(states[1]["registers"][24:26], [0, 0])
+                self.assertEqual(states[1]["uart_tx_dropped"], expected)
+                self.assertEqual([reply["value"] for reply in states[2:258]], [65] * 255 + [None])
+                self.assertTrue(all(reply["dropped"] == 45 for reply in states[2:258]))
+                self.assertEqual(states[258]["uart_tx_dropped"], expected)
+                self.assertEqual(states[259]["uart_tx_dropped"], [0, 0])
+                self.assertEqual(states[260], {"value": None, "dropped": 0})
+
     def test_multiple_commands_preserve_state_and_eof_terminates(self):
         states = exchange("avr", avr_loop(), [
             {"op": "run", "steps": 10}, {"op": "run", "steps": 20}, {"op": "state"},

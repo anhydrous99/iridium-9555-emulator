@@ -71,6 +71,7 @@ async function fixture(keyResponse) {
   document.createTextNode = (textContent) => ({ textContent });
   document.activeElement = null;
   const calls = [];
+  const requests = [];
   const context = vm.createContext({
     document, window, Intl, AbortSignal: { timeout: () => undefined },
     setTimeout: () => 1, clearTimeout() {},
@@ -78,13 +79,16 @@ async function fixture(keyResponse) {
       if (url === "/api/state") return { ok: true, json: async () => ({ firmware: null, processors: [], satellite: null, events: [], running: false }) };
       const body = JSON.parse(options.body);
       calls.push({ url, body });
+      requests.push(options);
       const response = keyResponse ? await keyResponse(body) : null;
-      return { ok: true, json: async () => response || { message: "Recorded; wiring unresolved", delivered: false } };
+      const result = response || { message: "Recorded; wiring unresolved", delivered: false };
+      return { ok: true, json: async () => url === "/api/key"
+        ? { generation: body.generation + (body.pressed ? 0 : 1), ...result } : result };
     },
   });
   vm.runInContext(source, context);
   await vm.runInContext("refreshState()", context);
-  return { context, calls, window, elements, buttons, run: (code) => vm.runInContext(code, context) };
+  return { context, calls, requests, window, elements, buttons, run: (code) => vm.runInContext(code, context) };
 }
 
 test("markup has one of every physical handset control and unique IDs", () => {
@@ -100,11 +104,13 @@ test("keyboard and pointer ownership prevent premature key release", async () =>
   const app = await fixture();
   app.run("pressKey('2', 'pointer:1'); pressKey('2', 'keyboard:Digit2'); releaseKey('pointer:1')");
   await app.run("keyQueue");
-  assert.deepEqual(app.calls.map((call) => call.body), [{ key: "2", pressed: true }]);
+  assert.deepEqual(app.calls.map((call) => call.body), [{ key: "2", pressed: true, generation: 0 }]);
   assert.ok(app.buttons.find((button) => button.dataset.key === "2").classes.has("held"));
   app.run("releaseKey('keyboard:Digit2')");
   await app.run("keyQueue");
-  assert.deepEqual(app.calls.map((call) => call.body), [{ key: "2", pressed: true }, { key: "2", pressed: false }]);
+  assert.deepEqual(app.calls.map((call) => call.body), [
+    { key: "2", pressed: true, generation: 0 }, { key: "2", pressed: false, generation: 0 },
+  ]);
 });
 
 test("network key releases cannot overtake a delayed press", async () => {
@@ -119,6 +125,66 @@ test("network key releases cannot overtake a delayed press", async () => {
   assert.deepEqual(app.calls.map((call) => call.body.pressed), [true, false]);
 });
 
+test("pagehide cancels queued presses and immediately releases an in-flight press", async () => {
+  let finishPress;
+  const app = await fixture((body) => body.pressed && !finishPress
+    ? new Promise((resolve) => { finishPress = resolve; }) : undefined);
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await Promise.resolve();
+  app.run("pressKey('2', 'keyboard:Digit2')");
+  app.window.listeners.get("pagehide")();
+  assert.deepEqual(app.calls.map((call) => call.body), [
+    { key: "1", pressed: true, generation: 0 },
+    { key: "1", pressed: false, generation: 0 },
+  ], "Cleanup is sent before the pending press promise settles");
+  assert.ok(app.requests.every((options) => options.keepalive === true));
+  assert.ok(app.buttons.every((button) => !button.classes.has("held")));
+  // Restoring the page must not revive the old queued press.
+  app.window.listeners.get("pageshow")({ persisted: true });
+  finishPress();
+  await app.run("keyQueue");
+  assert.equal(app.calls.length, 2);
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.slice(2).map((call) => call.body), [
+    { key: "1", pressed: true, generation: 1 },
+    { key: "1", pressed: false, generation: 1 },
+  ]);
+});
+
+test("pagehide releases submitted keys even after blur cleared their local owners", async () => {
+  let finishPress;
+  const app = await fixture((body) => body.pressed && !finishPress
+    ? new Promise((resolve) => { finishPress = resolve; }) : undefined);
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await Promise.resolve();
+  app.window.listeners.get("blur")();
+  app.window.listeners.get("pagehide")();
+  assert.deepEqual(app.calls.map((call) => call.body.pressed), [true, false]);
+  assert.equal(app.requests[1].keepalive, true);
+  finishPress();
+  await app.run("keyQueue");
+  assert.equal(app.calls.length, 2);
+});
+
+test("key generations follow server state and never regress on an older poll", async () => {
+  const app = await fixture();
+  app.run("renderState({key_generations:{'1':7}}); renderState({key_generations:{'1':6}})");
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.map((call) => call.body.generation), [7, 7]);
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.slice(2).map((call) => call.body.generation), [8, 8]);
+});
+
+test("serial capture loss is visible in the processor row", async () => {
+  const app = await fixture();
+  app.run("renderProcessors([{image:'avr',uart_tx_dropped:[45,0]}])");
+  const row = app.elements.get("processors").children[0];
+  assert.ok(row.children.some((child) => /UART.*45/.test(child.textContent)));
+});
+
 test("lost window focus releases all keys exactly once", async () => {
   const app = await fixture();
   app.run("pressKey('1', 'keyboard:Digit1'); pressKey('up', 'pointer:7')");
@@ -126,8 +192,8 @@ test("lost window focus releases all keys exactly once", async () => {
   app.run("releaseKey('keyboard:Digit1'); releaseKey('pointer:7')");
   await app.run("keyQueue");
   assert.deepEqual(app.calls.map((call) => call.body), [
-    { key: "1", pressed: true }, { key: "up", pressed: true },
-    { key: "1", pressed: false }, { key: "up", pressed: false },
+    { key: "1", pressed: true, generation: 0 }, { key: "up", pressed: true, generation: 0 },
+    { key: "1", pressed: false, generation: 0 }, { key: "up", pressed: false, generation: 0 },
   ]);
 });
 
@@ -141,7 +207,9 @@ test("shifted number key uses the physical code for release; forms keep their ty
   target.closest = () => target;
   down({ key: "5", code: "Digit5", target, preventDefault() { assert.fail("Form input was intercepted"); } });
   await app.run("keyQueue");
-  assert.deepEqual(app.calls.map((call) => call.body), [{ key: "*", pressed: true }, { key: "*", pressed: false }]);
+  assert.deepEqual(app.calls.map((call) => call.body), [
+    { key: "*", pressed: true, generation: 0 }, { key: "*", pressed: false, generation: 0 },
+  ]);
 });
 
 test("asset rendering remains explicitly separate from live firmware output", async () => {

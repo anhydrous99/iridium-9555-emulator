@@ -143,6 +143,7 @@ pub const Usart = extern struct {
     out_head: u8 = 0,
     out_tail: u8 = 0,
     out_ring: [256]u8 = @splat(0),
+    out_dropped: u64 = 0,
 };
 
 /// Snapshot part "dev": plain data only.
@@ -765,7 +766,7 @@ pub const Devices = struct {
             if (u.out_tail +% 1 != u.out_head) {
                 u.out_ring[u.out_tail] = u.tx_shift;
                 u.out_tail +%= 1;
-            }
+            } else u.out_dropped +|= 1;
             if (u.tx_full != 0) d.uartShift(n) else io[base] |= 0x40; // TXC
         }
         if (io[base + 1] & 0x10 == 0) return; // RXEN off: the line is not sampled

@@ -4,10 +4,13 @@ const element = (id) => document.getElementById(id);
 const numberFormat = new Intl.NumberFormat();
 const keyButtons = new Map([...document.querySelectorAll("[data-key]")].map((button) => [button.dataset.key, button]));
 const heldSources = new Map();
+const submittedKeys = new Map();
+const keyGenerations = new Map();
 const pendingActions = new Set();
 let latestState = null;
 let stateRequest = null;
 let keyQueue = Promise.resolve();
+let keyQueueVersion = 0;
 let feedbackTimer;
 let pollTimer;
 let satelliteDirty = false;
@@ -43,8 +46,8 @@ async function request(path, options = {}) {
   return result;
 }
 
-function post(path, body) {
-  return request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+function post(path, body, options = {}) {
+  return request(path, { ...options, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
 function node(tag, className, text) {
@@ -85,6 +88,9 @@ function renderProcessors(processors) {
     }
     if (processor.unclassified_accesses !== undefined) {
       row.append(node("p", "processor-note", `Unclassified accesses: ${numberFormat.format(processor.unclassified_accesses)}`));
+    }
+    if (processor.uart_tx_dropped?.some((count) => count > 0)) {
+      row.append(node("p", "processor-note processor-halt", `UART TX capture lost bytes: ${processor.uart_tx_dropped.join(" / ")} (ports 0 / 1). Reset to clear.`));
     }
     return row;
   }));
@@ -226,6 +232,9 @@ function renderEvents(events) {
 
 function renderState(state) {
   latestState = state;
+  for (const [key, generation] of Object.entries(state.key_generations || {})) {
+    keyGenerations.set(key, Math.max(keyGenerations.get(key) ?? 0, generation));
+  }
   const firmware = state.firmware;
   element("firmware-name").textContent = firmware?.name || "No firmware loaded";
   element("firmware-format").textContent = firmware?.format || "Load a supported original firmware image";
@@ -291,9 +300,15 @@ async function action(button, callback) {
 }
 
 function queueKey(key, pressed) {
+  const version = keyQueueVersion;
   keyQueue = keyQueue.then(async () => {
+    if (version !== keyQueueVersion) return;
+    const generation = (pressed ? undefined : submittedKeys.get(key)) ?? keyGenerations.get(key) ?? 0;
+    if (pressed) submittedKeys.set(key, generation);
     try {
-      const result = await post("/api/key", { key, pressed });
+      const result = await post("/api/key", { key, pressed, generation }, { keepalive: true });
+      keyGenerations.set(key, Math.max(keyGenerations.get(key) ?? 0, result.generation));
+      if (!pressed && submittedKeys.get(key) === generation) submittedKeys.delete(key);
       const delivery = result.delivered === true ? "Original firmware handler" : "Not delivered to firmware";
       element("key-feedback").textContent = `${key} ${pressed ? "↓" : "↑"} · ${delivery} · ${resultMessage(result, "Input recorded.")}`;
     } catch (error) {
@@ -425,12 +440,16 @@ document.querySelectorAll("[data-satellite]").forEach((button) => {
 
 window.addEventListener("pagehide", () => {
   closed = true;
+  keyQueueVersion += 1;
   clearTimeout(pollTimer);
-  const keys = new Set(heldSources.values());
+  for (const key of heldSources.values()) keyButtons.get(key).classList.remove("held");
   heldSources.clear();
-  for (const key of keys) {
-    fetch("/api/key", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, pressed: false }), keepalive: true }).catch(() => {});
+  for (const [key, generation] of submittedKeys) {
+    // The server cancels older presses even if this keepalive release arrives first.
+    keyGenerations.set(key, Math.max(keyGenerations.get(key) ?? 0, generation + 1));
+    fetch("/api/key", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, pressed: false, generation }), keepalive: true }).catch(() => {});
   }
+  submittedKeys.clear();
 });
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) {
