@@ -11,10 +11,11 @@ from iridium.session import Session
 EXECUTABLE = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
 
 
-def images(model, *, receive=True, valid_handle=True):
-    def operand(op, value):
-        return [(((value + 0x80) >> 8) & 255) << 8, ((value & 255) << 8) | op]
+def operand(op, value):
+    return [(((value + 0x80) >> 8) & 255) << 8, ((value & 255) << 8) | op]
 
+
+def images(model, *, receive=True, valid_handle=True):
     bc5_size, avr_size = (0x310FBA, 8678) if model == "9555" else (0x36BB22, 14296)
     data = bytearray(bc5_size)
     data[:2] = b"\xe0\0"
@@ -34,6 +35,73 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_continuation_services_gpio_readiness_within_original_budget(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            words = operand(0x15, 0xFFC2) + operand(0xC4, 0x1000) + [0xFCF4, 0x00E2]
+            data[0x100:0x100 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            ddr, port, value = (0x24, 0x25, 1) if model == "9555" else (0x21, 0x22, 0x80)
+            words = [0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, ddr, 0x9300, port, 0xCFFF]
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                        parse_firmware(b"".join(w.to_bytes(2, "little") for w in words).ljust(len(avr.data), b"\xff"),
+                                       "avr.bin", "avr", model=model)]
+            with self.subTest(model=model), Session(EXECUTABLE, firmware) as session:
+                session.spi_link.exchange()
+                first = session.engines["bc5"].request("call", entry=0x100, steps=10000, quantum=1)
+                self.assertTrue(first["last_call"]["pending"])
+                self.assertFalse(first["serial_waiting"])
+                before = [worker.state["steps"] for worker in session.engines.values()]
+                for arguments in ({"steps": 100000001}, {"steps": 0}, {"steps": True},
+                                  {"steps": "bad"}, {"steps": 9999, "quantum": 0}):
+                    with self.assertRaises(EngineError):
+                        session.probe("bc5", "call_resume", arguments)
+                    self.assertEqual([worker.state["steps"] for worker in session.engines.values()], before)
+                resumed = session.probe("bc5", "call_resume", {"steps": 9999})
+                self.assertTrue(resumed["last_call"]["returned"])
+                self.assertLessEqual(resumed["last_call"]["steps"], 10000)
+                self.assertGreater(session.engines["avr"].state["steps"], 0)
+
+    def test_dma_does_not_deliver_next_byte_after_chip_select_is_released(self):
+        for model in ("9555", "9575"):
+            for selected in (True, False):
+                bc5, avr = images(model)
+                words = []
+                setup = [(0x62, 0x8000), (0x61, 0x8010), (0xFE94, 1), (0xFDBE, 1),
+                         (0xFDBF, 0x440), (0xFDC0, 0), (0xFDC3, 0), (0xFDC1, 2),
+                         (0x62, 0x8000 if selected else 0x8010)]
+                for address, value in setup:
+                    words.extend(operand(0x14, value) + operand(0x25, address))
+                words.append(0x00E0)
+                firmware = [parse_firmware(b"".join(w.to_bytes(2, "little") for w in words).ljust(len(bc5.data), b"\0"),
+                                           "bc5.bin", "bc5", model=model)]
+                words = [0xE400, 0x9300, 0x4C, 0x9110, 0x4E, 0xCFFD]
+                firmware.append(parse_firmware(b"".join(w.to_bytes(2, "little") for w in words).ljust(len(avr.data), b"\xff"),
+                                               "avr.bin", "avr", model=model))
+                with self.subTest(model=model, selected=selected), Session(EXECUTABLE, firmware) as session:
+                    for address, values in ((0xA002, [0x100, 0]), (0xA100, [8]), (0xA200, [0x2211])):
+                        session.probe("bc5", "write", {"address": address, "values": values})
+                    session.control("step", 16)
+                    self.assertEqual(session.spi_link.transferred, 1)
+                    session.control("step", 2)
+                    session.control("step", 2)
+                    self.assertEqual(session.spi_link.transferred, 2 if selected else 1)
+                    self.assertEqual(session.engines["avr"].state["registers"][17], 0x22 if selected else 0x11)
+                    self.assertIsNone(session.engines["avr"].state["halt"])
+
+    def test_held_input_does_not_block_replacement_of_its_dead_worker(self):
+        for model in ("9555", "9575"):
+            for image, key in (("bc5", "1"), ("avr", "power")):
+                firmware = images(model)
+                with self.subTest(model=model, image=image), Session(EXECUTABLE, firmware) as session:
+                    session.key(key, True, client_id="tab-a", sequence=1, epoch=session.key_epoch)
+                    old = session.engines[image]
+                    old._process.kill()
+                    old._process.wait()
+                    session.load(next(item for item in firmware if item.image == image))
+                    self.assertIsNot(session.engines[image], old)
+                    self.assertEqual(session.keys, set())
+
     def test_standalone_cpu_probe_can_resume_without_a_serial_peer(self):
         for model in ("9555", "9575"):
             bc5 = images(model)[0]

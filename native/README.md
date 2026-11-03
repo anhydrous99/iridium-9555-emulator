@@ -26,7 +26,7 @@ The worker emits an initial JSON state, then one response for each newline-delim
 | `{"op":"idle","steps":10000000}` | BC5 only: execute at least one step, then stop at the known scheduler idle boundary 0xB774. Check `at_idle` before a debugger injection; budget exhaustion can return `at_idle:false`. |
 | `{"op":"state"}` | Return state without advancing guest time. |
 | `{"op":"reset"}` | Reset CPU/RAM/devices and discard guest changes to flash/EEPROM. Reload the original input in memory. |
-| `{"op":"warm_reset"}` | BC5/AVR: reset CPU/devices while retaining programmed flash and RAM; AVR also retains EEPROM, fuses and external inputs. Guest startup initializes its own memory. |
+| `{"op":"warm_reset"}` | BC5/AVR: reset CPU/devices while retaining programmed flash and RAM; AVR also retains EEPROM, fuses and external fixtures, and records an external reset in MCUSR. Guest startup initializes its own memory. |
 | `{"op":"read","address":40960,"count":16}` | Return `{address,unit_bits,values}` from raw backing memory, without side effects. BC5 units are 16-bit words; AVR/SPARC units are bytes. Device and CPU register state is not reflected in this raw-memory view. |
 | `{"op":"write","address":40960,"values":[123]}` | Debugger RAM/scratch write. Validate all values/ranges first; ROM, MMIO and CPU aliases are rejected. Return state. |
 | `{"op":"call","entry":476,"al":40960,"ah":123,"stack":[1],"steps":10000}` | BC5-only explicit debugger function probe at a byte address. Execute the original routine with AL/AH/stack arguments. Return state with `last_call`. |
@@ -67,8 +67,9 @@ A function probe chooses an IRQ-safe Y no higher than 0xFCC0, preserving the
 device and elapsed-time effects. Stack-local returned pointers expire.
 `last_call` reports `returned`, `pending`, AL/AH, steps and the probe PC.
 Failed probes retain stopped registers and up to 64 stack words. A serial wait
-or explicit initial `quantum` can yield a live probe; `call_resume` continues
-within its original cumulative budget and bus fuel. Ordinary run/idle/write and
+or explicit `quantum` can yield a live probe; `call_resume` accepts the same
+per-request quantum and continues within its original cumulative budget and bus
+fuel. Ordinary run/idle/write and
 a second call are rejected while pending. Reset discards it. Traps, nonreturning
 probes and stack-guard changes halt explicitly; this is not a snapshot transaction.
 

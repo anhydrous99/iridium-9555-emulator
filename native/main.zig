@@ -325,6 +325,10 @@ fn gpioResetAsserted() bool {
     return Bc.dev.low[0x61] & 0x8000 != 0 and Bc.dev.low[0x62] & 0x8000 == 0;
 }
 
+fn gpioAvrSelected() bool {
+    return Bc.dev.low[0x61] & 0x10 != 0 and Bc.dev.low[0x62] & 0x10 == 0;
+}
+
 fn serialAccess(address: u32, write: bool) bool {
     if (address == 0xFE95) return !write;
     return (address >= 0xFDBE and address <= 0xFDC5) or address == 0xFE93 or address == 0xFE94;
@@ -336,7 +340,7 @@ fn serialTransfer(count: u16) void {
     // mode3 and the clock/data pin indices 0,1,1 encoded in FDBF (table 2EF0).
     if (registers[0] & 1 == 0) return;
     if (registers[1] & 0x7FFF == 0x440 and serial_peer and
-        Bc.dev.low[0x61] & 0x10 != 0 and Bc.dev.low[0x62] & 0x10 == 0 and registers[5] <= 1)
+        gpioAvrSelected() and registers[5] <= 1)
     {
         if (serial_waiting) {
             hardwareFault(&BcMem.bus, 0xFDC1, true);
@@ -755,13 +759,7 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
             Bc.warmReset();
             attachBc5Devices();
         } else if (current_image == .avr) {
-            const ee = avr_dev.st.ee;
-            const analog = avr_dev.st.analog;
-            const pins = avr_dev.st.pins_in;
-            avr_dev.reset();
-            avr_dev.st.ee = ee;
-            avr_dev.st.analog = analog;
-            avr_dev.st.pins_in = pins;
+            avr_dev.resetWithCause(.external);
             avr_bus.resetRun(std.math.maxInt(u64));
             avr_soc.loader.coldReset(&avr_cpu);
             avr_cpu.st.pc = avr_dev.resetVector();
@@ -932,7 +930,7 @@ fn serial(out: *std.Io.Writer, obj: std.json.ObjectMap) !void {
         }
     }
     var value: ?u8 = null;
-    if (!gpioResetAsserted()) {
+    if (!gpioResetAsserted() and gpioAvrSelected()) {
         if (serial_dma) |*dma| {
             if (!dma.in_flight) {
                 value = if (dma.receive) 0 else bc5_mmu.readBuffer(Bc.dev.ext[0x94], serial_cursor) catch |err| {
@@ -1088,7 +1086,9 @@ fn callResume(obj: std.json.ObjectMap) !void {
     if (halt_reason != null) return error.MachineHalted;
     const steps = try number(u64, obj, "steps", context.remaining);
     if (steps == 0 or steps > max_probe_steps) return error.StepLimit;
-    continueCall(@min(steps, context.remaining));
+    const quantum = try number(u64, obj, "quantum", steps);
+    if (quantum == 0 or quantum > max_probe_steps) return error.StepLimit;
+    continueCall(@min(steps, quantum, context.remaining));
 }
 
 fn continueCall(steps: u64) void {

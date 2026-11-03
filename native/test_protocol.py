@@ -46,6 +46,25 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_avr_external_reset_preserves_fixtures_without_inventing_timer_edges(self):
+        # Read the reset cause, clear sticky flags, enable rising-edge T0 and poll count/ACO.
+        words = (0x9110, 0x54, 0xE000, 0x9300, 0x54, 0xE007, 0x9300, 0x45,
+                 0x9120, 0x46, 0x9130, 0x50, 0xCFFB)
+        for model, size, port, high in (("9555", 8678, 1, 1), ("9575", 14296, 3, 0x80)):
+            with self.subTest(model=model):
+                firmware = b"".join(w.to_bytes(2, "little") for w in words).ljust(size, b"\xff")
+                states = exchange("avr", firmware, [
+                    {"op": "pins", "port": port, "value": high},
+                    {"op": "comparator", "positive": 900, "negative": 100, "bandgap": 300},
+                    {"op": "run", "steps": 20}, {"op": "warm_reset"},
+                    {"op": "run", "steps": 20},
+                ], model=model)
+                for index, cause in ((3, 1), (5, 2)):
+                    self.assertEqual(states[index]["registers"][17], cause)
+                    self.assertEqual(states[index]["registers"][18], 0)
+                    self.assertEqual(states[index]["registers"][19] & 0x20, 0x20)
+                    self.assertIsNone(states[index]["halt"])
+
     def test_complete_avr_flash_and_boot_fuses_use_model_specific_bounds(self):
         for model, size, boot in (("9555", 0x4000, 0x1C00), ("9575", 0x20000, 0xF000)):
             with self.subTest(model=model):

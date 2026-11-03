@@ -103,8 +103,9 @@ class Session:
                     for key in self.keys:
                         code = self.profile.key_codes.get(key)
                         if primary and primary.state.get("bc5_hardware") and code is not None and key != "sos":
-                            self._request(primary, "key", code=code, pressed=False)
-                        elif key == "power" and self.spi_link:
+                            if firmware.image != "bc5":
+                                self._request(primary, "key", code=code, pressed=False)
+                        elif key == "power" and self.spi_link and firmware.image != "avr":
                             self._power_input(False)
                     # A new AVR starts a new board boot. Reset the retained primary
                     # so no native DMA byte remains owned by the retired SPI link.
@@ -508,7 +509,7 @@ class Session:
     def _probe_operation(self, worker, operation, arguments):
         arguments = dict(arguments)
         budget = arguments.get("steps", 100000 if operation == "call" else 100000000)
-        if operation == "call" and self.spi_link and type(budget) is int and budget > 0:
+        if self.spi_link and type(budget) is int and budget > 0:
             arguments.setdefault("quantum", self._board_quantum(budget))
         before = (worker.state.get("last_call") or {}).get("steps", 0) if operation == "call_resume" else 0
         # Native validation must run before any peripheral processor advances.

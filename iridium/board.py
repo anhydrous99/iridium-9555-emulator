@@ -125,7 +125,8 @@ class SpiLink:
             self.bc5.request("pins", mask=0x5000,
                              value=(0x1000 if handshake else 0) | (0x4000 if attention else 0))
 
-            if self._byte is not None and self._reply is None and not held:
+            selected = bool(gpio["direction"] & 0x10 and not gpio["output"] & 0x10)
+            if self._byte is not None and self._reply is None and not held and selected:
                 reply = self.avr.request("spi", value=self._byte[0])
                 if not isinstance(reply, dict) or "value" not in reply:
                     raise EngineError("Invalid AVR response on BC5/AVR SPI link")

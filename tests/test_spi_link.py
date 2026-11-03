@@ -5,7 +5,7 @@ from iridium.engine import EngineError
 
 
 def serial(value=None, *, sequence=0, active=False, remaining=0,
-           output=0x8000, direction=0x8000, reset_count=0):
+           output=0x8000, direction=0x8010, reset_count=0):
     return {"value": value, "sequence": sequence, "active": active,
             "remaining": remaining,
             "gpio": {"output": output, "direction": direction, "reset_count": reset_count}}
@@ -116,12 +116,31 @@ class SpiLinkTests(unittest.TestCase):
         self.assertEqual(link.state()["reset_count"], 2)
 
     def test_reset_pin_only_holds_avr_when_configured_as_output(self):
-        bc5, avr = Bc5(serial(7, sequence=1, active=True, output=0, direction=0)), Avr(5)
+        bc5, avr = Bc5(serial(7, sequence=1, active=True, output=0, direction=0x10)), Avr(5)
         link = SpiLink(bc5, avr, "9555")
         link.exchange()
         self.assertFalse(link.hold_reset)
         self.assertNotIn(("warm_reset", {}), avr.calls)
         self.assertIn(("spi", {"value": 7}), avr.calls)
+
+    def test_queued_byte_waits_for_driven_low_chip_select(self):
+        for model in ("9555", "9575"):
+            for gpio in ({"output": 0x8010}, {"direction": 0x8000}):
+                with self.subTest(model=model, gpio=gpio):
+                    bc5 = Bc5(serial(0x22, sequence=4, active=True),
+                              serial(sequence=4, active=True, **gpio),
+                              serial(sequence=4, active=True), serial())
+                    avr = Avr(None, 0x55)
+                    link = SpiLink(bc5, avr, model)
+                    link.exchange()  # The slave is not ready, so the byte remains queued.
+                    link.exchange()  # Deselect it before the retry.
+                    self.assertEqual([args for op, args in avr.calls if op == "spi"], [{"value": 0x22}])
+                    self.assertTrue(link.pending)
+                    link.exchange()  # Selecting it again permits exactly one transfer.
+                    self.assertEqual(link.transferred, 1)
+                    link.exchange()
+                    self.assertFalse(link.pending)
+                    self.assertEqual(bc5.calls[-2], ("serial", {"received": 0x55, "sequence": 4}))
 
     def test_undriven_slave_retains_byte_without_fabricating_reply(self):
         bc5 = Bc5(serial(0x81, sequence=2, active=True),

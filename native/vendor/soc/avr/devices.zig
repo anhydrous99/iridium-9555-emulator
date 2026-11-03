@@ -338,28 +338,44 @@ pub const Devices = struct {
 
     /// Power-on reset (EEPROM keeps its contents; the 1-Wire slave and its memory are on the board).
     pub fn reset(d: *Devices) void {
+        d.resetWithCause(.power_on);
+    }
+
+    pub const ResetCause = enum(u8) { power_on = 1, external = 2 };
+
+    pub fn resetWithCause(d: *Devices, cause: ResetCause) void {
         const ee = d.st.ee;
         const ow = d.st.ow;
         const fuse = d.st.fuse;
+        const analog = d.st.analog;
+        const comparator = d.st.comparator;
+        const bandgap = d.st.bandgap;
+        const pins = d.st.pins_in;
+        const flags = d.st.io[MCUSR];
         d.st = .{};
         d.st.fuse = fuse;
         d.st.ee = ee;
         d.st.ow = .{ .connected = ow.connected, .present = ow.present, .mem = ow.mem };
+        d.st.analog = analog;
+        d.st.comparator = comparator;
+        d.st.bandgap = bandgap;
+        d.st.pins_in = pins;
         d.st.io[UCSR0A] = 0x20;
         d.st.io[UCSR1A] = 0x20;
         d.st.io[UCSR0A + 2] = 0x06;
         d.st.io[UCSR1A + 2] = 0x06;
         d.st.io[CLKPR] = if (d.st.fuse.low & 0x80 == 0) @as(u8, 3) else 0;
-        d.st.io[MCUSR] = 0x01; // PORF
+        d.st.io[MCUSR] = (if (cause == .power_on) @as(u8, 0) else flags) | @backingInt(cause);
         d.st.io[0x66] = 0x80; // OSCCAL: factory value unknown [unk]
         d.st.io[ADCSRA] = 0;
-        if (d.st.fuse.high & 0x10 == 0) d.st.io[WDTCSR] = 0x08; // WDTON forces reset mode.
+        if (d.st.fuse.high & 0x10 == 0 or d.st.io[MCUSR] & 8 != 0) d.st.io[WDTCSR] = 0x08;
         d.st.io[TWSR] = 0xF8;
         d.st.io[TWDR] = 0xFF;
         d.st.io[TWAR] = 0xFE;
         d.pinChange();
         d.st.ext_last = d.extLevels();
         d.seedTimerPins();
+        d.comparatorRefresh();
         if (d.mega) for (uart_bases[2..]) |base| {
             d.st.io[base] = 0x20;
             d.st.io[base + 2] = 0x06;
@@ -861,6 +877,7 @@ pub const Devices = struct {
             .tape => return,
             .store => {
                 const previous = d.st.io[a];
+                const trigger = a == ADCSRB and d.adcTriggerLevel();
                 d.st.io[a] = v;
                 if (a == ADMUX and (previous ^ v) & 0x20 != 0) {
                     const encoded = @as(u16, d.st.io[ADCL]) | @as(u16, d.st.io[ADCH]) << 8;
@@ -872,6 +889,7 @@ pub const Devices = struct {
                 if (a == PCMSK0 or a == 0x6C or a == 0x6D or a == PCMSK3) d.pinChange();
                 if (a == EICRA or a == EICRB) d.externalInterrupts();
                 if (a == ADMUX or a == ADCSRB or (a == PRR and (previous ^ v) & PRADC != 0)) d.comparatorRefresh();
+                if (a == ADCSRB and !trigger and d.adcTriggerLevel()) d.adcTrigger(@truncate(v));
                 if (a == TCCR0A or a == TCCR2A) {
                     d.pinChange();
                     d.owDrive();
@@ -981,7 +999,7 @@ pub const Devices = struct {
                 // EEMPE stays set for 4 cycles after it is written; EEPE written inside that window
                 // starts a write. EEPE is otherwise status (set while programming).
                 const mpe = d.st.ee_window != 0;
-                if (v & 0x02 != 0 and mpe and d.st.ee_busy == 0) {
+                if (v & 0x02 != 0 and mpe and d.st.ee_busy == 0 and d.st.spm_busy == 0) {
                     d.st.ee_busy = @intCast(d.fCpu() * 34 / 10_000); // 3.4 ms
                     d.st.ee_window = 0;
                     io[a] = (io[a] & 0x02) | (v & 0x38) | 0x02;
@@ -1251,9 +1269,7 @@ pub const Devices = struct {
         if (wgm == 8 or wgm == 10 or wgm == 12 or wgm == 14) return; // ICRn supplies TOP.
         if (level == ((control >> 6) & 1)) {
             t.capture = t.count;
-            const rising = d.st.io[timer16_flags[n]] & 0x20 == 0;
-            d.st.io[timer16_flags[n]] |= 0x20;
-            if (n == 0 and rising) d.adcTrigger(7);
+            d.timerFlags(timer16_flags[n], 0x20);
         }
     }
 
@@ -1330,6 +1346,34 @@ pub const Devices = struct {
             if (rising) d.adcTrigger(1);
         }
         if (io[ACSR] & 4 != 0) d.timerPinEdges();
+    }
+
+    fn adcTriggerLevel(d: *const Devices) bool {
+        const io = &d.st.io;
+        return switch (io[ADCSRB] & 7) {
+            0 => false,
+            1 => io[ACSR] & 0x10 != 0,
+            2 => io[EIFR] & 1 != 0,
+            3 => io[TIFR0] & 2 != 0,
+            4 => io[TIFR0] & 1 != 0,
+            5 => io[TIFR1] & 4 != 0,
+            6 => io[TIFR1] & 1 != 0,
+            7 => io[TIFR1] & 0x20 != 0,
+            else => unreachable,
+        };
+    }
+
+    fn timerFlags(d: *Devices, address: u16, flags: u8) void {
+        const rising = flags & ~d.st.io[address];
+        d.st.io[address] |= flags;
+        if (address == TIFR0) {
+            if (rising & 2 != 0) d.adcTrigger(3);
+            if (rising & 1 != 0) d.adcTrigger(4);
+        } else if (address == TIFR1) {
+            if (rising & 4 != 0) d.adcTrigger(5);
+            if (rising & 1 != 0) d.adcTrigger(6);
+            if (rising & 0x20 != 0) d.adcTrigger(7);
+        }
     }
 
     fn adcTrigger(d: *Devices, source: u3) void {
@@ -1616,8 +1660,6 @@ pub const Devices = struct {
         const div01 = [8]u64{ 0, 1, 8, 64, 256, 1024, 0, 0 };
         const div2 = [8]u64{ 0, 1, 8, 32, 64, 128, 256, 1024 };
         // External clocks arrive through GPIO edges; asynchronous Timer2 uses host oscillator ticks.
-        const flags0 = io[TIFR0];
-        const flags1 = io[TIFR1];
         if (io[PRR] & PRTIM0 == 0) d.timer8(0, ticks(old01, d.st.pre01, div01[io[TCCR0B] & 7]));
         for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
             if (d.timerPowered(n))
@@ -1631,11 +1673,6 @@ pub const Devices = struct {
                 if (t.capture_cycles >= 4) d.captureEdge(n, t.capture_candidate);
             }
         }
-        if (flags0 & 2 == 0 and io[TIFR0] & 2 != 0) d.adcTrigger(3);
-        if (flags0 & 1 == 0 and io[TIFR0] & 1 != 0) d.adcTrigger(4);
-        if (flags1 & 4 == 0 and io[TIFR1] & 4 != 0) d.adcTrigger(5);
-        if (flags1 & 1 == 0 and io[TIFR1] & 1 != 0) d.adcTrigger(6);
-        if (flags1 & 0x20 == 0 and io[TIFR1] & 0x20 != 0) d.adcTrigger(7);
         for (0..d.uartCount()) |k| {
             const mask: u8 = if (k == 0) PRUSART0 else if (d.mega) @as(u8, 1) << @intCast(k - 1) else PRUSART1;
             if (d.ioRunning() and io[if (d.mega and k > 0) 0x65 else PRR] & mask == 0) d.uartTick(@intCast(k), cycles);
@@ -1767,7 +1804,7 @@ pub const Devices = struct {
                 io[rc] = old +% 1;
                 if (wgm == 2 and old == 0xFF) flags |= 1; // CTC missed TOP still overflows at MAX.
             }
-            io[rf] |= flags;
+            d.timerFlags(rf, flags);
             var changed = false;
             for (0..2) |c| {
                 if (!d.output8Enabled(n, c)) continue;
@@ -1846,7 +1883,12 @@ pub const Devices = struct {
             },
             5, 7, 9, 11, 13 => t.temp = value,
             4 => t.count = @as(u16, t.temp) << 8 | value,
-            6 => t.capture = @as(u16, t.temp) << 8 | value,
+            6 => {
+                const base = timer16_bases[n];
+                const wgm = ((d.st.io[base + 1] >> 1) & 0xC) | (d.st.io[base] & 3);
+                if (wgm == 8 or wgm == 10 or wgm == 12 or wgm == 14)
+                    t.capture = @as(u16, t.temp) << 8 | value;
+            },
             8, 10, 12 => {
                 const c = (off - 8) / 2;
                 t.buffered[c] = @as(u16, t.temp) << 8 | value;
@@ -1910,7 +1952,7 @@ pub const Devices = struct {
                 t.count = old +% 1;
                 if (ctc and old == 0xFFFF) flags |= 1;
             }
-            io[timer16_flags[n]] |= flags;
+            d.timerFlags(timer16_flags[n], flags);
             var changed = false;
             for (old_compare[0..if (d.mega) @as(usize, 3) else 2], 0..) |compare, c| {
                 if (!d.output16Enabled(n, c)) continue;
@@ -2135,6 +2177,124 @@ fn fresh() Devices {
     var d: Devices = .{};
     d.reset();
     return d;
+}
+
+test "external reset retains fixtures, seeds input history and preserves sticky reset causes" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        const port: u4 = if (mega) 3 else 1;
+        const bit: u8 = if (mega) 0x80 else 1;
+        d.setPinsIn(port, bit);
+        d.setAnalog(0, 123);
+        d.setComparatorInputs(900, 100);
+        d.setBandgap(300);
+        d.st.ee[7] = 0x5A;
+        d.write(MCUSR, 0);
+        d.resetWithCause(.external);
+        try testing.expectEqual(@as(u8, 2), d.read(MCUSR));
+        try testing.expectEqual(@as(u16, 123), d.st.analog[0]);
+        try testing.expectEqual([2]u16{ 900, 100 }, d.st.comparator);
+        try testing.expectEqual(@as(u16, 300), d.st.bandgap);
+        try testing.expectEqual(@as(u8, 0x5A), d.st.ee[7]);
+        d.write(TCCR0B, 7);
+        d.tick(2);
+        try testing.expectEqual(@as(u8, 0), d.read(TCNT0));
+        try testing.expectEqual(@as(u8, 0), d.read(PCIFR));
+        try testing.expectEqual(@as(u8, 0x20), d.read(ACSR) & 0x20);
+        d.setPinsIn(port, 0);
+        d.setPinsIn(port, bit);
+        try testing.expectEqual(@as(u8, 1), d.read(TCNT0));
+        d.st.io[MCUSR] = 0x0D; // Previously latched power-on, brown-out and watchdog resets.
+        d.resetWithCause(.external);
+        try testing.expectEqual(@as(u8, 0x0F), d.read(MCUSR));
+        try testing.expectEqual(@as(u8, 8), d.read(WDTCSR) & 8);
+        d.reset();
+        try testing.expectEqual(@as(u8, 1), d.read(MCUSR));
+    }
+}
+
+test "external timer flag edges trigger ADC samples on both profiles" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]u3{ 3, 4, 5, 6 }) |source| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            d.setAnalog(0, 555);
+            d.write(ADCSRB, source);
+            d.write(ADCSRA, 0xA0);
+            const timer0 = source < 5;
+            if (timer0) {
+                d.write(OCR0A, 1);
+                if (source == 4) d.write(TCNT0, 0xFF);
+                d.write(TCCR0B, 7);
+            } else {
+                d.write(OCR1BH, 0);
+                d.write(OCR1BL, 1);
+                if (source == 6) {
+                    d.write(TCNT1H, 0xFF);
+                    d.write(TCNT1L, 0xFF);
+                }
+                d.write(TCCR1B, 7);
+            }
+            const port: u4 = if (mega) 3 else 1;
+            const bit: u8 = if (timer0) (if (mega) 0x80 else 1) else (if (mega) 0x40 else 2);
+            d.setPinsIn(port, bit);
+            d.setPinsIn(port, 0);
+            d.setPinsIn(port, bit);
+            try testing.expect(d.st.adc_busy > 0);
+            d.tick(50);
+            try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x50);
+            const sample = @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8;
+            try testing.expectEqual(@as(u16, 555), sample);
+            d.write(ADCSRA, 0xB0); // A high trigger flag alone cannot start another conversion.
+            d.tick(100);
+            try testing.expectEqual(@as(u32, 0), d.st.adc_busy);
+            try testing.expectEqual(@as(u8, 0), d.read(ADCSRA) & 0x50);
+        }
+    }
+}
+
+test "changing ADC sources triggers only a low-to-high selected flag" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(ADCSRB, 2); // INT0 flag is low.
+        d.write(ADCSRA, 0xA0);
+        d.write(OCR0A, 1);
+        d.write(TCCR0B, 1);
+        d.tick(2);
+        try testing.expect(d.read(TIFR0) & 2 != 0);
+        d.write(TCCR0B, 0);
+        try testing.expectEqual(@as(u32, 0), d.st.adc_busy);
+        d.write(ADCSRB, 3);
+        try testing.expect(d.st.adc_busy > 0);
+        d.tick(50);
+        d.write(ADCSRA, 0xB0);
+        d.write(ADCSRB, 3); // Same high source: no new edge.
+        try testing.expectEqual(@as(u32, 0), d.st.adc_busy);
+        d.write(ADCSRB, 0); // Free-running selection itself must not trigger.
+        try testing.expectEqual(@as(u32, 0), d.st.adc_busy);
+        d.write(ADCSRB, 3);
+        try testing.expect(d.st.adc_busy > 0);
+    }
+}
+
+test "ICR writes commit only after selecting an ICR TOP mode on every timer" {
+    for ([_]bool{ false, true }) |mega| {
+        for (timer16_bases[0..if (mega) @as(usize, 4) else 1]) |base| {
+            for (0..16) |mode| {
+                var d: Devices = .{ .mega = mega };
+                d.reset();
+                d.write(base, @intCast(mode & 3));
+                d.write(base + 1, @intCast((mode & 12) << 1));
+                d.write(base + 7, 0x12);
+                d.write(base + 6, 0x34);
+                const capture = @as(u16, d.read(base + 6)) | @as(u16, d.read(base + 7)) << 8;
+                const allowed = mode == 8 or mode == 10 or mode == 12 or mode == 14;
+                try testing.expectEqual(@as(u16, if (allowed) 0x1234 else 0), capture);
+            }
+        }
+    }
 }
 
 test "Timer1 normal mode at clk/1024; TEMP-latched 16-bit read; PRR gating" {
@@ -2789,9 +2949,10 @@ test "ICR-TOP phase PWM signals capture at TOP once per cycle on all 16-bit time
             for ([_]u8{ 8, 10 }) |mode| {
                 var d: Devices = .{ .mega = mega };
                 d.reset();
+                d.write(base, mode & 3);
+                d.write(base + 1, (mode & 12) << 1);
                 d.write(base + 7, 0);
                 d.write(base + 6, 3);
-                d.write(base, mode & 3);
                 d.write(base + 1, ((mode & 12) << 1) | 1);
                 d.write(timer16_masks[n], 0x20);
                 d.tick(2);
@@ -3226,6 +3387,41 @@ const SpmTest = struct {
         try t.steps(1);
     }
 };
+
+test "EEPROM and flash self-programming exclude each other in either order" {
+    for ([_]bool{ false, true }) |mega| {
+        var t: emu.cpu.TestRig = .{};
+        try t.init(&.{0x0000});
+        defer t.deinit();
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.configureFuses(0x77, 0x99, 0xFE, 0xFF);
+        t.bus.dev = d.device();
+        t.cpu.sys = d.sys();
+        t.cpu.program_mask = if (mega) 0xFFFF else emu.cpu.pc_mask;
+        const boot = @as(usize, d.bootStart()) * 2;
+        std.mem.writeInt(u16, t.prog[boot..][0..2], 0x95E8, .little);
+        try SpmTest.command(&t, &d, 3, 0x100, 0);
+        try testing.expect(d.st.spm_busy > 0);
+        d.write(EEDR, 0x5A);
+        d.write(EECR, 4);
+        d.write(EECR, 2);
+        try testing.expectEqual(@as(u32, 0), d.st.ee_busy);
+        d.tick(6800);
+        try testing.expect(d.st.spm_busy > 0);
+        try testing.expectEqual(@as(u8, 0xFF), d.st.ee[0]);
+        d.tick(d.st.spm_busy);
+        d.write(EECR, 4);
+        d.write(EECR, 2);
+        try testing.expect(d.st.ee_busy > 0);
+        try SpmTest.command(&t, &d, 3, 0x100, 0);
+        try testing.expectEqual(@as(u32, 0), d.st.spm_busy);
+        d.tick(d.st.ee_busy);
+        try testing.expectEqual(@as(u8, 0x5A), d.st.ee[0]);
+        try SpmTest.command(&t, &d, 3, 0x100, 0);
+        try testing.expect(d.st.spm_busy > 0);
+    }
+}
 
 test "SPM instructions enforce boot and lock permissions, page erase/write timing, NOR writes and RWW enable" {
     for ([_]bool{ false, true }) |mega| {

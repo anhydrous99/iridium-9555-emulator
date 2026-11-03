@@ -85,9 +85,10 @@ retaining RAM and emulated flash contents. Original reset code validates retaine
 persistent-store records before clearing RAM. This is an explicit host operation;
 watchdog timing is not modeled. The ordinary `reset` also clears RAM and restores
 flash from the supplied firmware, returning the worker to a fresh experiment.
-AVR `warm_reset` retains program/EEPROM, fuses, SRAM and external input levels;
-its original reset code executes from the configured reset vector. A cold AVR
-reset restores the supplied program and clears the experiment's device state.
+AVR `warm_reset` retains program/EEPROM, fuses, SRAM and external digital/analog
+fixtures, reseeds edge detectors and records EXTRF while retaining sticky reset
+flags. Its original reset code executes from the configured reset vector. A cold
+AVR reset restores the supplied program and clears the experiment's device state.
 
 The Python transport applies one 30-second deadline to sending a request and
 receiving its reply. Timeouts, disconnects, malformed replies and oversized replies
