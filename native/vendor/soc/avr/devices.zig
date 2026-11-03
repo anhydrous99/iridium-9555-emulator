@@ -532,7 +532,7 @@ pub const Devices = struct {
                 } else if (d.st.master_busy != 0) io[SPSR] |= 0x40; // WCOL
             },
             UCSR0A, UCSR1A => {
-                io[a] = (io[a] & ~@as(u8, 0x43)) | (v & 0x03); // U2X, MPCM
+                io[a] = (io[a] & ~@as(u8, 0x03)) | (v & 0x03); // U2X, MPCM
                 if (v & 0x40 != 0) io[a] &= ~@as(u8, 0x40); // TXC is write-one-to-clear
             },
             UCSR0A + 6, UCSR1A + 6 => {
@@ -1074,6 +1074,32 @@ test "USART: frame timing from UBRR/U2X, UDRE/TXC, RX FIFO with overrun" {
     try testing.expectEqual(@as(u8, 1), d.read(UCSR0A + 6));
     try testing.expectEqual(@as(u8, 2), d.read(UCSR0A + 6));
     try testing.expectEqual(@as(u8, 0), d.read(UCSR0A) & 0x80);
+}
+
+test "USART0/1: TXC survives writing zero and clears only when written one" {
+    for ([_]u8{ UCSR0A, UCSR1A }, 0..) |base, port| {
+        for ([_]u8{ 0x00, 0x03 }) |control| {
+            var d = fresh();
+            const n: u1 = @intCast(port);
+            const vector: u8 = if (n == 0) Vec.usart0_tx else Vec.usart1_tx;
+            d.write(base, 0x03); // U2X, MPCM
+            d.write(base + 1, 0x48); // TXEN, TXCIE
+            d.write(base + 6, 0x41);
+            d.tick(10 * 8); // Default UBRR=0, 8N1 with U2X.
+            try testing.expectEqual(@as(?u8, 0x41), d.uartPop(n));
+            try testing.expectEqual(@as(u8, 0x63), d.read(base));
+            try testing.expectEqual(@as(?u8, vector), d.pending());
+
+            d.write(base, control); // TXC=0 preserves the completed transmission.
+            try testing.expectEqual(@as(u8, 0x60) | control, d.read(base));
+            try testing.expectEqual(@as(?u8, vector), d.pending());
+            d.write(base, 0x40 | control);
+            try testing.expectEqual(@as(u8, 0x20) | control, d.read(base));
+            try testing.expectEqual(@as(?u8, null), d.pending());
+            d.write(base, 0x40 | control); // Writing one never sets TXC.
+            try testing.expectEqual(@as(u8, 0x20) | control, d.read(base));
+        }
+    }
 }
 
 test "SPI slave: transfer exchanges SPDR, SPIF cleared by SPSR read then SPDR access" {

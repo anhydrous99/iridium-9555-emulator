@@ -80,6 +80,23 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(states[259]["uart_tx_dropped"], [0, 0])
                 self.assertEqual(states[260], {"value": None, "dropped": 0})
 
+    def test_uart_txc_writes_preserve_then_clear_completed_transmission(self):
+        for port in (0, 1):
+            with self.subTest(port=port):
+                base = 0xC0 + port * 8
+                # Transmit 'A', wait for TXC, then write TXC=0 and TXC=1, saving each status.
+                words = (0xE008, 0x9300, base + 1, 0xE401, 0x9300, base + 6,
+                         0x9110, base, 0xFF16, 0xCFFC,
+                         0xE000, 0x9300, base, 0x9120, base,
+                         0xE400, 0x9300, base, 0x9130, base, 0xCFFF)
+                firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(8678, b"\xff")
+                states = exchange("avr", firmware, [
+                    {"op": "run", "steps": 1000}, {"op": "uart_tx", "port": port},
+                ])
+                self.assertIsNone(states[1]["halt"])
+                self.assertEqual(states[1]["registers"][17:20], [0x60, 0x60, 0x20])
+                self.assertEqual(states[2], {"value": 65, "dropped": 0})
+
     def test_multiple_commands_preserve_state_and_eof_terminates(self):
         states = exchange("avr", avr_loop(), [
             {"op": "run", "steps": 10}, {"op": "run", "steps": 20}, {"op": "state"},
@@ -131,6 +148,26 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(states[1]["pc"], states[0]["pc"])
         self.assertEqual(states[1]["registers"], states[0]["registers"])
         self.assertIn("brk", states[2]["halt"])
+
+    def test_bc5_modifier_chain_probe_returns_and_reset_still_executes(self):
+        firmware = bytearray(0x310FBA)
+        firmware[0:2] = (0x0004).to_bytes(2, "little")
+        # Repeated 'u' modifiers; lsr #1; rts.
+        code = b"\x09\x00" * 299 + b"\xa4\x01\xe2\x00"
+        firmware[0x100:0x100 + len(code)] = code
+        states = exchange("bc5", firmware, [
+            {"op": "call", "entry": 0x100, "al": 0x8000, "steps": 10},
+            {"op": "call", "entry": 0x100, "al": 8, "steps": 10},
+            {"op": "reset"}, {"op": "run", "steps": 1},
+        ])
+        for state, result in zip(states[1:3], (0x4000, 4)):
+            self.assertTrue(state["last_call"]["returned"])
+            self.assertEqual(state["last_call"]["al"], result)
+            self.assertEqual(state["last_call"]["steps"], 2)
+            self.assertEqual(state["registers"], states[0]["registers"])
+            self.assertIsNone(state["halt"])
+        self.assertEqual(states[3]["steps"], 0)
+        self.assertIn("brk", states[4]["halt"])
 
     def test_bc5_warm_reset_retains_ram_while_fresh_reset_clears_it(self):
         firmware = bytearray(0x310FBA)
