@@ -26,8 +26,11 @@ class Engine:
             self._process = subprocess.Popen(
                 [str(executable), "--image", image, "--firmware", str(firmware)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
+            os.set_blocking(self._process.stdin.fileno(), False)
             self._selector.register(self._process.stdout, selectors.EVENT_READ)
-            self.state = self._receive()
+            self.state = self._receive(time.monotonic() + self._timeout)
+            if self.state.get("error"):
+                raise EngineError(str(self.state["error"]))
         except BaseException:
             self.close()
             raise
@@ -35,48 +38,71 @@ class Engine:
     def request(self, op: str, **arguments) -> dict:
         with self._lock:
             if self._process is None or self._process.poll() is not None:
+                self.close()
                 raise EngineError("CPU worker is no longer running")
             data = json.dumps({"op": op, **arguments}, separators=(",", ":")).encode() + b"\n"
             if len(data) > 65536:
                 raise EngineError("CPU request exceeds 64 KiB")
+            deadline = time.monotonic() + self._timeout
             try:
-                self._process.stdin.write(data)
-                self._process.stdin.flush()
-                response = self._receive()
-            except (BrokenPipeError, OSError) as error:
+                self._send(data, deadline)
+                response = self._receive(deadline)
+            except OSError as error:
+                self.close()
                 raise EngineError(f"CPU worker disconnected: {error}") from error
+            except EngineError:
+                # No request IDs: a broken exchange makes all later replies ambiguous.
+                self.close()
+                raise
             if response.get("error"):
+                if response.get("fatal"):
+                    self.close()
                 raise EngineError(str(response["error"]))
             if "registers" in response:
                 self.state = response
             return response
 
-    def _receive(self) -> dict:
-        deadline = time.monotonic() + self._timeout
-        while b"\n" not in self._buffer:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not self._selector.select(remaining):
-                self._process.kill()
-                self._process.wait()
-                raise EngineError("CPU worker timed out and was stopped")
+    def _wait(self, selector, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not selector.select(remaining):
+            self._process.kill()
+            self._process.wait()
+            raise EngineError("CPU worker timed out and was stopped")
+
+    def _send(self, data: bytes, deadline: float) -> None:
+        pending = memoryview(data)
+        with selectors.DefaultSelector() as selector:
+            selector.register(self._process.stdin, selectors.EVENT_WRITE)
+            while pending:
+                self._wait(selector, deadline)
+                try:
+                    written = os.write(self._process.stdin.fileno(), pending)
+                except BlockingIOError:
+                    continue
+                pending = pending[written:]
+
+    def _receive(self, deadline: float) -> dict:
+        while True:
+            end = self._buffer.find(b"\n")
+            if (end if end >= 0 else len(self._buffer)) > 4 * 1024 * 1024:
+                raise EngineError("CPU response exceeds 4 MiB")
+            if end >= 0:
+                break
+            self._wait(self._selector, deadline)
             block = os.read(self._process.stdout.fileno(), 65536)
             if not block:
                 self._stderr.seek(0)
                 detail = self._stderr.read(4096).decode(errors="replace").strip()
                 raise EngineError(f"CPU worker stopped unexpectedly: {detail}")
             self._buffer.extend(block)
-            if len(self._buffer) > 4 * 1024 * 1024:
-                raise EngineError("CPU response exceeds 4 MiB")
         line, _, rest = self._buffer.partition(b"\n")
         self._buffer = bytearray(rest)
         try:
             response = json.loads(line)
-        except (ValueError, UnicodeDecodeError) as error:
+        except (ValueError, RecursionError) as error:
             raise EngineError("CPU worker returned malformed JSON") from error
         if not isinstance(response, dict):
             raise EngineError("CPU worker response is not an object")
-        if response.get("error"):
-            raise EngineError(str(response["error"]))
         return response
 
     def close(self) -> None:
@@ -95,6 +121,7 @@ class Engine:
             self._process = None
         self._selector.close()
         self._stderr.close()
+        self._buffer.clear()
 
     def __enter__(self):
         return self
