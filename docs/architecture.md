@@ -75,6 +75,11 @@ persistent-store records before clearing RAM. This is an explicit host operation
 watchdog timing is not modeled. The ordinary `reset` also clears RAM and restores
 flash from the supplied firmware, returning the worker to a fresh experiment.
 
+The Python transport applies one 30-second deadline to sending a request and
+receiving its reply. Timeouts, disconnects, malformed replies and oversized replies
+close the worker so a later command cannot consume an earlier command's response.
+Explicit native request errors with `fatal: false` leave the worker available.
+
 The worker reports `halt: "firmware-reset-requested"` when the original reset
 routine reaches byte `0x184F0` with its watchdog armed (`0x76 == 1` and bit 0 of
 `0xFF91` set). This records an original firmware reset request at a known boundary;

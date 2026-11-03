@@ -24,8 +24,8 @@ the native executor using Zig's cache, listens on all IPv4 interfaces
 From another device, open `http://<this-computer-IP>:9555`. Devices that can reach
 the port share control of the same emulator session. Each browser owns its held
 keys; a key held in several browsers is released after its final owner releases it.
-Use `--host 127.0.0.1` for
-local-only access. Press Ctrl+C to stop the server and CPU workers. Use
+Use `--host 127.0.0.1` for local-only access. Press Ctrl+C to stop the server and
+CPU workers. Use
 `--no-browser` to print the URL without opening it, or `--port 0` to choose a free port.
 
 `--initialize-ui` runs original application-initialization routines at scheduler
@@ -110,6 +110,9 @@ navigation and the original missing-SIM error. Deliberate opcode changes must
 change execution, including an altered application initializer that must fail
 visibly. Original-image tests are explicitly skipped when the environment
 variable is unset.
+
+GitHub Actions runs the firmware-free suite on pushes and pull requests with
+Python 3.10, Node 22, and checksum-verified Zig 0.17.0.
 
 Tests establish only their asserted behavior. They do not establish hardware
 equivalence, complete menus, satellite acquisition, call audio, or complete modem
