@@ -102,7 +102,7 @@ function drawDisplay(state) {
   const preview = element("asset-toggle").checked;
   const image = preview ? state?.asset : state?.lcd;
   const dropped = !preview && state?.processors?.some((processor) => processor.image === "bc5" && processor.lcd_dropped > 0);
-  const signature = JSON.stringify([preview, state?.firmware?.sha256, state?.ui_initialized, image, dropped]);
+  const signature = JSON.stringify([preview, state?.handset?.model, state?.firmware?.sha256, state?.ui_initialized, image, dropped]);
   if (signature === lastDisplaySignature) return;
   lastDisplaySignature = signature;
   const canvas = element("lcd");
@@ -169,7 +169,7 @@ function drawDisplay(state) {
   element("display-orientation").hidden = preview;
   if (!preview) {
     element("display-orientation").textContent = image.segment_zero_on_right
-      ? "9555 panel mapping · SEG127 left, COM0 top"
+      ? `${state?.handset?.model === "9575" ? "9575" : "9555"} panel mapping · SEG127 left, COM0 top`
       : `Controller mapping · ${displayText(image.coordinates || "unspecified")}`;
   }
   describe(preview ? "Firmware asset preview — not live LCD" : "Live original firmware LCD · experimental software initialization");
@@ -237,10 +237,42 @@ function renderEvents(events) {
   }));
 }
 
+function renderHandset(handset) {
+  const extreme = handset?.model === "9575";
+  const model = extreme ? "9575" : "9555";
+  const name = extreme ? "Iridium 9575 Extreme" : "Iridium 9555";
+  document.title = `${model}${extreme ? " Extreme" : ""} · Firmware lab`;
+  element("brand").setAttribute("aria-label", `${name} firmware lab home`);
+  element("brand-model").textContent = model;
+  element("research-heading").textContent = `${name.toUpperCase()} · RESEARCH BENCH`;
+  element("phone-model").textContent = extreme ? "EXTREME" : model;
+  element("phone-bottom-model").textContent = model;
+  element("footer-model").textContent = name.toUpperCase();
+  element("handset").classList.toggle("extreme", extreme);
+  element("extreme-key-help").hidden = !extreme;
+  element("firmware-profile").textContent = `${name}${handset?.firmware_version ? ` · ${handset.firmware_version}` : ""}. Handset model is identified from the firmware image.`;
+  element("firmware-input").setAttribute("aria-label", `Load original ${name} firmware image`);
+  element("fidelity-description").textContent = `This is a partial ${name} hardware model. Application initialization and software key injection are explicit experimental scenarios.`;
+  keyButtons.get("convenience").setAttribute("aria-label", extreme ? "Location convenience key" : "Side convenience key");
+  keyButtons.get("convenience").title = extreme ? "Location convenience key (G)" : "Side convenience key (G)";
+  const keys = new Set(handset?.keys || [...keyButtons.keys()].filter((key) => extreme || key !== "sos"));
+  for (const [key, button] of keyButtons) {
+    const available = keys.has(key) && (key !== "sos" || extreme);
+    button.hidden = !available;
+    button.disabled = !available;
+    if (!available) {
+      for (const [source, held] of heldSources) {
+        if (held === key) releaseKey(source);
+      }
+    }
+  }
+}
+
 function renderState(state) {
   if (keyEpoch !== null && state.key_epoch < keyEpoch) return;
   updateKeyEpoch(state.key_epoch);
   latestState = state;
+  renderHandset(state.handset);
   const firmware = state.firmware;
   element("firmware-name").textContent = firmware?.name || "No firmware loaded";
   element("firmware-format").textContent = firmware?.format || "Load a supported original firmware image";
@@ -286,7 +318,7 @@ async function refreshState(afterMutation = false) {
 async function poll() {
   if (closed) return;
   await refreshState();
-  if (!closed) pollTimer = setTimeout(poll, latestState?.running ? 500 : 1250);
+  if (!closed) pollTimer = setTimeout(poll, latestState?.running ? 50 : 1250);
 }
 
 function resultMessage(result, fallback) {
@@ -333,7 +365,8 @@ function queueKey(key, pressed) {
 }
 
 function pressKey(key, source) {
-  if (closed || keyEpoch === null || !keyButtons.has(key) || heldSources.has(source)) return;
+  const button = keyButtons.get(key);
+  if (closed || keyEpoch === null || !button || button.disabled || button.hidden || heldSources.has(source)) return;
   const wasHeld = [...heldSources.values()].includes(key);
   heldSources.set(source, key);
   keyButtons.get(key).classList.add("held");
@@ -390,7 +423,7 @@ for (const [key, button] of keyButtons) {
   });
 }
 
-const physicalKeys = { ArrowUp: "up", ArrowDown: "down", Escape: "red", c: "green", p: "power", F1: "soft_left", F2: "soft_right", PageUp: "volume_up", PageDown: "volume_down" };
+const physicalKeys = { ArrowUp: "up", ArrowDown: "down", Escape: "red", c: "green", p: "power", g: "convenience", s: "sos", F1: "soft_left", F2: "soft_right", PageUp: "volume_up", PageDown: "volume_down" };
 window.addEventListener("keydown", (event) => {
   if (event.target.closest("input, textarea, select, [contenteditable='true']") || event.ctrlKey || event.altKey || event.metaKey) return;
   let key;

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
-    <meta name="description" content="Local Iridium 9555 original-firmware execution and hardware research bench.">
+    <meta name="description" content="Local Iridium 9555 and 9575 Extreme original-firmware execution and hardware research bench.">
     <title>9555 · Firmware lab</title>
     <link rel="stylesheet" href="/style.css">
     <script src="/app.js" defer></script>
@@ -12,16 +12,16 @@
   <body>
     <div class="app-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="9555 firmware lab home">
+        <a id="brand" class="brand" href="/" aria-label="9555 firmware lab home">
           <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-          <span>9555<span class="brand-divider">/</span><span class="brand-subtitle">FIRMWARE LAB</span></span>
+          <span><span id="brand-model">9555</span><span class="brand-divider">/</span><span class="brand-subtitle">FIRMWARE LAB</span></span>
         </a>
         <div class="connection"><span id="connection-dot" class="status-dot"></span><span id="connection-status">Connecting to local engine</span></div>
       </header>
 
       <main>
         <div class="page-heading">
-          <div><p class="eyebrow">IRIDIUM 9555 · RESEARCH BENCH</p><h1>Inside the handset.</h1><p class="intro">Original firmware, observable execution, and a hardware model you can inspect.</p></div>
+          <div><p id="research-heading" class="eyebrow">IRIDIUM 9555 · RESEARCH BENCH</p><h1>Inside the handset.</h1><p class="intro">Original firmware, observable execution, and a hardware model you can inspect.</p></div>
           <span class="fidelity-tag"><span aria-hidden="true">◒</span> Partial hardware model</span>
         </div>
 
@@ -30,12 +30,13 @@
             <div class="panel-heading"><h2 id="handset-heading">Handset</h2><span class="micro-label">XAP2 / BC5</span></div>
             <div class="handset-stage">
               <div class="stage-grid" aria-hidden="true"></div>
-              <div class="handset">
+              <div id="handset" class="handset">
                 <div class="antenna" aria-hidden="true"><span></span></div>
                 <button class="phone-key power-key" data-key="power" aria-label="Power" title="Power (P)">⏻</button>
+                <button class="phone-key sos-key" data-key="sos" aria-label="SOS key" title="SOS (S) · emulator input only" hidden disabled>SOS</button>
                 <div class="phone-body">
                   <div class="speaker" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-                  <div class="phone-brand">iridium<span class="orbit" aria-hidden="true"></span><span class="phone-model">9555</span></div>
+                  <div class="phone-brand">iridium<span class="orbit" aria-hidden="true"></span><span id="phone-model" class="phone-model">9555</span></div>
                   <div class="screen-bezel"><div class="lcd-wrap"><canvas id="lcd" width="128" height="128" role="img" aria-label="Awaiting original firmware LCD output"></canvas><div id="lcd-placeholder" class="lcd-placeholder"><span class="lcd-cross" aria-hidden="true">+</span><span id="lcd-placeholder-text">AWAITING<br>FIRMWARE DISPLAY</span></div></div></div>
                   <div class="soft-keys"><button class="phone-key soft-key" data-key="soft_left" aria-label="Left soft key" title="Left soft key (F1)"><span></span></button><button class="phone-key soft-key" data-key="soft_right" aria-label="Right soft key" title="Right soft key (F2)"><span></span></button></div>
                   <div class="navigation">
@@ -61,14 +62,14 @@
                     <button class="phone-key number-key" data-key="0" aria-label="0 plus"><b>0</b><span>+</span></button>
                     <button class="phone-key number-key" data-key="#" aria-label="Hash"><b>#</b><span>SPACE</span></button>
                   </div>
-                  <div class="phone-bottom" aria-hidden="true"><i></i><span>9555</span><i></i></div>
+                  <div class="phone-bottom" aria-hidden="true"><i></i><span id="phone-bottom-model">9555</span><i></i></div>
                 </div>
-                <div class="volume-keys"><button class="phone-key" data-key="volume_up" aria-label="Volume up" title="Volume up (Page Up)">+</button><button class="phone-key" data-key="volume_down" aria-label="Volume down" title="Volume down (Page Down)">−</button><button class="phone-key convenience-key" data-key="convenience" aria-label="Side convenience key" title="Side convenience key — hardware wiring unresolved">◆</button></div>
+                <div class="volume-keys"><button class="phone-key" data-key="volume_up" aria-label="Volume up" title="Volume up (Page Up)">+</button><button class="phone-key" data-key="volume_down" aria-label="Volume down" title="Volume down (Page Down)">−</button></div><button class="phone-key convenience-key" data-key="convenience" aria-label="Side convenience key" title="Side convenience key (G)">◆</button>
               </div>
             </div>
             <div class="display-controls"><label class="checkbox-label"><input id="asset-toggle" type="checkbox"> View embedded firmware asset</label><p id="display-mode" class="display-mode">Live LCD unavailable · initialize application to capture firmware output</p><p id="display-orientation" class="display-orientation" hidden>9555 panel mapping · SEG127 left, COM0 top</p></div>
             <div class="key-status"><span class="micro-label">INPUT</span><div><p id="key-mode">Bench input only · application is not initialized</p><p id="key-feedback" role="status">Press a handset key to inspect delivery.</p></div></div>
-            <details class="keyboard-help"><summary>Keyboard controls<span aria-hidden="true">↗</span></summary><p>Digits, <kbd>*</kbd>, <kbd>#</kbd>, and <kbd>↑</kbd>/<kbd>↓</kbd> match the handset. <kbd>Esc</kbd> ends, <kbd>C</kbd> calls, <kbd>P</kbd> powers, <kbd>F1</kbd>/<kbd>F2</kbd> are soft keys, and <kbd>PgUp</kbd>/<kbd>PgDn</kbd> adjust volume. After experimental application initialization, supported keys call the original firmware handler. Electrical keypad wiring and the convenience-key mapping remain unresolved.</p></details>
+            <details class="keyboard-help"><summary>Keyboard controls<span aria-hidden="true">↗</span></summary><p>Digits, <kbd>*</kbd>, <kbd>#</kbd>, and <kbd>↑</kbd>/<kbd>↓</kbd> match the handset. <kbd>Esc</kbd> ends, <kbd>C</kbd> calls, <kbd>P</kbd> powers, <kbd>F1</kbd>/<kbd>F2</kbd> are soft keys, <kbd>PgUp</kbd>/<kbd>PgDn</kbd> adjust volume, and <kbd>G</kbd> presses the convenience key. <span id="extreme-key-help" hidden><kbd>S</kbd> presses the 9575 SOS key. No emergency message or call leaves this emulator. </span>After experimental application initialization, mapped keys call the original firmware handler; the input status reports whether each event was delivered. Electrical keypad wiring remains unresolved.</p></details>
           </section>
 
           <div class="instrument-panels">
@@ -76,6 +77,7 @@
               <div class="panel-heading"><h2 id="firmware-heading"><span class="section-number">01</span> Firmware source</h2><span class="micro-label">ORIGINAL BINARY</span></div>
               <div class="firmware-file"><span class="file-icon" aria-hidden="true">BIN</span><div class="file-details"><strong id="firmware-name">No firmware loaded</strong><span id="firmware-format">Load a supported original firmware image</span></div><label class="button button-small file-button">Load image<input id="firmware-input" type="file" accept=".bin,.dfu,application/octet-stream" aria-label="Load original firmware image"></label></div>
               <ul id="firmware-images" class="firmware-images" aria-label="Loaded firmware images"></ul>
+              <p id="firmware-profile" class="small-note">Handset model is identified from the firmware image.</p>
               <p class="small-note">Changes are executed from the supplied bytes. Source files remain unchanged.</p>
             </section>
 
@@ -105,14 +107,14 @@
               <div class="scenario-inject"><div class="call-state"><span class="micro-label">CALL STATE</span><span id="call-state">Idle</span></div><label class="field-label" for="remote-number">Remote number</label><input id="remote-number" class="text-input" type="tel" value="+881600000001" maxlength="32" autocomplete="off"><div class="scenario-buttons"><button class="button button-small" data-satellite="incoming_call">Incoming call</button><button class="button button-small button-quiet" data-satellite="answer">Answer</button><button class="button button-small button-quiet" data-satellite="hangup">Hang up</button></div><label class="field-label" for="sms-text">Incoming SMS</label><div class="sms-compose"><input id="sms-text" class="text-input" type="text" value="Test message from the satellite model." maxlength="160" autocomplete="off"><button class="button button-small" data-satellite="incoming_sms">Inject</button></div></div>
             </section>
 
-            <section class="panel fidelity-panel" aria-labelledby="fidelity-heading"><div class="panel-heading"><h2 id="fidelity-heading"><span class="section-number">04</span> Model boundaries</h2><span class="micro-label">EXPLICIT LIMITS</span></div><p>This is a firmware execution bench, not a complete 9555 hardware emulator. Application initialization and software key injection are explicit experimental scenarios.</p><ul id="limitations"><li>Normal handset startup and electrical keypad delivery remain incomplete.</li><li>Live display output comes from captured original firmware LCD traffic.</li><li>The satellite model is independent of the original modem firmware.</li><li>Hardware timing, DSP behavior, and radio protocols are not validated.</li></ul></section>
+            <section class="panel fidelity-panel" aria-labelledby="fidelity-heading"><div class="panel-heading"><h2 id="fidelity-heading"><span class="section-number">04</span> Model boundaries</h2><span class="micro-label">EXPLICIT LIMITS</span></div><p id="fidelity-description">This is a partial handset hardware model. Application initialization and software key injection are explicit experimental scenarios.</p><ul id="limitations"><li>Normal handset startup and electrical keypad delivery remain incomplete.</li><li>Live display output comes from captured original firmware LCD traffic.</li><li>The satellite model is independent of the original modem firmware.</li><li>Hardware timing, DSP behavior, and radio protocols are not validated.</li></ul></section>
           </div>
         </div>
 
         <section class="panel event-panel" aria-labelledby="events-heading"><div class="panel-heading"><h2 id="events-heading">Event log</h2><span id="event-count" class="micro-label">0 EVENTS</span></div><div class="event-table-wrap"><table class="event-table"><thead><tr><th scope="col">Time</th><th scope="col">Source</th><th scope="col">Event</th></tr></thead><tbody id="events"><tr><td colspan="3" class="empty-state">Waiting for engine events.</td></tr></tbody></table></div></section>
         <div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div>
       </main>
-      <footer><span><span class="status-dot" aria-hidden="true"></span> LOCAL EXECUTION</span><span>IRIDIUM 9555 <span class="footer-divider">/</span> FIRMWARE RESEARCH</span><span>No live satellite transmission</span></footer>
+      <footer><span><span class="status-dot" aria-hidden="true"></span> LOCAL EXECUTION</span><span><span id="footer-model">IRIDIUM 9555</span> <span class="footer-divider">/</span> FIRMWARE RESEARCH</span><span>No live satellite transmission</span></footer>
     </div>
     <noscript><p class="noscript">JavaScript is required for the handset controls. The engine can also be run from the command line.</p></noscript>
   </body>

@@ -35,5 +35,6 @@ jobs:
       - name: Run firmware-free tests
         env:
           IRIDIUM_TEST_FIRMWARE: ''
+          IRIDIUM_TEST_9575_FIRMWARE: ''
           PYTHONWARNINGS: error::ResourceWarning
         run: ./test

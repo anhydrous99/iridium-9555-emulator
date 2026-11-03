@@ -112,7 +112,7 @@ def main():
             for item in images:
                 path = Path(temporary) / f"{item.image}.bin"
                 path.write_bytes(item.data)
-                with Engine(args.engine.resolve(), item.image, path) as worker:
+                with Engine(args.engine.resolve(), item.image, path, model=item.model) as worker:
                     def boot():
                         worker.request("reset")
                         state = worker.request("run", steps=7_000_000)

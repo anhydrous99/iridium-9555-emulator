@@ -10,9 +10,9 @@ from iridium.session import Session
 
 
 class FakeEngine:
-    def __init__(self, executable, image, firmware):
+    def __init__(self, executable, image, firmware, *, model="9555"):
         self.data = firmware.read_bytes()
-        self.state = {"image": image, "pc": 0, "steps": 0, "halt": "ready", "registers": []}
+        self.state = {"image": image, "handset": model, "pc": 0, "steps": 0, "halt": "ready", "registers": []}
         self.closed = False
         self.calls = []
 
@@ -55,6 +55,77 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(old.closed)
         self.assertEqual(self.session.engines["avr"].data, patch.data)
         self.assertEqual(self.session.state()["firmware"]["sha256"], patch.sha256)
+
+    def test_model_switch_retires_old_processors_and_keys(self):
+        self.session.key("1", True)
+        old = self.session.engines["avr"]
+        with self.assertRaisesRegex(ValueError, "BC5"):
+            self.session.load(parse_firmware(bytes(14296), "avr.bin"))
+        self.assertFalse(old.closed)
+        self.session.load(parse_firmware(bytes(0x36BB22), "bc5_main.bin"))
+        state = self.session.state()
+        self.assertTrue(old.closed)
+        self.assertEqual(set(self.session.engines), {"bc5"})
+        self.assertEqual(state["handset"]["model"], "9575")
+        self.assertEqual(state["keys"], [])
+        self.assertIn("sos", state["handset"]["keys"])
+        self.assertFalse(self.session.key("sos", True)["delivered"])
+        self.assertFalse(self.session.key("convenience", True)["delivered"])
+        self.session.load(parse_firmware(bytes(14296), "avr.bin"))
+        self.assertEqual(self.session.engines["avr"].state["handset"], "9575")
+        with self.assertRaises(ValueError):
+            self.session.load(self.firmware)
+
+    def test_failed_model_switch_preserves_previous_experiment(self):
+        old = self.session.engines["avr"]
+        self.session._engine_factory = Mock(side_effect=EngineError("unsupported image"))
+        with self.assertRaises(EngineError):
+            self.session.load(parse_firmware(bytes(0x36BB22), "bc5_main.bin"))
+        self.assertEqual(self.session.model, "9555")
+        self.assertIs(self.session.engines["avr"], old)
+        self.assertFalse(old.closed)
+        with self.assertRaises(ValueError):
+            self.session.key("sos", True)
+
+    def test_key_waiting_behind_model_switch_is_validated_against_new_handset(self):
+        self.session.load(parse_firmware(bytes(0x36BB22), "bc5_main.bin"))
+        original_lock = self.session._lock
+        owner = threading.current_thread()
+        waiting = threading.Event()
+        errors = []
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread() is not owner:
+                    waiting.set()
+                return original_lock.__enter__()
+
+            def __exit__(self, *args):
+                return original_lock.__exit__(*args)
+
+        self.session._lock = ObservedLock()
+
+        def press_sos():
+            try:
+                self.session.key("sos", True)
+            except ValueError as error:
+                errors.append(error)
+
+        with original_lock:
+            thread = threading.Thread(target=press_sos)
+            thread.start()
+            self.assertTrue(waiting.wait(2))
+            self.session.load(parse_firmware(bytes(0x310FBA), "bc5_main.bin"))
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertNotIn("sos", self.session.keys)
+
+    def test_mixed_handset_constructor_is_rejected_before_starting_workers(self):
+        factory = Mock()
+        with self.assertRaises(ValueError):
+            Session(Path("unused"), [self.firmware, parse_firmware(bytes(14296), "avr.bin")], factory)
+        factory.assert_not_called()
 
     def test_step_and_reset_preserve_truthful_fidelity(self):
         epoch = self.session.key_epoch

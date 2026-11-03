@@ -10,6 +10,8 @@ from types import MappingProxyType
 from typing import Mapping
 import zlib
 
+from .profiles import PROFILES, HandsetProfile
+
 
 class AssetError(ValueError):
     """The firmware does not contain a valid supported asset."""
@@ -58,13 +60,16 @@ class BC5Assets:
     MAX_IMAGE_BYTES = 8 * 1024 * 1024
     MAX_FRAME_PIXELS = 16 * 1024 * 1024
 
-    def __init__(self, image: bytes):
+    def __init__(self, image: bytes, profile: HandsetProfile = PROFILES["9555"]):
         if len(image) > self.MAX_IMAGE_BYTES or len(image) % 2:
             raise AssetError("BC5 payload must be an even number of bytes, at most 8 MiB")
         self._image = bytes(image)
+        self.WINDOW_OFFSET = profile.code_bytes
+        self.DIRECTORY_POINTER = profile.directory_pointer
+        self.DIRECTORY_SLOTS = profile.directory_slots
         pointer = self.WINDOW_OFFSET + 2 * self.DIRECTORY_POINTER
         if pointer + 4 > len(image):
-            raise AssetError("BC5 payload is too short for the HT25003 filesystem pointer")
+            raise AssetError(f"BC5 payload is too short for the {profile.version} filesystem pointer")
         high, low = struct.unpack_from("<HH", image, pointer)
         directory = (((high << 16) | low) - self.ADDRESS_BIAS) * 2
         directory_end = directory + self.DIRECTORY_SLOTS * 10

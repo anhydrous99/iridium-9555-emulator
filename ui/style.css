@@ -77,7 +77,16 @@ h2 { font-weight: 550; font-size: 13px; letter-spacing: -.1px; }
 .phone-bottom i { width: 4px; height: 4px; border: 1px solid #616d53; background: #151c10; border-radius: 50%; }
 .volume-keys { position: absolute; left: -8px; top: 147px; display: flex; flex-direction: column; width: 9px; gap: 3px; }
 .volume-keys button { height: 41px; font-size: 10px; color: #aebd9c; border-radius: 3px 0 0 3px; background: #343c2c; }
-.volume-keys .convenience-key { margin-top: 22px; height: 35px; font-size: 7px; }
+.convenience-key { position: absolute; left: -8px; top: 255px; width: 9px; height: 35px; font-size: 7px; border-radius: 3px 0 0 3px; background: #343c2c; }
+.phone-key[hidden], #extreme-key-help[hidden] { display: none; }
+.sos-key { position: absolute; left: 104px; top: -11px; z-index: 1; width: 42px; height: 22px; border: 2px solid #2b2926; border-radius: 6px 6px 2px 2px; background: #b74732; color: #fff0e7; font: bold 9px var(--mono); }
+.extreme .phone-body { border: 3px solid #262825; border-radius: 23px 23px 28px 28px; padding: 14px 15px 8px; background: linear-gradient(90deg, #171b19, #363b37 9%, #232825 15%, #303530 85%, #151916); box-shadow: inset 0 3px 1px #757d72, inset 0 -4px 2px #101310, 0 0 0 5px #111512; }
+.extreme .phone-body::before, .extreme .phone-body::after { content: ""; position: absolute; top: 110px; bottom: 60px; width: 8px; background: repeating-linear-gradient(#101611 0 14px, #3a4238 15px 17px, #1b211c 18px 32px); border-radius: 3px; }
+.extreme .phone-body::before { left: -6px; }
+.extreme .phone-body::after { right: -6px; }
+.extreme .antenna { border-radius: 9px 9px 2px 2px; background: linear-gradient(90deg, #171e19, #3c443c 45%, #202922); }
+.extreme .convenience-key { left: auto; right: -11px; top: 170px; width: 12px; height: 47px; border-radius: 0 3px 3px 0; background: #383f37; }
+.extreme .phone-model { font-size: 9px; letter-spacing: .6px; color: #d4dbce; }
 .display-controls { padding: 18px 22px 16px; border-top: 1px solid var(--line-soft); }
 .checkbox-label { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #d0d7c9; cursor: pointer; }
 input[type="checkbox"] { width: 13px; height: 13px; margin: 0; accent-color: var(--accent); cursor: pointer; }

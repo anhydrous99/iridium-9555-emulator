@@ -10,6 +10,8 @@ const mmu = @import("mmu.zig");
 const m = trx.machine;
 const Value = std.json.Value;
 const Image = enum { bc5, avr, trx, ptt };
+const Handset = enum { @"9555", @"9575" };
+var handset: Handset = .@"9555";
 const max_steps = 10_000_000;
 const max_probe_steps = 100_000_000;
 const max_memory = 4096;
@@ -35,6 +37,13 @@ const avr_map = [_]common.bus.Range{
     .{ .lo = 0x5D, .hi = 0x5F, .kind = .cpu_alias },
     .{ .lo = 0x60, .hi = 0xFF, .kind = .mmio },
     .{ .lo = 0x100, .hi = 0x4FF, .kind = .ram },
+};
+const avr_extreme_map = [_]common.bus.Range{
+    .{ .lo = 0, .hi = 0x1F, .kind = .cpu_alias },
+    .{ .lo = 0x20, .hi = 0x5C, .kind = .mmio },
+    .{ .lo = 0x5D, .hi = 0x5F, .kind = .cpu_alias },
+    .{ .lo = 0x60, .hi = 0x1FF, .kind = .mmio },
+    .{ .lo = 0x200, .hi = 0x21FF, .kind = .ram },
 };
 var trx_model: trx.devices.Model = undefined;
 var trx_flash: trx.devices.Flash = undefined;
@@ -89,6 +98,8 @@ fn serve(init: std.process.Init, out: *std.Io.Writer) !u8 {
             name = args[i + 1];
         } else if (std.mem.eql(u8, args[i], "--firmware")) {
             path = args[i + 1];
+        } else if (std.mem.eql(u8, args[i], "--model")) {
+            handset = std.meta.stringToEnum(Handset, args[i + 1]) orelse return error.UnknownHandset;
         } else return error.UnknownArgument;
     }
     current_image = std.meta.stringToEnum(Image, name orelse return error.ExpectedImageAndFirmware) orelse return error.UnknownImage;
@@ -115,23 +126,34 @@ fn serve(init: std.process.Init, out: *std.Io.Writer) !u8 {
 fn initialize(init: std.process.Init, path: []const u8) !void {
     switch (current_image) {
         .bc5 => {
-            // This board profile deliberately requires the evidenced HT25003 memory layout.
-            if (firmware.len != 0x310FBA and firmware.len != 0x310FBE) return error.BadBc5ImageSize;
+            const size: usize = if (handset == .@"9575") 0x36BB22 else 0x310FBA;
+            if (firmware.len != size and firmware.len != size + 4) return error.BadBc5ImageSize;
             var profile = bc5.main_image;
             profile.file = path;
-            profile.window_end = 0x3C7E; // The final two raw-image words are a container CRC, not firmware.
+            // The optional final two raw-image words are a container CRC, not firmware.
+            profile.window_end = if (handset == .@"9575") 0x3E6C else 0x3C7E;
+            if (handset == .@"9575") {
+                profile.window_base = 0x363E4A / 2;
+                profile.code_words = 0xFEF96 / 2;
+            }
             try Bc.init(init.gpa, init.io, std.Io.Dir.cwd(), profile);
             attachBc5Devices();
         },
         .avr => {
-            try avr_soc.loader.load(&avr_prog, firmware);
-            avr_bus = try avr.cpu.Bus.init(init.gpa, &avr_map, &avr_backing);
+            const size: usize = if (handset == .@"9575") 14296 else avr_soc.loader.image_len;
+            if (firmware.len != size) return error.BadAvrImageSize;
+            @memset(&avr_prog, 0xFF);
+            @memcpy(avr_prog[0..firmware.len], firmware);
+            avr_backing[0].mem = avr_data[0..if (handset == .@"9575") @as(usize, 0x2200) else 0x500];
+            avr_bus = try avr.cpu.Bus.init(init.gpa, if (handset == .@"9575") &avr_extreme_map else &avr_map, &avr_backing);
             avr_cpu = .{ .data = &avr_data, .prog = &avr_prog, .bus = &avr_bus };
-            avr_dev = .{ .bus = &avr_bus, .open_bus = true };
+            avr_cpu.program_mask = if (handset == .@"9575") 0xFFFF else avr.cpu.pc_mask;
+            avr_dev = .{ .bus = &avr_bus, .open_bus = true, .mega = handset == .@"9575" };
             avr_dev.reset();
             avr_bus.dev = avr_dev.device();
             avr_cpu.sys = avr_dev.sys();
             avr_soc.loader.coldReset(&avr_cpu);
+            if (handset == .@"9575") avr_cpu.st.sp = 0x21FF;
         },
         .trx, .ptt => {
             const expected: usize = if (current_image == .trx) 0x260760 else 0xA7BF8;
@@ -212,9 +234,10 @@ fn reset(init: std.process.Init) !void {
         .avr => {
             @memset(&avr_data, 0);
             avr_bus.resetRun(std.math.maxInt(u64));
-            avr_dev = .{ .bus = &avr_bus, .open_bus = true };
+            avr_dev = .{ .bus = &avr_bus, .open_bus = true, .mega = handset == .@"9575" };
             avr_dev.reset();
             avr_soc.loader.coldReset(&avr_cpu);
+            if (handset == .@"9575") avr_cpu.st.sp = 0x21FF;
         },
         .trx, .ptt => {
             trx_model.deinit();
@@ -239,6 +262,10 @@ fn json(out: *std.Io.Writer, value: anytype) !void {
 
 fn state(out: *std.Io.Writer) !void {
     var registers: [32]u32 = @splat(0);
+    var uart_dropped: [4]u64 = @splat(0);
+    if (current_image == .avr) for (&uart_dropped, avr_dev.st.usart) |*lost, uart| {
+        lost.* = uart.out_dropped;
+    };
     var lcd_numbers: [lcd_buffer.len]u16 = undefined;
     for (lcd_buffer[0..lcd_len], 0..) |byte, index| lcd_numbers[index] = byte;
     const pc: u32 = switch (current_image) {
@@ -265,6 +292,7 @@ fn state(out: *std.Io.Writer) !void {
     }
     try json(out, .{
         .image = @tagName(current_image),
+        .handset = @tagName(handset),
         .pc = pc,
         .program_pc = program_pc,
         .steps = total_steps,
@@ -287,14 +315,12 @@ fn state(out: *std.Io.Writer) !void {
         .unclassified_accesses = unclassified,
         .lcd_bytes = lcd_numbers[0..lcd_len],
         .lcd_dropped = lcd_dropped,
-        .uart_tx_dropped = if (current_image == .avr)
-            [2]u64{ avr_dev.st.usart[0].out_dropped, avr_dev.st.usart[1].out_dropped }
-        else
-            null,
+        .uart_tx_dropped = if (current_image == .avr) uart_dropped[0..avr_dev.uartCount()] else null,
         .last_call = last_call,
         .model = "partial-peripherals",
         .mmu_assumption = if (current_image == .bc5) mmu.assumption else null,
         .flash_assumption = if (current_image == .bc5) bc5.flash_mod.assumption else null,
+        .avr_assumption = if (current_image == .avr and handset == .@"9575") "inferred-atmega640-1280-family; unsupported peripherals remain open bus" else null,
         .model_error = model_error,
     });
     lcd_len = 0;
@@ -375,8 +401,8 @@ fn step(comptime image: Image) void {
         },
         .avr => {
             const pc = @as(u32, avr_cpu.st.pc) * 2;
-            if (pc == avr_soc.loader.main_addr) milestones.main = true;
-            if (pc == avr_soc.loader.idle_addr) milestones.idle = true;
+            if (pc == (if (handset == .@"9575") @as(u32, 0x105C) else avr_soc.loader.main_addr)) milestones.main = true;
+            if (pc == (if (handset == .@"9575") @as(u32, 0xB1E) else avr_soc.loader.idle_addr)) milestones.idle = true;
             avr_cpu.step();
             total_steps += 1;
             if (avr_cpu.stop) |h| setHalt(h);
@@ -473,13 +499,18 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
         try call(obj);
     } else if (std.mem.eql(u8, op.string, "pins")) {
         if (current_image != .avr) return error.AvrOnly;
-        avr_dev.setPinsIn(try number(u2, obj, "port", null), try number(u8, obj, "value", null));
+        const port = try number(u4, obj, "port", null);
+        if (port >= avr_dev.portCount()) return error.BadPort;
+        avr_dev.setPinsIn(port, try number(u8, obj, "value", null));
     } else if (std.mem.eql(u8, op.string, "uart_rx")) {
         if (current_image != .avr) return error.AvrOnly;
-        if (!avr_dev.uartPush(try number(u1, obj, "port", null), try number(u8, obj, "value", null))) return error.UartFull;
+        const port = try number(u2, obj, "port", null);
+        if (port >= avr_dev.uartCount()) return error.BadPort;
+        if (!avr_dev.uartPush(port, try number(u8, obj, "value", null))) return error.UartFull;
     } else if (std.mem.eql(u8, op.string, "uart_tx")) {
         if (current_image != .avr) return error.AvrOnly;
-        const port = try number(u1, obj, "port", null);
+        const port = try number(u2, obj, "port", null);
+        if (port >= avr_dev.uartCount()) return error.BadPort;
         return json(out, .{ .value = avr_dev.uartPop(port), .dropped = avr_dev.st.usart[port].out_dropped });
     } else if (std.mem.eql(u8, op.string, "spi")) {
         if (current_image != .avr) return error.AvrOnly;
@@ -493,7 +524,7 @@ fn validRange(address: u32, count: usize) bool {
     const end = address + @as(u32, @intCast(count));
     return switch (current_image) {
         .bc5 => end <= 0x10000,
-        .avr => end <= avr_data.len,
+        .avr => end <= (if (handset == .@"9575") @as(u32, 0x2200) else 0x500),
         .trx, .ptt => m.bytes(address, @intCast(count)) != null,
     };
 }

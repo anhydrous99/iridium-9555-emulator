@@ -15,14 +15,15 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("IRIDIUM_CORE", ROOT / "zig-out/bin/iridium-core"))
 ORIGINALS = os.environ.get("IRIDIUM_TEST_FIRMWARE")
+EXTREME = os.environ.get("IRIDIUM_TEST_9575_FIRMWARE")
 
 
-def exchange(image: str, firmware: bytes, commands: list[dict | str]) -> list[dict]:
+def exchange(image: str, firmware: bytes, commands: list[dict | str], model: str = "9555") -> list[dict]:
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp) / "test.bin"
         path.write_bytes(firmware)
         result = subprocess.run(
-            [str(ENGINE), "--image", image, "--firmware", str(path)],
+            [str(ENGINE), "--image", image, "--firmware", str(path), "--model", model],
             input="".join((command if isinstance(command, str) else json.dumps(command)) + "\n" for command in commands),
             capture_output=True,
             text=True,
@@ -38,6 +39,45 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_extreme_memory_map_and_additional_ports(self):
+        firmware = b"\xff\xcf" + b"\xff" * (14296 - 2)
+        states = exchange("avr", firmware, [
+            {"op": "write", "address": 0x200, "values": [0x56]},
+            {"op": "write", "address": 0x21FF, "values": [0xA5]},
+            {"op": "read", "address": 0x21FF, "count": 1},
+            {"op": "write", "address": 0x130, "values": [1]},
+            {"op": "uart_rx", "port": 3, "value": 65},
+            {"op": "pins", "port": 10, "value": 32},
+            {"op": "pins", "port": 11, "value": 0},
+            {"op": "read", "address": 0x2200, "count": 1},
+            {"op": "reset"}, {"op": "read", "address": 0x21FF, "count": 1},
+        ], model="9575")
+        self.assertEqual(states[0]["sp"], 0x21FF)
+        self.assertEqual(states[0]["handset"], "9575")
+        self.assertEqual(states[0]["uart_tx_dropped"], [0, 0, 0, 0])
+        self.assertEqual(states[3]["values"], [0xA5])
+        self.assertEqual(states[4]["error"], "RamWriteRequired")
+        self.assertNotIn("error", states[5])
+        self.assertNotIn("error", states[6])
+        self.assertEqual(states[7]["error"], "BadPort")
+        self.assertEqual(states[8]["error"], "BadMemoryRange")
+        self.assertEqual(states[10]["values"], [0])
+
+    def test_extreme_bc5_constant_window_and_instruction_extent(self):
+        firmware = bytearray(0x36BB22)
+        firmware[0x363E4A + 0x200:0x363E4A + 0x202] = b"\x34\x12"
+        # A function beyond the 9555's code boundary must execute under the HL profile.
+        firmware[0xFEF90:0xFEF94] = b"\x14\x07\xe2\x00"
+        states = exchange("bc5", firmware, [
+            {"op": "read", "address": 0x100, "count": 1},
+            {"op": "call", "entry": 0xFEF90, "steps": 10},
+            {"op": "call", "entry": 0xFEF96, "steps": 10},
+        ], model="9575")
+        self.assertEqual(states[1]["values"], [0x1234])
+        self.assertTrue(states[2]["last_call"]["returned"])
+        self.assertEqual(states[2]["last_call"]["al"], 7)
+        self.assertEqual(states[3]["error"], "BadEntry")
+
     def test_avr_watchdog_request_stops_execution_until_reset(self):
         # Enable WDE, then keep reading MCUSR without servicing the watchdog.
         words = (0xE008, 0x9300, 0x0060, 0x9110, 0x0054, 0xCFFD)
@@ -336,6 +376,43 @@ class OriginalFirmwareTests(unittest.TestCase):
                 self.assertTrue(state["milestones"]["main"])
                 self.assertTrue(state["milestones"]["scheduler"])
                 self.assertIsNone(state["halt"])
+
+
+@unittest.skipUnless(EXTREME, "Set IRIDIUM_TEST_9575_FIRMWARE for HL25003 integration checks")
+class ExtremeFirmwareTests(unittest.TestCase):
+    def test_original_extreme_factory_defaults_and_key_handler(self):
+        firmware = (Path(EXTREME) / "bc5_main.bin").read_bytes()
+        states = exchange("bc5", firmware, [
+            {"op": "idle"},
+            {"op": "call", "entry": 0x6365E, "steps": 10_000_000},
+            {"op": "call", "entry": 0x93788, "steps": 10_000_000},
+            {"op": "warm_reset"}, {"op": "idle"}, {"op": "idle"},
+            {"op": "call", "entry": 0x93788, "steps": 10_000_000},
+            {"op": "call", "entry": 0x9375A, "steps": 10_000_000},
+            {"op": "idle"}, {"op": "read", "address": 0xF70E, "count": 2},
+        ], model="9575")
+        self.assertTrue(states[1]["at_idle"])
+        self.assertEqual(len(states[2]["lcd_bytes"]), 43)
+        self.assertEqual(states[3]["halt"], "firmware-reset-requested")
+        self.assertEqual(states[3]["last_call"]["pc"], 0x184F0)
+        self.assertTrue(states[6]["at_idle"])
+        self.assertTrue(states[7]["last_call"]["returned"])
+        self.assertTrue(states[8]["last_call"]["returned"])
+        self.assertEqual(states[10]["values"], [4, 0x0A55])
+        for state in states[4:10]:
+            self.assertIsNone(state["halt"])
+            self.assertIsNone(state["model_error"])
+
+    def test_original_extreme_avr_executes_and_mutation_changes_execution(self):
+        firmware = (Path(EXTREME) / "avr.bin").read_bytes()
+        state = exchange("avr", firmware, [{"op": "run", "steps": 100_000}], model="9575")[-1]
+        self.assertTrue(state["milestones"]["main"])
+        self.assertTrue(state["milestones"]["idle"])
+        self.assertIsNone(state["halt"])
+        self.assertGreater(state["sp"], 0x200)
+        altered = exchange("avr", b"\xff\xff" + firmware[2:], [{"op": "run", "steps": 100_000}], model="9575")[-1]
+        self.assertIn("invalid", altered["halt"])
+        self.assertFalse(altered["milestones"]["main"])
 
 
 if __name__ == "__main__":

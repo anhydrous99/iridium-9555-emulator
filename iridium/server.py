@@ -99,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/firmware":
                 filename = Path(unquote(self.headers.get("X-Filename", "upload.bin"))).name
                 firmware = parse_firmware(body, filename, allow_invalid_crc=self.server.allow_invalid_crc)
+                if firmware.image in ("trx", "ptt"):
+                    # These payloads are shared by both upgrade packages.
+                    firmware = parse_firmware(body, filename, model=self.server.session.model,
+                                              allow_invalid_crc=self.server.allow_invalid_crc)
                 self.server.session.load(firmware)
                 response = {"ok": True, "message": f"Loaded {filename}", "firmware": firmware.describe(),
                             "key_epoch": self.server.session.key_epoch}
