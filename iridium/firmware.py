@@ -12,6 +12,8 @@ from pathlib import Path
 import struct
 import zlib
 
+from .profiles import PROFILES, HandsetProfile
+
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 BC5_CODE_BYTES = 0x3096BE
@@ -34,6 +36,11 @@ class Firmware:
     sha256: str
     format: str
     warnings: tuple[str, ...] = ()
+    model: str = "9555"
+
+    @property
+    def profile(self) -> HandsetProfile:
+        return PROFILES[self.model]
 
     @cached_property
     def payload_sha256(self) -> str:
@@ -42,14 +49,16 @@ class Firmware:
     def describe(self) -> dict:
         return {"image": self.image, "name": self.name, "sha256": self.sha256,
                 "payload_sha256": self.payload_sha256, "format": self.format,
-                "size": len(self.data), "warnings": list(self.warnings)}
+                "size": len(self.data), "warnings": list(self.warnings),
+                "model": self.model, "firmware_version": self.profile.version}
 
 
 def _crc(data: bytes) -> int:
     return zlib.crc32(data) ^ 0xFFFFFFFF
 
 
-def _dfu(data: bytes, allow_invalid_crc: bool) -> tuple[bytes, tuple[str, ...]]:
+def _dfu(data: bytes, allow_invalid_crc: bool, model: str | None
+         ) -> tuple[bytes, tuple[str, ...], HandsetProfile]:
     if len(data) < 40:
         raise FirmwareError("Truncated CSR DFU header")
     magic, version, length, header_size = struct.unpack_from("<8sHIH", data)
@@ -61,16 +70,20 @@ def _dfu(data: bytes, allow_invalid_crc: bool) -> tuple[bytes, tuple[str, ...]]:
         "<8s4I", data, header_size)
     if magic != b"CSRbcfw1" or reserved != 0:
         raise FirmwareError("Unsupported CSRbcfw1 header")
-    if code_field != BC5_CODE_BYTES + 4 or data_field != BC5_DATA_BYTES + 0x10000:
-        raise FirmwareError("Firmware layout differs from the supported HT25003 BC5 profile")
+    profile = next((p for p in PROFILES.values()
+                    if code_field == p.code_bytes + 4 and data_field == p.data_bytes + 0x10000), None)
+    if profile is None:
+        raise FirmwareError("Firmware layout differs from the supported BC5 profiles")
+    if model is not None and model != profile.model:
+        raise FirmwareError(f"Firmware is for {profile.name}, not the selected {model}")
     start = header_size + 24
-    end = start + BC5_PAYLOAD_BYTES
+    end = start + profile.payload_bytes
     if end + 20 != len(data):
         raise FirmwareError("CSR code/data lengths do not match the container")
     _, product, vendor, dfu_version, signature, suffix_size, suffix_crc = struct.unpack_from(
         "<HHHH3sBI", data, end + 4)
-    if (product, vendor, signature, suffix_size) != (0xA555, 0x1EDD, b"UFD", 16):
-        raise FirmwareError("DFU suffix is not an Iridium 9555 image")
+    if (product, vendor, signature, suffix_size) != (profile.product, 0x1EDD, b"UFD", 16):
+        raise FirmwareError(f"DFU suffix does not match the {profile.name} profile")
     if dfu_version != 0x100:
         raise FirmwareError("Unsupported USB DFU version")
     failures = []
@@ -82,57 +95,62 @@ def _dfu(data: bytes, allow_invalid_crc: bool) -> tuple[bytes, tuple[str, ...]]:
             failures.append(f"{label} CRC mismatch")
     if failures and not allow_invalid_crc:
         raise FirmwareError("; ".join(failures) + "; use --allow-invalid-crc for a deliberate patch")
-    return data[start:end], tuple(failures)
+    return data[start:end], tuple(failures), profile
 
 
 def parse_firmware(data: bytes, name: str, image: str | None = None,
-                   allow_invalid_crc: bool = False) -> Firmware:
+                   allow_invalid_crc: bool = False, model: str | None = None) -> Firmware:
     if not data or len(data) > MAX_IMAGE_BYTES:
         raise FirmwareError("Firmware must contain 1 byte to 8 MiB")
     warnings: tuple[str, ...] = ()
     payload = data
     kind = "raw"
+    if model is not None and model not in PROFILES:
+        raise FirmwareError("Unknown handset model")
     if data.startswith(b"CSR-dfu2"):
         if image not in (None, "bc5"):
             raise FirmwareError("CSR DFU contains BC5 firmware, not the selected processor")
-        payload, warnings = _dfu(data, allow_invalid_crc)
+        payload, warnings, profile = _dfu(data, allow_invalid_crc, model)
         image, kind = "bc5", "CSR-dfu2"
     else:
         if image is None:
             image = next((key for key, filename in RAW_FILES.items() if filename == name), None)
-        if image is None and len(data) in (BC5_PAYLOAD_BYTES, BC5_PAYLOAD_BYTES + 4):
-            image = "bc5"
-        if image is None:
-            image = next((key for key, size in PROFILE_BYTES.items() if len(data) == size), None)
+        candidates = [(p, processor) for p in PROFILES.values()
+                      if model is None or p.model == model
+                      for processor, size in p.image_sizes.items()
+                      if (image is None or processor == image) and size > 0
+                      and len(data) in ((size, size + 4) if processor == "bc5" else (size,))]
+        if not candidates:
+            raise FirmwareError("Unknown image or wrong length for the selected handset/processor profile")
+        # Shared auxiliary images retain the original 9555 default; a directory's
+        # checked BC5 container or --model resolves their handset context.
+        profile, image = candidates[0]
         if image == "bc5":
-            if len(data) not in (BC5_PAYLOAD_BYTES, BC5_PAYLOAD_BYTES + 4):
-                raise FirmwareError("Raw BC5 image has the wrong length for HT25003")
-            payload = data[:BC5_PAYLOAD_BYTES]
-            warnings = ("Raw image: container CRC unavailable; identity tracked by SHA-256",)
-        elif image in PROFILE_BYTES:
-            expected = PROFILE_BYTES[image]
-            if len(data) != expected:
-                raise FirmwareError(f"{image} image must contain {expected} bytes for the HT25003 profile")
-        else:
-            raise FirmwareError("Unknown image: supply main.dfu, bc5_main.bin, or --image avr|trx|ptt")
-    return Firmware(image, name, payload, sha256(data).hexdigest(), kind, warnings)
+            payload = data[:profile.payload_bytes]
+        warnings = ("Raw image: container CRC unavailable; identity tracked by SHA-256",)
+    return Firmware(image, name, payload, sha256(data).hexdigest(), kind, warnings, profile.model)
 
 
 def load_firmware(path: Path, image: str | None = None,
-                  allow_invalid_crc: bool = False) -> list[Firmware]:
+                  allow_invalid_crc: bool = False, model: str | None = None) -> list[Firmware]:
     if path.is_dir():
-        if image:
-            return load_firmware(path / RAW_FILES[image], image, allow_invalid_crc)
         # Prefer the checked container; explicitly pass a .bin to run a raw patch.
         bc5 = path / "main.dfu"
         if not bc5.exists():
             bc5 = path / RAW_FILES["bc5"]
-        result = load_firmware(bc5, "bc5", allow_invalid_crc)
+        if image and image != "bc5":
+            if model is None and bc5.exists():
+                model = load_firmware(bc5, "bc5", allow_invalid_crc)[0].model
+            return load_firmware(path / RAW_FILES[image], image, allow_invalid_crc, model)
+        result = load_firmware(bc5, "bc5", allow_invalid_crc, model)
+        if image == "bc5":
+            return result
+        model = result[0].model
         for processor in ("avr", "trx", "ptt"):
             candidate = path / RAW_FILES[processor]
             if candidate.exists():
-                result.extend(load_firmware(candidate, processor, allow_invalid_crc))
+                result.extend(load_firmware(candidate, processor, allow_invalid_crc, model))
         return result
     with path.open("rb") as source:
         data = source.read(MAX_IMAGE_BYTES + 1)
-    return [parse_firmware(data, path.name, image, allow_invalid_crc)]
+    return [parse_firmware(data, path.name, image, allow_invalid_crc, model)]

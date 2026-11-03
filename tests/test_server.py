@@ -109,6 +109,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
 
+    def test_upload_switches_handset_and_shared_modem_inherits_it(self):
+        status, data, _ = self.request("POST", "/api/firmware", bytes(0x36BB22),
+                                       {"X-Filename": "bc5_main.bin"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["firmware"]["model"], "9575")
+        status, data, _ = self.request("POST", "/api/firmware", bytes(0x260760),
+                                       {"X-Filename": "trx_seg1_0x10000.bin"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["firmware"]["model"], "9575")
+        status, data, _ = self.request("GET", "/api/state")
+        state = json.loads(data)
+        self.assertEqual(state["handset"]["model"], "9575")
+        self.assertIn("sos", state["handset"]["keys"])
+        self.assertEqual({image["model"] for image in state["images"]}, {"9575"})
+        self.assertEqual(arguments(["--model", "9575"]).firmware,
+                         Path(__file__).resolve().parent.parent / "firmware/9575")
+
 
 if __name__ == "__main__":
     unittest.main()

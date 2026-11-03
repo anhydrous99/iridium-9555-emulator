@@ -37,11 +37,14 @@ matrix wiring:
 | Left soft key, right soft key | `0x96`, `0x97` |
 | Send, end | `0x8D`, `0x8C` |
 | Volume up, volume down | `0xA0`, `0xA1` |
-| Power | `0xAA` |
+| Convenience | `0xAA` |
+| Physical power | Not established at this software input boundary |
 
 The handset has a two-way navigation rocker, separate soft keys, and a side
 convenience key. A distinct four-way rocker or center OK key should not be
-invented. The convenience key's code is not established here. The shared
+invented. The convenience key was previously mislabeled as power; the original
+keypad self-test establishes `0xAA` as convenience, corroborated by the 9575's
+location shortcut. See [corrected control evidence](9575-controls.md). The shared
 firmware also targets other handset variants.
 
 ### Dynamic observation on the existing core
@@ -51,7 +54,7 @@ On 2026-11-02 an isolated Zig probe loaded the original binary using
 scheduler idle call at `0xB774` after **6,442,383 instructions**. The registered
 key callback `0xF6FB:0xF6FC` remained **zero**.
 
-The probe invoked original `0x67F04` with power press `(0xAA, 1)`, ran two million
+The probe invoked original `0x67F04` with convenience press `(0xAA, 1)`, ran two million
 instructions, invoked release `(0xAA, 4)`, and ran another two million. Both
 injected calls returned. Original `0x67FEA` dispatched twice and freed the events;
 the pending count returned to zero. There were **zero calls to UI handler
@@ -123,7 +126,9 @@ The verified experimental startup sequence is:
 3. Perform `warm_reset`, then run to idle again. With the defaults retained,
    original `0x3AF72` succeeds and the original task invokes `0x6365E` itself.
    Do not duplicate that initialization.
-4. Call original `0x8CC8C` again, then `0x8CC5E`, and let the original scheduler
+4. Call original `0x8CC8C` again, then the original power-on helper
+   `0x6BE4C(AL=0)` and charging/UI transition `0x6A092(AL=3)`. The power helper
+   invokes the registered `0x8CC5E` animation callback. Let the original scheduler
    advance the animation and home screen.
 
 On the tested image, cold idle took 6,491,511 instructions. The first `0x8CC8C`
@@ -138,11 +143,14 @@ Two startup boundaries remain explicit. `0x6365E` eventually calls
 ADC completion is not modeled. After warm boot, an additional 30 million
 instructions left the UI callback unset and produced no further LCD writes.
 The power state machine registers `0x8CC5E` as its UI-start callback; its physical
-power event is also not modeled. Explicit calls at these two boundaries are
-therefore an experimental application bootstrap, not a claim of complete natural
-boot. Calling `0x8CC5E` directly does not advance the original power state from
-1 through `0x10` and `0x20`; complete power-state behavior and every navigation
-path remain unverified. No link-ready callback such as `0x8CA1E` is injected.
+power event is also not modeled. The previous bootstrap called that callback
+directly, leaving the power and charging/UI states behind. A delayed charging
+screen then covered the animation after frame 2 while its timer kept running.
+The current bootstrap executes the original successful power-on branch's helper
+and state transition instead. See [boot-animation evidence](boot-animation.md)
+for both builds' addresses and regression coverage. This remains experimental:
+electrical inputs, complete power-state behavior and every navigation path are
+unverified. No link-ready callback such as `0x8CA1E` is injected.
 
 ### Measured original UI and key response
 

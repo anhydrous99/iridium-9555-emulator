@@ -30,11 +30,12 @@ def build_engine() -> Path:
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description="Execute original Iridium 9555 firmware with partial hardware models")
+    parser = argparse.ArgumentParser(description="Execute original Iridium 9555 / 9575 Extreme firmware with partial hardware models")
     parser.add_argument("firmware", nargs="?", type=Path,
-                        default=Path.home() / "Documents/Projects/rev-firmware/firmware",
                         help="main.dfu, raw firmware, or extracted firmware directory")
     parser.add_argument("--image", choices=("bc5", "avr", "trx", "ptt"), help="Processor for a raw binary")
+    parser.add_argument("--model", choices=("9555", "9575"),
+                        help="Handset profile; auto-detected from BC5 layout when omitted")
     parser.add_argument("--headless", action="store_true", help="Run bounded instructions and print JSON evidence")
     parser.add_argument("--initialize-ui", action="store_true",
                         help="Experimental: invoke original application initialization after kernel idle")
@@ -45,6 +46,9 @@ def arguments(argv=None):
     parser.add_argument("--port", type=int, default=9555, help="HTTP port; 0 chooses a free port")
     parser.add_argument("--no-browser", action="store_true", help="Print the local UI URL without opening a browser")
     result = parser.parse_args(argv)
+    if result.firmware is None:
+        result.firmware = (ROOT / "firmware/9575" if result.model == "9575" else
+                           Path.home() / "Documents/Projects/rev-firmware/firmware")
     if not 1 <= result.steps <= 100000000:
         parser.error("--steps must be between 1 and 100000000")
     if not 0 <= result.port <= 65535:
@@ -55,7 +59,7 @@ def arguments(argv=None):
 def main(argv=None) -> int:
     args = arguments(argv)
     try:
-        firmware = load_firmware(args.firmware.expanduser(), args.image, args.allow_invalid_crc)
+        firmware = load_firmware(args.firmware.expanduser(), args.image, args.allow_invalid_crc, args.model)
         if args.inspect:
             print(json.dumps([item.describe() for item in firmware], indent=2))
             return 0
@@ -80,7 +84,7 @@ def main(argv=None) -> int:
             session.start()
             with Server((args.host, args.port), session, ROOT / "ui", args.allow_invalid_crc) as server:
                 url = f"http://{server.authority}/"
-                print(f"Iridium 9555 firmware lab: {url}", flush=True)
+                print(f"{session.profile.name} firmware lab: {url}", flush=True)
                 print(f"Listening on {args.host}:{server.server_port}", flush=True)
                 print("Partial hardware model. Press Ctrl+C to stop.", flush=True)
                 if not args.no_browser:

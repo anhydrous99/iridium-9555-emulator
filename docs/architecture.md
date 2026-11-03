@@ -1,11 +1,16 @@
 # Architecture and debugger API
 
 `iridium/firmware.py` validates source bytes and strips container metadata.
+`iridium/profiles.py` records the two supported builds' layouts and software
+entry points; the loaded image selects the handset throughout the host and UI.
 `iridium/engine.py` owns a native worker and its bounded JSON-lines transport.
 `iridium/session.py` serializes debugger actions and keeps independent CPU state,
 input events and satellite scenarios. `iridium/server.py` exposes that session
 on all IPv4 interfaces by default (`--host 127.0.0.1` restricts access to loopback).
 `ui/` renders state without synthesizing firmware menus.
+While running it polls 50 ms after each completed response, with only one state
+request in flight, so intermediate LCD animation frames can be displayed.
+Paused sessions retain the slower 1,250 ms polling interval.
 
 `native/main.zig` adapts the original CPU/SoC implementations under
 `native/vendor/`. Each processor lives in a separate OS process because the
@@ -15,7 +20,10 @@ on physical hardware. The scenario clock is also an explicitly simulated clock.
 
 ## Input and execution boundaries
 
-The supported profile is the supplied HT25003 firmware. BC5 program addresses
+The supported profiles are HT25003 for 9555 and HL25003 for 9575 Extreme.
+DFU layouts and USB product IDs must both match. Raw images are selected by
+their exact profile lengths; shared modem binaries inherit the selected model.
+BC5 program addresses
 are word addresses based at `0x800C`; the API exposes both `program_pc` and the
 image-byte `pc`. BC5 data-memory addresses and `read`/`write` values are words.
 AVR/SPARC memory operations use bytes; their displayed PCs use byte addresses.
@@ -42,6 +50,7 @@ After `zig build -j2`:
 
 ```sh
 zig-out/bin/iridium-core --image bc5 --firmware /path/to/bc5_main.bin
+zig-out/bin/iridium-core --model 9575 --image bc5 --firmware firmware/9575/bc5_main.bin
 ```
 
 The worker emits startup state, then one JSON object per newline-terminated
@@ -123,7 +132,9 @@ three consecutive ten-million-instruction requests to reach idle during a warm
 boot, stopping immediately if the worker reports a halt.
 
 Experimental `initialize_ui` pauses all host workers and follows the original
-application's persistent-store initialization path:
+application's persistent-store initialization path. The addresses below are for
+HT25003; HL25003 uses setup `0x93788`, power-on helper `0x6BED0`, graphics pointer
+`0xF72C` and key callback `0xF70E:0xF70F`, with the same graphics-init entry:
 
 1. Reach scheduler idle, invoke original device initialization `0x6365E` if it
    has not already run, then full application initialization `0x8CC8C`.
@@ -131,8 +142,15 @@ application's persistent-store initialization path:
    requests a watchdog reset. Perform `warm_reset` and run to idle again; original
    reset code validates the retained records and invokes device initialization.
    Invoke full `0x8CC8C` again after this reset.
-3. Invoke `0x8CC5E` to start the original animation.
-   Check the installed key callback and resume scheduler execution.
+3. Invoke the original power-on helper `0x6BE4C(AL=0)`, which advances the power
+   state and invokes the registered application-start callback. Then invoke
+   `0x6A092(AL=3)` to advance the charging/UI state, following the original
+   power-on branch. Check the installed key callback and resume the scheduler.
+
+Calling the application-start callback directly left the charging state behind;
+a delayed charging-screen update then covered the animation after its third
+frame. The corrected sequence keeps the animation visible until its original
+completion callback. See [boot-animation evidence](boot-animation.md).
 
 The animation now advances automatically to the original home screen showing
 Searching for Iridium, Acquiring time, Menu and Help. A left soft-key event opens
@@ -145,12 +163,18 @@ before retrying, so partially initialized state is not initialized twice.
 After this scenario, mapped key events enter original `0x67F04` with key code
 in AL and transition 1 (down) or 4 (up) in AH. The scheduler dispatches the
 allocated event through the original callback. Before initialization or for the
-unmapped convenience key, the host records the event and reports non-delivery.
+physical power control, the host records the event and reports non-delivery.
+The convenience key uses `0xAA` on both builds; the 9575's SOS key uses `0xAB`.
+The original location prompt, location screen and emergency countdown execute in
+the guest. No coordinates or emergency-service responses are invented by the host.
+See [control evidence](9575-controls.md) and [native model evidence](9575-native.md).
 
 ## HTTP API
 
 `GET /api/state` returns image hashes, processors, input state, scenario state,
 bounded events, an optional original asset preview and explicit fidelity limits.
+Its `handset` object reports `model`, `name`, `firmware_version` (profile build)
+and available physical `keys`.
 Mutations use `POST` with `Content-Type: application/json`:
 
 | Endpoint | Body |
@@ -179,6 +203,9 @@ the same transition to be injected twice.
 
 `POST /api/firmware` accepts the raw file body with an `X-Filename` header. It
 validates and starts the replacement worker before disposing of the prior one.
+Replacing BC5 with another handset's image closes all old processors and clears
+the old experiment; auxiliary images must match that handset. Identical modem
+payloads uploaded alone retain the current handset context.
 Firmware is staged only in a private temporary directory. Requests are bounded,
 and Host validation accepts the connection's destination IP, the configured
 browser authority, or localhost. Origin must match that validated Host; cross-site

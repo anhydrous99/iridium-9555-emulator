@@ -20,6 +20,7 @@ class Element {
     this.checked = false;
     this.disabled = false;
     this.classes = new Set();
+    this.attributes = new Map();
     this.classList = {
       add: (name) => this.classes.add(name),
       remove: (name) => this.classes.delete(name),
@@ -29,7 +30,7 @@ class Element {
   addEventListener(name, handler) { this.listeners.set(name, handler); }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes.set(name, value); }
   contains() { return false; }
   closest() { return null; }
   matches() { return false; }
@@ -97,7 +98,64 @@ test("markup has one of every physical handset control and unique IDs", () => {
   assert.equal(ids.length, new Set(ids).size);
   assert.equal(keys.length, new Set(keys).size);
   assert.deepEqual(new Set(keys), new Set([...
-    "0123456789*#", "soft_left", "soft_right", "up", "down", "green", "red", "power", "volume_up", "volume_down", "convenience"]));
+    "0123456789*#", "soft_left", "soft_right", "up", "down", "green", "red", "power", "volume_up", "volume_down", "convenience", "sos"]));
+});
+
+test("firmware handset metadata selects the Extreme identity and physical controls", async () => {
+  const app = await fixture();
+  const sos = app.buttons.find((button) => button.dataset.key === "sos");
+  assert.equal(app.elements.get("brand-model").textContent, "9555");
+  assert.equal(sos.hidden, true);
+  assert.equal(sos.disabled, true);
+  app.run("renderState({handset:{model:'9575',name:'Iridium 9575 Extreme',firmware_version:'HL25003'}})");
+  assert.equal(app.run("document.title"), "9575 Extreme · Firmware lab");
+  assert.equal(app.elements.get("brand-model").textContent, "9575");
+  assert.equal(app.elements.get("phone-model").textContent, "EXTREME");
+  assert.equal(app.elements.get("phone-bottom-model").textContent, "9575");
+  assert.match(app.elements.get("research-heading").textContent, /9575 EXTREME/);
+  assert.match(app.elements.get("firmware-profile").textContent, /HL25003/);
+  assert.match(app.elements.get("fidelity-description").textContent, /partial Iridium 9575 Extreme/);
+  assert.match(app.elements.get("firmware-input").attributes.get("aria-label"), /9575 Extreme/);
+  assert.ok(app.elements.get("handset").classes.has("extreme"));
+  assert.equal(app.elements.get("extreme-key-help").hidden, false);
+  assert.equal(sos.hidden, false);
+  assert.equal(sos.disabled, false);
+  assert.equal(app.buttons.find((button) => button.dataset.key === "convenience").attributes.get("aria-label"), "Location convenience key");
+  app.run("renderState({handset:{model:'9555',firmware_version:'HT25003'}})");
+  assert.equal(app.elements.get("phone-model").textContent, "9555");
+  assert.equal(app.elements.get("handset").classes.has("extreme"), false);
+  assert.equal(app.elements.get("extreme-key-help").hidden, true);
+  assert.equal(sos.hidden, true);
+});
+
+test("SOS keyboard events respect handset controls and report actual firmware delivery", async () => {
+  const app = await fixture();
+  const down = app.window.listeners.get("keydown");
+  const up = app.window.listeners.get("keyup");
+  const press = () => down({ key: "s", code: "KeyS", target: new Element(), preventDefault() {} });
+  press();
+  up({ key: "s", code: "KeyS" });
+  await app.run("keyQueue");
+  assert.equal(app.calls.length, 0, "9555 must not submit the Extreme-only SOS key");
+  app.run("renderState({handset:{model:'9575',keys:['sos','power']}})");
+  press();
+  up({ key: "s", code: "KeyS" });
+  app.run("pressKey('1','pointer:1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.map((call) => call.body), [
+    { key: "sos", pressed: true, generation: 0 }, { key: "sos", pressed: false, generation: 0 },
+  ]);
+  assert.match(app.elements.get("key-feedback").textContent, /Not delivered to firmware/);
+});
+
+test("switching handset releases a held key that is absent from the replacement model", async () => {
+  const app = await fixture();
+  app.run("renderState({handset:{model:'9575'}}); pressKey('sos','pointer:1')");
+  await app.run("keyQueue");
+  app.run("renderState({handset:{model:'9555'}}); releaseKey('pointer:1')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.map((call) => call.body.pressed), [true, false]);
+  assert.equal(app.buttons.find((button) => button.dataset.key === "sos").classes.has("held"), false);
 });
 
 test("keyboard and pointer ownership prevent premature key release", async () => {
@@ -232,6 +290,49 @@ function liveState() {
     asset: { width: 2, height: 1, pixels: [3, 1] },
   };
 }
+
+test("live polling paints successive frames at 50 ms without overlapping requests", async () => {
+  const app = await fixture();
+  const timers = [];
+  const responses = [];
+  let requests = 0;
+  app.context.setTimeout = (callback, delay) => { timers.push({ callback, delay }); return timers.length; };
+  app.context.fetch = async (url) => {
+    assert.equal(url, "/api/state");
+    requests += 1;
+    return { ok: true, json: () => new Promise((resolve) => responses.push(resolve)) };
+  };
+
+  const polling = app.run("poll()");
+  const sharedRefresh = app.run("refreshState()");
+  await new Promise(setImmediate);
+  assert.equal(requests, 1, "An action refresh shares the pending poll request");
+  assert.equal(timers.length, 0, "A slow response cannot start another poll");
+  const first = liveState();
+  first.running = true;
+  first.lcd.pixels[0] = 3;
+  responses.shift()(first);
+  await Promise.all([polling, sharedRefresh]);
+  assert.equal(app.elements.get("lcd").draws, 1);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 50);
+
+  const nextPoll = timers.shift().callback();
+  const nextRefresh = app.run("refreshState()");
+  await new Promise(setImmediate);
+  assert.equal(requests, 2);
+  assert.equal(timers.length, 0);
+  const second = liveState();
+  second.running = false;
+  second.lcd.pixels[1] = 3;
+  responses.shift()(second);
+  await Promise.all([nextPoll, nextRefresh]);
+  assert.equal(app.elements.get("lcd").draws, 2, "Each received animation frame is painted");
+  assert.deepEqual(Array.from(app.elements.get("lcd").frame.data.slice(0, 8)),
+    [169, 184, 145, 255, 33, 48, 21, 255]);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 1250, "Paused sessions keep the slower polling interval");
+});
 
 test("live LCD follows changing firmware pixels and stays distinct from asset preview", async () => {
   const app = await fixture();

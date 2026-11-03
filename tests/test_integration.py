@@ -10,29 +10,32 @@ import tempfile
 import unittest
 
 from iridium.engine import Engine, EngineError
+from iridium.assets import BC5Assets
 from iridium.firmware import load_firmware, parse_firmware
 from iridium.session import Session
+from iridium.profiles import PROFILES
 
 
 FIRMWARE_DIRECTORY = os.environ.get("IRIDIUM_TEST_FIRMWARE")
+EXTREME_DIRECTORY = os.environ.get("IRIDIUM_TEST_9575_FIRMWARE")
 EXECUTABLE = Path(__file__).resolve().parent.parent / "zig-out/bin/iridium-core"
 
 
-@unittest.skipUnless(FIRMWARE_DIRECTORY, "Set IRIDIUM_TEST_FIRMWARE for original-binary execution tests")
-class OriginalFirmwareTests(unittest.TestCase):
+class OriginalFirmwareChecks:
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        self.profile = PROFILES[self.model]
 
     def worker(self, image, patch=None):
-        firmware = load_firmware(Path(FIRMWARE_DIRECTORY), image)[0]
+        firmware = load_firmware(Path(self.firmware_directory), image)[0]
         data = bytearray(firmware.data)
         if patch:
             offset, replacement = patch
             data[offset:offset + len(replacement)] = replacement
         path = Path(self.directory.name) / f"{image}.bin"
         path.write_bytes(data)
-        engine = Engine(EXECUTABLE, image, path)
+        engine = Engine(EXECUTABLE, image, path, model=self.model)
         self.addCleanup(engine.close)
         return engine
 
@@ -49,7 +52,7 @@ class OriginalFirmwareTests(unittest.TestCase):
         self.assertTrue(state["last_call"]["returned"])
         self.assertEqual(engine.request("read", address=0xA100, count=3)["values"], [0xBEEF] * 3)
         # Original event dispatcher is not connected to a handset UI at kernel idle.
-        self.assertEqual(engine.request("read", address=0xF6FB, count=2)["values"], [0, 0])
+        self.assertEqual(engine.request("read", address=self.profile.key_callback, count=2)["values"], [0, 0])
 
     def test_patched_reset_instruction_changes_executed_behavior(self):
         engine = self.worker("bc5", (0, b"\x04\x00"))  # XAP BRK replaces reset branch.
@@ -81,13 +84,14 @@ class OriginalFirmwareTests(unittest.TestCase):
         self.assertEqual(engine.request("state")["steps"], 0)
 
     def test_experimental_original_ui_initialization_and_software_key_delivery(self):
-        firmware = load_firmware(Path(FIRMWARE_DIRECTORY), "bc5")
+        firmware = load_firmware(Path(self.firmware_directory), "bc5")
         with Session(EXECUTABLE, firmware) as session:
             session.control("initialize_ui")
             self.assertTrue(session.ui_initialized)
             response = session.key("soft_left", True)
             self.assertTrue(response["delivered"])
-            self.assertEqual(session.engines["bc5"].request("read", address=0xF743, count=1)["values"], [0x96])
+            self.assertEqual(session.engines["bc5"].request(
+                "read", address=self.profile.key_callback + 0x48, count=1)["values"], [0x96])
             session.key("soft_left", False)
             for _ in range(40):
                 session.control("step", 50000)
@@ -99,7 +103,7 @@ class OriginalFirmwareTests(unittest.TestCase):
             self.assertFalse(state["satellite"]["firmware_connected"])
             # A firmware patch/debugger write can remove the callback. Do not
             # keep claiming delivery merely because initialization once passed.
-            session.probe("bc5", "write", {"address": 0xF6FB, "values": [0, 0]})
+            session.probe("bc5", "write", {"address": self.profile.key_callback, "values": [0, 0]})
             with self.assertRaisesRegex(EngineError, "handler is absent"):
                 session.key("1", True)
             self.assertFalse(session.ui_initialized)
@@ -108,11 +112,26 @@ class OriginalFirmwareTests(unittest.TestCase):
             self.assertIsNone(session.state()["lcd"])
 
     def test_original_animation_reaches_readable_home_and_navigable_menu(self):
-        firmware = load_firmware(Path(FIRMWARE_DIRECTORY), "bc5")
+        firmware = load_firmware(Path(self.firmware_directory), "bc5")
         with Session(EXECUTABLE, firmware) as session:
             session.control("initialize_ui")
+            assets = BC5Assets(firmware[0].data, self.profile)
+            frames = [0, 20, 40, 60, 80, 97]
+
+            def animation_crop(pixels):
+                # Exclude status icons and the existing one-column panel/bitmap edge discrepancy.
+                return b"".join(bytes(pixels[row * 128 + 1:(row + 1) * 128]) for row in range(16, 112))
+
+            expected = [sha256(animation_crop(assets.bitmap(self.profile.animation_file, frame).pixels)).digest()
+                        for frame in frames]
+            seen = []
             for _ in range(600):
                 session.control("step", 200000)
+                lcd = session.lcd.state()
+                if (lcd["known_pixels"] == 16384 and lcd["display_on"] and lcd["error"] is None
+                        and len(seen) < len(expected) and sha256(animation_crop(lcd["pixels"])).digest() == expected[len(seen)]):
+                    seen.append(frames[len(seen)])
+            self.assertEqual(seen, frames, "Original LCD must show successive satellite-animation frames before home")
 
             def assert_rows(first, last, expected):
                 state = session.state()
@@ -130,7 +149,7 @@ class OriginalFirmwareTests(unittest.TestCase):
                 for _ in range(10):
                     session.control("step", 200000)
 
-            # Known-answer pixel crops of visually verified original HT25003 text.
+            # Known-answer crops visually verified against HT25003 and HL25003.
             # Exclude changing status icons; a mirrored logo or blank redraw cannot pass.
             # Home screen: readable Menu / Help captions after the animation, without keys.
             assert_rows(113, 128, "b27866e4b66c4276d7f13b5b830b672ddf8f348dab67e38c8df5326a58de66d9")
@@ -150,8 +169,9 @@ class OriginalFirmwareTests(unittest.TestCase):
             assert_rows(113, 128, "b27866e4b66c4276d7f13b5b830b672ddf8f348dab67e38c8df5326a58de66d9")
 
     def test_patched_application_initializer_fault_is_not_hidden(self):
-        data = bytearray(load_firmware(Path(FIRMWARE_DIRECTORY), "bc5")[0].data)
-        data[0x8CC8C:0x8CC8E] = b"\x04\x00"  # BRK in application setup.
+        data = bytearray(load_firmware(Path(self.firmware_directory), "bc5")[0].data)
+        entry = self.profile.application_setup
+        data[entry:entry + 2] = b"\x04\x00"  # BRK in application setup.
         firmware = parse_firmware(bytes(data), "patched-bc5.bin", "bc5")
         with Session(EXECUTABLE, [firmware]) as session:
             with self.assertRaisesRegex(EngineError, "brk"):
@@ -160,6 +180,59 @@ class OriginalFirmwareTests(unittest.TestCase):
             self.assertFalse(session.running)
             with self.assertRaisesRegex(EngineError, "reset before retrying"):
                 session.control("initialize_ui")
+
+
+@unittest.skipUnless(FIRMWARE_DIRECTORY, "Set IRIDIUM_TEST_FIRMWARE for original 9555 execution tests")
+class OriginalFirmwareTests(OriginalFirmwareChecks, unittest.TestCase):
+    model = "9555"
+    firmware_directory = FIRMWARE_DIRECTORY
+
+
+@unittest.skipUnless(EXTREME_DIRECTORY, "Set IRIDIUM_TEST_9575_FIRMWARE for original 9575 execution tests")
+class ExtremeFirmwareTests(OriginalFirmwareChecks, unittest.TestCase):
+    model = "9575"
+    firmware_directory = EXTREME_DIRECTORY
+
+    def test_original_location_and_cancellable_sos_controls(self):
+        firmware = load_firmware(Path(self.firmware_directory), "bc5")
+        with Session(EXECUTABLE, firmware) as session:
+            session.control("initialize_ui")
+            for _ in range(600):
+                session.control("step", 200000)
+            self.assertEqual(session.state()["handset"]["model"], "9575")
+            self.assertEqual(session.state()["asset"]["source"], "firmware resource 21")
+            # Power is a separate hardware path, never the convenience key.
+            self.assertFalse(session.key("power", True)["delivered"])
+            self.assertFalse(session.key("power", False)["delivered"])
+
+            def press(key):
+                self.assertTrue(session.key(key, True)["delivered"])
+                self.assertTrue(session.key(key, False)["delivered"])
+                for _ in range(10):
+                    session.control("step", 200000)
+
+            def assert_screen(expected):
+                state = session.state()
+                self.assertIsNone(state["processors"][0]["halt"])
+                self.assertIsNone(state["lcd"]["error"])
+                self.assertEqual(state["lcd"]["known_pixels"], 16384)
+                pixels = bytes(state["lcd"]["pixels"][16 * 128:113 * 128])
+                self.assertEqual(sha256(pixels).hexdigest(), expected)
+                self.assertFalse(state["satellite"]["firmware_connected"])
+
+            press("convenience")
+            # Original 'Enable GPS?' prompt.
+            assert_screen("ccab0537fb15d496f17cc97f8104369a8d402327827e54765d9819e856dd1357")
+            press("soft_left")
+            # Current Location: empty coordinates and 'Age of fix: Updating'.
+            assert_screen("7f211763990f11dadfc3ec8b186a8f4c2c98308e64877bceb412b2010cf30a7e")
+            press("soft_right")
+            home = bytes(session.state()["lcd"]["pixels"])
+            press("sos")
+            # Original 20-second emergency countdown with deployment instructions.
+            assert_screen("bb6ba11a55781edb3b9b98732e303f6c226f6664e2711b611f3e7739b8dcdb83")
+            press("soft_right")
+            self.assertEqual(bytes(session.state()["lcd"]["pixels"])[16 * 128:], home[16 * 128:])
 
 
 if __name__ == "__main__":
