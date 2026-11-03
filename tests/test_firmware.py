@@ -34,6 +34,17 @@ class FirmwareTests(unittest.TestCase):
         self.assertEqual(image.sha256, sha256(self.dfu).hexdigest())
         self.assertEqual(image.warnings, ())
 
+    def test_descriptions_identify_the_payload_and_keep_mutable_fields_isolated(self):
+        original = parse_firmware(self.dfu, "main.dfu")
+        patched = parse_firmware(b"\x04\x00" + original.data[2:], "patched.bin", "bc5")
+        for image in (original, patched):
+            report = image.describe()
+            self.assertEqual(report["payload_sha256"], sha256(image.data).hexdigest())
+            report["warnings"].append("caller modification")
+            self.assertNotIn("caller modification", image.describe()["warnings"])
+        self.assertNotEqual(original.describe()["sha256"], original.describe()["payload_sha256"])
+        self.assertNotEqual(original.describe()["payload_sha256"], patched.describe()["payload_sha256"])
+
     def test_patched_dfu_requires_explicit_checksum_override(self):
         patched = bytearray(self.dfu)
         patched[0x3E0] = 0x91

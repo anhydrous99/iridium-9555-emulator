@@ -1,0 +1,248 @@
+{
+  "environment": {
+    "python": "3.14.4",
+    "platform": "Linux-7.0.0-42-generic-x86_64-with-glibc2.43",
+    "node": "v22.22.1",
+    "zig": "0.17.0",
+    "revision": "484a759b292c58cb38dcef9a4da8a2b5dc274c68",
+    "source_sha256": {
+      "iridium/firmware.py": "7063a73eed7e86b64599bb51bfd282035ce7addbff94af9ef58b0154dd3790f9",
+      "iridium/lcd.py": "8660a42831acc1b1a08c66116c79dfddd265a8277a252948d67e22f69548e289",
+      "ui/app.js": "f5d7806ba4d1c112358abfab5b0a54403d3c562c05c5bc328ef206ef5bee8098",
+      "native/vendor/common/bus.zig": "deb04f2b3a66b16218783148a31949d477cf9a49f6129b79bed104e5d2e3dc5c",
+      "native/main.zig": "244a2fd00fb22d44bcd2a1b8ed492c97736129f4cc5a5d1f6d1381b3e7dc5377"
+    },
+    "engine_sha256": "b181254ccdafe5198f3ce6ceff9812a8772f31e529d3b49baa34b4662912e5d5"
+  },
+  "metrics": {
+    "lcd_unchanged": {
+      "median_ms": 4.27540628,
+      "samples_ms": [
+        4.25442554,
+        4.27453664,
+        4.31318762,
+        4.24991228,
+        4.27540628,
+        4.30568303,
+        4.30455099
+      ],
+      "iterations_per_sample": 100
+    },
+    "lcd_changed": {
+      "median_ms": 4.617152466666667,
+      "samples_ms": [
+        4.714279133333334,
+        4.646798866666666,
+        4.617152466666667,
+        4.611509133333334,
+        4.588631866666666,
+        4.711442766666667,
+        4.609087533333334
+      ],
+      "iterations_per_sample": 30
+    },
+    "session_state": {
+      "median_ms": 4.08578181,
+      "samples_ms": [
+        4.08453115,
+        4.08578181,
+        4.08359437,
+        4.1001704199999995,
+        4.13848607,
+        4.08467552,
+        4.098055319999999
+      ],
+      "iterations_per_sample": 100
+    },
+    "state_json": {
+      "median_ms": 4.69050912,
+      "samples_ms": [
+        4.67964458,
+        4.67609156,
+        4.67633712,
+        4.710383599999999,
+        4.69050912,
+        4.72818446,
+        4.74248641
+      ],
+      "iterations_per_sample": 100
+    },
+    "http_poll": {
+      "median_ms": 7.71533835,
+      "samples_ms": [
+        7.82598605,
+        7.71533835,
+        6.605233650000001,
+        7.5362331,
+        6.7612977999999995,
+        7.86168705,
+        7.786557
+      ],
+      "iterations_per_sample": 20
+    },
+    "bc5_boot_7m": {
+      "median_ms": 211.566412,
+      "samples_ms": [
+        211.566412,
+        209.914578,
+        211.13239,
+        214.101756,
+        211.467204,
+        213.232032,
+        215.154085
+      ],
+      "iterations_per_sample": 1
+    },
+    "avr_boot_7m": {
+      "median_ms": 276.734531,
+      "samples_ms": [
+        276.734531,
+        278.099482,
+        278.740955,
+        278.487225,
+        274.724129,
+        274.218744,
+        274.328572
+      ],
+      "iterations_per_sample": 1
+    },
+    "trx_boot_7m": {
+      "median_ms": 239.420713,
+      "samples_ms": [
+        224.416971,
+        223.622289,
+        239.777829,
+        239.746048,
+        239.465928,
+        238.991611,
+        239.420713
+      ],
+      "iterations_per_sample": 1
+    },
+    "ptt_boot_7m": {
+      "median_ms": 243.500578,
+      "samples_ms": [
+        227.621841,
+        243.500578,
+        243.815794,
+        243.779414,
+        243.792209,
+        233.676411,
+        226.79632
+      ],
+      "iterations_per_sample": 1
+    },
+    "application_initialize": {
+      "median_ms": 1142.742589,
+      "samples_ms": [
+        1133.611953,
+        1138.448479,
+        1140.177959,
+        1142.742589,
+        1145.65717,
+        1144.685934,
+        1143.771064
+      ],
+      "iterations_per_sample": 1
+    },
+    "original_session_state": {
+      "median_ms": 7.14713408,
+      "samples_ms": [
+        7.3740185,
+        7.1392884400000005,
+        7.243049849999999,
+        7.1861622800000005,
+        7.138708940000001,
+        7.14512578,
+        7.14713408
+      ],
+      "iterations_per_sample": 100
+    },
+    "original_state_json": {
+      "median_ms": 8.10912455,
+      "samples_ms": [
+        8.150283570000001,
+        8.066169219999999,
+        8.10912455,
+        8.10767722,
+        8.19369687,
+        8.25359314,
+        8.08782407
+      ],
+      "iterations_per_sample": 100
+    },
+    "ui_unchanged": {
+      "median_ms": 0.25514207099999997,
+      "samples_ms": [
+        0.256901999,
+        0.256718271,
+        0.25656945999999997,
+        0.254433401,
+        0.254973603,
+        0.25484861600000003,
+        0.25514207099999997
+      ],
+      "iterations_per_sample": 1000
+    },
+    "ui_redraw": {
+      "median_ms": 8.00585276,
+      "samples_ms": [
+        8.05683708,
+        7.90163159,
+        8.00855758,
+        8.00170142,
+        8.10166855,
+        7.99020568,
+        8.00585276
+      ],
+      "iterations_per_sample": 100
+    }
+  },
+  "response_bytes": 117085,
+  "firmware": [
+    {
+      "image": "bc5",
+      "name": "main.dfu",
+      "sha256": "229ff386d1fc764d651403eb68a0bfdcd4902934e0e4b0bedc3b0ba9a0c5f3f2",
+      "payload_sha256": "38a12b9994456ebb9b2dc1b8afc8aad2dd903370bb282f01af925164bf44a98e",
+      "format": "CSR-dfu2",
+      "size": 3215290,
+      "warnings": []
+    },
+    {
+      "image": "avr",
+      "name": "avr.bin",
+      "sha256": "84801ab15a81fb208fac95001004ed8bff4c3d625224b764fa58f1bce3b9df5b",
+      "payload_sha256": "84801ab15a81fb208fac95001004ed8bff4c3d625224b764fa58f1bce3b9df5b",
+      "format": "raw",
+      "size": 8678,
+      "warnings": []
+    },
+    {
+      "image": "trx",
+      "name": "trx_seg1_0x10000.bin",
+      "sha256": "4f7939844993b28cae3031fa3da1b5bdb5c9546045cae1e0f6e42dd2d591e54b",
+      "payload_sha256": "4f7939844993b28cae3031fa3da1b5bdb5c9546045cae1e0f6e42dd2d591e54b",
+      "format": "raw",
+      "size": 2492256,
+      "warnings": []
+    },
+    {
+      "image": "ptt",
+      "name": "trx_seg2.bin",
+      "sha256": "1a4f78525e9b474946b21c4aba287dbd7e076c72acb534a0b0a7439daefb28ca",
+      "payload_sha256": "1a4f78525e9b474946b21c4aba287dbd7e076c72acb534a0b0a7439daefb28ca",
+      "format": "raw",
+      "size": 687096,
+      "warnings": []
+    }
+  ],
+  "native_states": {
+    "bc5": "96452a2a51e9d85eee733977e9e45d9abe3c4bb5f170658404ea25bb55d05ebf",
+    "avr": "646401ed7f08cdab6e00b9b8a41808db75d770fb853dac414ba27c4e8cd71d5a",
+    "trx": "0d164eb65781ef0426d287bd590ddf107c1ba8387030d1ed90b8cb74d1f9c384",
+    "ptt": "738d457fd2ec0ff21526b08b848b8c8781600ef3ee65347ed2513b8e9206d2cd"
+  },
+  "animation_120m_ms": 3870.055232,
+  "home_pixels_sha256": "3950bdcac33f96b3735eec97f676a686ff88035e2b983ebb77927a02f869808d"
+}

@@ -117,6 +117,26 @@ class LCDTest(unittest.TestCase):
         lcd.feed(bytes.fromhex("10 03 E0 E8 01 FF FF EE"))
         self.assertEqual(lcd.column, 6)
 
+    def test_state_snapshots_are_isolated_and_follow_fragmented_writes(self):
+        lcd = ST7541()
+        lcd.feed(bytes.fromhex("AF E8 01 01"))
+        partial = lcd.state()
+        lcd.feed(bytes([1]))
+        complete = lcd.state()
+        self.assertEqual(partial["known_pixels"], 0)
+        self.assertEqual(complete["known_pixels"], 8)
+        self.assertEqual(complete["pixels"][0], 3)
+        complete["pixels"][0] = 0
+        complete["known"][0] = False
+        complete["palette"][0] = 255
+        current = lcd.state()
+        self.assertEqual(current["pixels"][0], 3)
+        self.assertTrue(current["known"][0])
+        self.assertEqual(current["palette"][0], 0)
+        lcd.feed(bytes.fromhex("A7"))
+        self.assertEqual(lcd.state()["pixels"][0], 0)
+        self.assertEqual(current["pixels"][0], 3)
+
     def test_unknown_command_or_unsupported_configuration_latches_error(self):
         for stream in ("18", "A3", "48 40", "44 01", "F7 00", "EE", "38 01"):
             with self.subTest(stream=stream):

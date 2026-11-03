@@ -25,6 +25,7 @@ class ST7541:
         self.saved_column = None
         self.error = None
         self.version = self.data_bytes = 0
+        self._state_cache = None
 
     def feed(self, data: bytes) -> None:
         """Consume a stream fragment, preserving incomplete commands/data runs.
@@ -38,6 +39,7 @@ class ST7541:
             raise TypeError("LCD input must be bytes")
         if data:
             self.version += 1
+            self._state_cache = None
         for value in data:
             if self.remaining:
                 address = self.page * 256 + self.column
@@ -127,33 +129,40 @@ class ST7541:
         self.parameters[command] = value
 
     def state(self) -> dict:
+        # Reuse the projection between stream fragments; callers own their snapshots.
+        if self._state_cache is None:
+            self._state_cache = self._render_state()
+        return {**self._state_cache, "pixels": self._state_cache["pixels"].copy(),
+                "known": self._state_cache["known"].copy(),
+                "palette": self._state_cache["palette"].copy()}
+
+    def _render_state(self) -> dict:
         """Return nominal 2-bit output pixels and their evidence mask.
 
         Pixel codes are white/light/dark/black (0..3), not measured luminance.
         Unknown pixels have placeholder value zero and known=False. Consumers
         must preserve that distinction instead of claiming an initialized LCD.
         """
-        pixels = [0] * (self.WIDTH * self.HEIGHT)
-        known = [False] * len(pixels)
         visible = self.display_on and not self.sleeping
-        for y in range(self.HEIGHT):
-            com = 127 - y if self.com_reverse else y
-            row = (com + self.start_line) & 127
-            page = (row // 8) * 256
-            bit = row & 7
-            for x in range(self.WIDTH):
-                index = y * 128 + x
-                segment = 127 - x if self.segment_zero_on_right else x
-                column = 127 - segment if self.adc_reverse else segment
-                address = page + column * 2
-                valid = self.written[address] and self.written[address + 1]
-                known[index] = bool(valid or not visible or self.entire_on)
-                if visible and self.entire_on:
-                    pixels[index] = 3
-                elif visible and valid:
-                    value = (((self.ram[address] >> bit) & 1) << 1
-                             | ((self.ram[address + 1] >> bit) & 1))
-                    pixels[index] = 3 - value if self.reverse else value
+        pixels = [3 if visible and self.entire_on else 0] * (self.WIDTH * self.HEIGHT)
+        known = [not visible or self.entire_on] * len(pixels)
+        if visible and not self.entire_on:
+            mirrored = self.segment_zero_on_right != self.adc_reverse
+            for y in range(self.HEIGHT):
+                com = 127 - y if self.com_reverse else y
+                row = (com + self.start_line) & 127
+                page = (row // 8) * 256
+                bit = row & 7
+                for x in range(self.WIDTH):
+                    index = y * 128 + x
+                    column = 127 - x if mirrored else x
+                    address = page + column * 2
+                    valid = self.written[address] and self.written[address + 1]
+                    known[index] = bool(valid)
+                    if valid:
+                        value = (((self.ram[address] >> bit) & 1) << 1
+                                 | ((self.ram[address + 1] >> bit) & 1))
+                        pixels[index] = 3 - value if self.reverse else value
         return {
             "width": self.WIDTH, "height": self.HEIGHT, "pixels": pixels,
             "display_on": visible, "error": self.error, "version": self.version,

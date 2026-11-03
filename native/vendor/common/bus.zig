@@ -55,6 +55,8 @@ pub fn Bus(comptime cfg: Config) type {
 
         gpa: std.mem.Allocator,
         map: []const Range,
+        // The BC5's complete 16-bit data map fits in 64 KiB; byte buses keep range lookup.
+        kinds: [if (Unit == u16) 65536 else 0]Kind = @splat(.unclassified),
         backing: []const Backing(Unit),
         tape: ?*Tape = null,
         dev: ?Device = null,
@@ -74,7 +76,14 @@ pub fn Bus(comptime cfg: Config) type {
                 if (b.mem.len == 0 or b.base + (b.mem.len - 1) < b.base) return error.BadMap;
                 if (i > 0 and backing[i - 1].base + backing[i - 1].mem.len > b.base) return error.BadMap;
             }
-            return .{ .gpa = gpa, .map = map, .backing = backing };
+            var self = Self{ .gpa = gpa, .map = map, .backing = backing };
+            for (map) |r| {
+                if (r.lo < self.kinds.len) {
+                    const end = @min(@as(u64, r.hi) + 1, self.kinds.len);
+                    @memset(self.kinds[r.lo..@intCast(end)], r.kind);
+                }
+            }
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
@@ -88,8 +97,8 @@ pub fn Bus(comptime cfg: Config) type {
             self.fuel = fuel;
         }
 
-        // shortcut: binary search per access, no page cache; add one if the emulators profile it hot.
         pub fn kindOf(self: *const Self, addr: u32) Kind {
+            if (addr < self.kinds.len) return self.kinds[addr];
             var lo: usize = 0;
             var hi: usize = self.map.len;
             while (lo < hi) {
@@ -289,6 +298,31 @@ test "bad maps are rejected" {
     try testing.expectError(error.BadMap, testBus16(&data, &overlap));
     const unsorted = [_]Range{ .{ .lo = 8, .hi = 9, .kind = .ram }, .{ .lo = 0, .hi = 1, .kind = .rom } };
     try testing.expectError(error.BadMap, testBus16(&data, &unsorted));
+}
+
+test "16-bit classification agrees with ranges including gaps and wider addresses" {
+    var data: [16]u16 = @splat(0);
+    const map = [_]Range{
+        .{ .lo = 1, .hi = 3, .kind = .mmio },
+        .{ .lo = 0x100, .hi = 0x3FFF, .kind = .rom },
+        .{ .lo = 0xA000, .hi = 0xFD04, .kind = .ram },
+        .{ .lo = 0xFD05, .hi = 0xFD05, .kind = .mmio },
+        .{ .lo = 0xFFF0, .hi = 0xFFFFFFFF, .kind = .scratch },
+    };
+    var b = try testBus16(&data, &map);
+    defer b.deinit();
+    for (0..65536) |addr| {
+        var expected: Kind = .unclassified;
+        for (map) |r| {
+            if (addr >= r.lo and addr <= r.hi) {
+                expected = r.kind;
+                break;
+            }
+        }
+        try testing.expectEqual(expected, b.kindOf(@intCast(addr)));
+    }
+    try testing.expectEqual(Kind.scratch, b.kindOf(0x10000));
+    try testing.expectEqual(Kind.scratch, b.kindOf(0xFFFFFFFF));
 }
 
 test "strict log keeps order; ram and scratch are not logged; mmio reads come from the tape" {
