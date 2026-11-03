@@ -19,18 +19,25 @@ EXTREME = os.environ.get("IRIDIUM_TEST_9575_FIRMWARE")
 
 
 def exchange(image: str, firmware: bytes, commands: list[dict | str], model: str = "9555") -> list[dict]:
+    expanded, responses = [], []
+    for command in commands:
+        # Full IRQ startup can exceed one native request's 10m instruction limit.
+        expanded.extend([{"op": "idle"}] * 3 if isinstance(command, dict) and command.get("op") == "boot_idle"
+                        else [command])
+        responses.append(len(expanded))
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp) / "test.bin"
         path.write_bytes(firmware)
         result = subprocess.run(
             [str(ENGINE), "--image", image, "--firmware", str(path), "--model", model],
-            input="".join((command if isinstance(command, str) else json.dumps(command)) + "\n" for command in commands),
+            input="".join((command if isinstance(command, str) else json.dumps(command)) + "\n" for command in expanded),
             capture_output=True,
             text=True,
             timeout=60,
             check=True,
         )
-        return [json.loads(line) for line in result.stdout.splitlines()]
+        states = [json.loads(line) for line in result.stdout.splitlines()]
+        return [states[0], *(states[index] for index in responses)]
 
 
 def avr_loop() -> bytes:
@@ -39,6 +46,151 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_complete_avr_flash_and_boot_fuses_use_model_specific_bounds(self):
+        for model, size, boot in (("9555", 0x4000, 0x1C00), ("9575", 0x20000, 0xF000)):
+            with self.subTest(model=model):
+                firmware = bytearray(b"\xff" * size)
+                firmware[:2] = b"\xff\xcf"
+                firmware[-2:] = b"\x12\x34"
+                states = exchange("avr", firmware, [
+                    {"op": "program_read", "address": size - 2, "count": 2},
+                    {"op": "program_read", "address": size, "count": 1},
+                    {"op": "fuses", "low": 0x77, "high": 0x98, "extended": 0xFE, "lock": 0xFF},
+                    {"op": "reset"}, {"op": "fuses"},
+                    {"op": "fuses", "low": 0x77}, {"op": "fuses"},
+                ], model=model)
+                self.assertEqual(states[1]["values"], [0x12, 0x34])
+                self.assertEqual(states[2]["error"], "BadMemoryRange")
+                self.assertEqual(states[3]["boot_start"], boot)
+                self.assertEqual(states[3]["reset_vector"], boot)
+                self.assertEqual(states[4]["program_pc"], boot)
+                self.assertEqual(states[5]["fuses"]["high"], 0x98)
+                self.assertEqual(states[6]["error"], "MissingField")
+                self.assertEqual(states[7], states[5])
+
+    def test_strict_bc5_rejects_latch_access_and_survives_reset(self):
+        for model, size in (("9555", 0x310FBA), ("9575", 0x36BB22)):
+            with self.subTest(model=model):
+                firmware = bytearray(size)
+                # ld AL,#1; st AL,@0xFF91; rts.
+                firmware[0x100:0x106] = b"\x14\x01\x25\x91\xe2\x00"
+                states = exchange("bc5", firmware, [
+                    {"op": "hardware", "strict": True},
+                    {"op": "call", "entry": 0x100, "steps": 10},
+                    {"op": "hardware", "strict": False},
+                    {"op": "run", "steps": 10}, {"op": "reset"},
+                    {"op": "trace", "enabled": True},
+                    {"op": "call", "entry": 0x100, "steps": 10}, {"op": "trace"},
+                    {"op": "hardware", "strict": True}, {"op": "reset"},
+                ], model=model)
+                self.assertEqual(states[2]["model_error"], {
+                    "address": 0xFF91, "operation": "write", "reason": "UnmodeledRegister"})
+                self.assertEqual(states[4]["steps"], states[2]["steps"])
+                self.assertTrue(states[7]["last_call"]["returned"])
+                self.assertEqual(states[8]["accesses"], [
+                    {"addr": 0xFF91, "bits": 16, "write": True, "value": 1}])
+                self.assertTrue(states[10]["hardware_strict"])
+                self.assertIsNone(states[10]["model_error"])
+
+    def test_strict_avr_rejects_open_bus_and_protocol_errors_are_atomic(self):
+        firmware = b"".join(word.to_bytes(2, "little") for word in (0x9100, 0xF0, 0xCFFF))
+        for model, size in (("9555", 8678), ("9575", 14296)):
+            with self.subTest(model=model):
+                states = exchange("avr", firmware.ljust(size, b"\xff"), [
+                    {"op": "hardware", "strict": "yes"},
+                    {"op": "hardware", "strict": True},
+                    {"op": "run", "steps": 10}, {"op": "reset"},
+                    {"op": "run", "steps": 10},
+                ], model=model)
+                self.assertEqual(states[1]["error"], "ExpectedBoolean")
+                self.assertEqual(states[3]["model_error"], {
+                    "address": 0xF0, "operation": "read", "reason": "UnmodeledRegister"})
+                self.assertTrue(states[4]["hardware_strict"])
+                self.assertEqual(states[5]["model_error"], states[3]["model_error"])
+
+    def test_trace_is_ordered_bounded_and_reports_capture_loss(self):
+        # Read PINB repeatedly. Every iteration has one MMIO read.
+        words = (0x9100, 0x23, 0xCFFD)
+        firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(8678, b"\xff")
+        states = exchange("avr", firmware, [
+            {"op": "trace", "enabled": True}, {"op": "pins", "port": 1, "value": 0xA5},
+            {"op": "run", "steps": 10000}, {"op": "trace"}, {"op": "trace"},
+            {"op": "reset"}, {"op": "trace"},
+        ])
+        trace = states[4]
+        self.assertEqual(len(trace["accesses"]), 4096)
+        self.assertEqual(trace["dropped"], 5000 - 4096)
+        self.assertTrue(all(access == {"addr": 0x23, "bits": 8, "write": False, "value": 0xA5}
+                            for access in trace["accesses"]))
+        self.assertEqual(states[5]["accesses"], [])
+        self.assertEqual(states[5]["dropped"], trace["dropped"])
+        self.assertEqual(states[7], {"enabled": True, "accesses": [], "dropped": 0})
+
+    def test_adc_stimulus_reaches_guest_conversion_on_both_models(self):
+        for model, size, channel in (("9555", 8678, 7), ("9575", 14296, 15)):
+            with self.subTest(model=model):
+                # Select ADC7/15, start a conversion, wait, then read the result.
+                words = (0xE007, 0x9300, 0x7C, 0xE008 if channel == 15 else 0xE000,
+                         0x9300, 0x7B, 0xEC00, 0x9300, 0x7A,
+                         *(0x0000 for _ in range(100)), 0x9110, 0x78, 0x9120, 0x79, 0xCFFF)
+                firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                states = exchange("avr", firmware, [
+                    {"op": "adc", "channel": channel, "value": 0x2AB},
+                    {"op": "adc", "channel": channel, "value": 1024},
+                    {"op": "run", "steps": 150},
+                    {"op": "adc", "channel": channel + 1, "value": 0},
+                ], model=model)
+                self.assertEqual(states[2]["error"], "IntegerOutOfRange")
+                self.assertIsNone(states[3]["halt"])
+                self.assertEqual(states[3]["registers"][17:19], [0xAB, 2])
+                self.assertIn(states[4]["error"], ("BadChannel", "IntegerOutOfRange"))
+
+    def test_sparc_irq_stimulus_is_validated_and_reset_deasserts_it(self):
+        firmware = bytes(0x260760)
+        states = exchange("trx", firmware, [
+            {"op": "irq", "level": 15}, {"op": "irq", "level": 16},
+            {"op": "state"}, {"op": "irq", "level": 0},
+            {"op": "irq", "level": 7}, {"op": "reset"},
+        ])
+        self.assertEqual(states[1]["irq_level"], 15)
+        self.assertEqual(states[2]["error"], "IntegerOutOfRange")
+        self.assertEqual(states[3]["irq_level"], 15)
+        self.assertEqual(states[4]["irq_level"], 0)
+        self.assertEqual(states[6]["irq_level"], 0)
+
+    def test_uart_batch_validation_precedes_input_and_output_mutation(self):
+        # Enable TX, transmit one byte, then wait for its completion.
+        words = (0xE008, 0x9300, 0xC1, 0xE401, 0x9300, 0xC6, 0xCFFF)
+        firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(8678, b"\xff")
+        states = exchange("avr", firmware, [
+            {"op": "run", "steps": 1000},
+            {"op": "uart_io", "port": 0, "rx": [1, -1]},
+            {"op": "uart_io", "port": 0, "rx": [1] * 64},
+            {"op": "uart_io", "port": 0},
+        ])
+        self.assertEqual(states[2]["error"], "IntegerOutOfRange")
+        self.assertEqual(states[3], {"accepted": 63, "values": [65], "dropped": 0})
+        self.assertEqual(states[4], {"accepted": 0, "values": [], "dropped": 0})
+
+    def test_avr_additional_stimuli_validate_without_advancing_guest_instructions(self):
+        states = exchange("avr", avr_loop(), [
+            {"op": "comparator", "positive": 900, "negative": 200, "bandgap": 350},
+            {"op": "comparator", "positive": 900, "negative": 1024},
+            {"op": "async_clock", "ticks": 10},
+            {"op": "async_clock", "ticks": 10_000_001},
+            {"op": "twi", "action": "address", "address": 128, "read": False},
+            {"op": "twi", "action": "reply", "reply": "invented"},
+            {"op": "twi", "action": "address", "address": 20, "read": False},
+            {"op": "twi", "action": "events"}, {"op": "state"},
+        ])
+        self.assertEqual(states[2]["error"], "IntegerOutOfRange")
+        self.assertEqual(states[4]["error"], "StepLimit")
+        self.assertEqual(states[5]["error"], "IntegerOutOfRange")
+        self.assertEqual(states[6]["error"], "BadTwiReply")
+        self.assertEqual(states[7], {"accepted": False})
+        self.assertEqual(states[8], {"events": [], "dropped": 0})
+        self.assertEqual(states[9]["steps"], 0)
+
     def test_extreme_memory_map_and_additional_ports(self):
         firmware = b"\xff\xcf" + b"\xff" * (14296 - 2)
         states = exchange("avr", firmware, [
@@ -224,9 +376,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(states[3]["halt"])
         self.assertEqual(states[4]["values"], [0x94A1, 0x1234])
         self.assertEqual(states[6]["values"], [0, 0])
-        other = exchange("avr", avr_loop(), [{"op": "warm_reset"}, {"op": "state"}])
-        self.assertEqual(other[1]["error"], "Bc5Only")
-        self.assertEqual(other[2]["steps"], 0)
+        other = exchange("avr", avr_loop(), [
+            {"op": "write", "address": 0x110, "values": [0xA5]},
+            {"op": "run", "steps": 5}, {"op": "warm_reset"},
+            {"op": "read", "address": 0x110, "count": 1},
+            {"op": "reset"}, {"op": "read", "address": 0x110, "count": 1},
+        ])
+        self.assertIsNone(other[3]["halt"])
+        self.assertEqual(other[3]["steps"], 0)
+        self.assertEqual(other[4]["values"], [0xA5])
+        self.assertEqual(other[6]["values"], [0])
 
     def test_bc5_call_stack_arguments_do_not_overwrite_paused_stack(self):
         firmware = bytearray(0x310FBA)
@@ -280,15 +439,15 @@ class OriginalFirmwareTests(unittest.TestCase):
     def test_original_factory_defaults_survive_warm_reset_and_pass_startup_gate(self):
         firmware = (Path(ORIGINALS) / "bc5_main.bin").read_bytes()
         states = exchange("bc5", firmware, [
-            {"op": "idle"},
+            {"op": "boot_idle"},
             {"op": "call", "entry": 0x6365E, "steps": 10_000_000},
             {"op": "call", "entry": 0x8CC8C, "steps": 10_000_000},
             {"op": "warm_reset"},
             # Application initialization after retained factory settings exceeds one run budget.
-            {"op": "idle"}, {"op": "idle"},
+            {"op": "boot_idle"}, {"op": "boot_idle"},
             {"op": "call", "entry": 0x3AF72, "steps": 100_000},
             {"op": "call", "entry": 0xBB06A, "steps": 100_000},
-            {"op": "reset"}, {"op": "idle"},
+            {"op": "reset"}, {"op": "boot_idle"},
             {"op": "call", "entry": 0x3AF72, "steps": 100_000},
             {"op": "call", "entry": 0xBB06A, "steps": 100_000},
         ])
@@ -305,7 +464,7 @@ class OriginalFirmwareTests(unittest.TestCase):
     def test_explicit_original_display_initialization_emits_known_command_stream(self):
         firmware = (Path(ORIGINALS) / "bc5_main.bin").read_bytes()
         states = exchange("bc5", firmware, [
-            {"op": "idle", "steps": 10_000_000},
+            {"op": "boot_idle"},
             {"op": "call", "entry": 0x6365E, "steps": 10_000_000},
         ])
         boot, probe = states[-2:]
@@ -324,35 +483,34 @@ class OriginalFirmwareTests(unittest.TestCase):
 
     def test_idle_advances_before_stopping_at_safe_scheduler_boundary(self):
         firmware = (Path(ORIGINALS) / "bc5_main.bin").read_bytes()
-        states = exchange("bc5", firmware, [{"op": "idle"}, {"op": "idle"}])
+        states = exchange("bc5", firmware, [{"op": "boot_idle"}, {"op": "boot_idle"}])
         self.assertTrue(states[1]["at_idle"])
         self.assertTrue(states[2]["at_idle"])
         self.assertGreater(states[2]["steps"], states[1]["steps"])
 
-    def test_explicit_ui_startup_delivers_original_key_event_and_display_bytes(self):
-        firmware = (Path(ORIGINALS) / "bc5_main.bin").read_bytes()
-        states = exchange("bc5", firmware, [
-            {"op": "idle"},
-            {"op": "call", "entry": 0x6365E, "steps": 10_000_000},
-            {"op": "call", "entry": 0x8CC5E, "steps": 10_000_000},
-            {"op": "idle"},
-            {"op": "call", "entry": 0x67F04, "al": 0x96, "ah": 1, "steps": 1_000_000},
-            {"op": "idle"},
-            {"op": "read", "address": 0xF743, "count": 1},
-            {"op": "run", "steps": 2_000_000},
-        ])
-        self.assertEqual(states[-2]["values"], [0x96])
-        display = states[-1]
-        self.assertIsNone(display["halt"])
-        self.assertIsNone(display["model_error"])
-        self.assertGreater(len(display["lcd_bytes"]), 4096)
-        self.assertEqual(display["lcd_dropped"], 0)
-        self.assertEqual(set(display["lcd_bytes"][:3]), {0xB0, 0x10, 0})
-        self.assertEqual(display["lcd_bytes"][3:5], [0xE8, 0x7F])
+    def test_hardware_startup_delivers_matrix_events_and_original_display(self):
+        import sys
+        sys.path.insert(0, str(ROOT))
+        from iridium.firmware import load_firmware
+        from iridium.session import Session
+        images = [item for item in load_firmware(Path(ORIGINALS)) if item.image in ("bc5", "avr")]
+        with Session(ENGINE, images) as session:
+            session.control("initialize_ui")
+            self.assertTrue(session.key("soft_left", True)["delivered"])
+            self.assertEqual(session.engines["bc5"].request("read", address=0xF704, count=1)["values"], [0x96])
+            self.assertTrue(session.key("soft_left", False)["delivered"])
+            state = session.state()
+            bc5 = session.engines["bc5"].state
+            self.assertIsNone(bc5["halt"])
+            self.assertIsNone(bc5["model_error"])
+            self.assertEqual(bc5["lcd_dropped"], 0)
+            self.assertEqual(state["lcd"]["known_pixels"], 16384)
+            self.assertIsNone(state["lcd"]["error"])
+            self.assertGreater(state["spi_link"]["transferred"], 0)
 
     def test_bc5_original_and_crc_stripped_reach_same_idle(self):
         original = (Path(ORIGINALS) / "bc5_main.bin").read_bytes()
-        states = [exchange("bc5", data, [{"op": "run", "steps": 7_000_000}])[-1] for data in (original, original[:-4])]
+        states = [exchange("bc5", data, [{"op": "boot_idle"}])[-1] for data in (original, original[:-4])]
         for state in states:
             self.assertTrue(state["milestones"]["main"])
             self.assertTrue(state["milestones"]["scheduler"])
@@ -383,13 +541,13 @@ class ExtremeFirmwareTests(unittest.TestCase):
     def test_original_extreme_factory_defaults_and_key_handler(self):
         firmware = (Path(EXTREME) / "bc5_main.bin").read_bytes()
         states = exchange("bc5", firmware, [
-            {"op": "idle"},
+            {"op": "boot_idle"},
             {"op": "call", "entry": 0x6365E, "steps": 10_000_000},
             {"op": "call", "entry": 0x93788, "steps": 10_000_000},
-            {"op": "warm_reset"}, {"op": "idle"}, {"op": "idle"},
+            {"op": "warm_reset"}, {"op": "boot_idle"}, {"op": "boot_idle"},
             {"op": "call", "entry": 0x93788, "steps": 10_000_000},
             {"op": "call", "entry": 0x9375A, "steps": 10_000_000},
-            {"op": "idle"}, {"op": "read", "address": 0xF70E, "count": 2},
+            {"op": "boot_idle"}, {"op": "read", "address": 0xF70E, "count": 2},
         ], model="9575")
         self.assertTrue(states[1]["at_idle"])
         self.assertEqual(len(states[2]["lcd_bytes"]), 43)
@@ -413,6 +571,298 @@ class ExtremeFirmwareTests(unittest.TestCase):
         altered = exchange("avr", b"\xff\xff" + firmware[2:], [{"op": "run", "steps": 100_000}], model="9575")[-1]
         self.assertIn("invalid", altered["halt"])
         self.assertFalse(altered["milestones"]["main"])
+
+
+@unittest.skipUnless(ORIGINALS or EXTREME, "Set original firmware directories for BC5 hardware checks")
+class OriginalBc5HardwareTests(unittest.TestCase):
+    def profiles(self):
+        for model, directory, setup, board in (
+            ("9555", ORIGINALS, 0x8CC8C, 0xF7B5),
+            ("9575", EXTREME, 0x93788, 0xF7D6),
+        ):
+            if directory:
+                yield model, Path(directory), setup, board
+
+    def worker(self, model, directory, image="bc5"):
+        # This file also runs directly from native/, outside Python's package search root.
+        import sys
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from iridium.engine import Engine
+        engine = Engine(ENGINE, image, directory / ("avr.bin" if image == "avr" else "bc5_main.bin"), model=model)
+        self.addCleanup(engine.close)
+        return engine
+
+    def reach_idle(self, engine):
+        for _ in range(3):
+            state = engine.request("idle")
+            self.assertIsNone(state["halt"])
+            if state["at_idle"]:
+                return state
+        self.fail("Original BC5 did not reach scheduler idle")
+
+    def return_from_irq(self, engine):
+        for _ in range(400):
+            state = engine.request("state")
+            self.assertIsNone(state["halt"])
+            if state["pc"] == 0x12E:
+                return engine.request("run", steps=1)
+            engine.request("run", steps=1)
+        self.fail("Original IRQ wrapper did not reach RTI")
+
+    def test_original_avr_power_selectors_read_the_model_specific_physical_inputs(self):
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model):
+                engine = self.worker(model, directory, "avr")
+                engine.request("run", steps=100000)
+                signals = ((2, 0, 0x20), (2, 1, 0x22), (3, 4, 0x38)) if model == "9555" else (
+                    (8, 3, 0x86), (8, 4, 0x88), (8, 5, 0x8A))
+                for selector, (port, bit, reply_selector) in zip((0x20, 0x22, 0x38), signals):
+                    for level in (0, 1):
+                        engine.request("pins", port=port, value=level << bit)
+                        received = []
+                        # Execute the original register4 SPI GPIO-read command.
+                        for value in (0x80, selector, 0x11, 0, 0, 0, 0):
+                            received.append(engine.request("spi", value=value)["value"])
+                            self.assertIsNone(engine.request("run", steps=1000)["halt"])
+                        self.assertEqual(received[4:], [0x80, reply_selector | level, 0])
+
+    def test_original_irq_wrapper_preserves_register_banks_and_scratch_at_different_depths(self):
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model):
+                engine = self.worker(model, directory)
+                engine.request("hardware", enabled=True)
+                engine.request("reset")
+                self.reach_idle(engine)
+                for entry, priority in ((0x6590, 3), (0x65E6, 1)):
+                    state = engine.request("call", entry=entry, al=1, ah=priority, steps=10000)
+                    self.assertTrue(state["last_call"]["returned"])
+                self.reach_idle(engine)
+                checked = 0
+                for offset in range(24):
+                    if offset:
+                        engine.request("run", steps=1031 * offset)
+                    before = engine.request("state")
+                    engine.request("irq", source=1)  # Original IRQ1 handler is a bare RTS.
+                    state = engine.request("run", steps=1)
+                    if state["pc"] != 8:  # Guest critical sections defer delivery.
+                        continue
+                    after = self.return_from_irq(engine)
+                    self.assertEqual(after["pc"], before["pc"])
+                    self.assertEqual(after["registers"], before["registers"])
+                    checked += 1
+                self.assertGreaterEqual(checked, 5)
+
+    def test_original_nested_irq_restores_outer_handler_and_interrupted_task(self):
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model):
+                engine = self.worker(model, directory)
+                engine.request("hardware", enabled=True)
+                engine.request("reset")
+                self.reach_idle(engine)
+                for source, priority in ((0, 2), (1, 3)):
+                    engine.request("call", entry=0x6590, al=source, ah=priority, steps=10000)
+                    engine.request("call", entry=0x65E6, al=source, ah=1, steps=10000)
+                task = self.reach_idle(engine)
+                engine.request("irq", source=0)
+                for _ in range(100):
+                    outer = engine.request("run", steps=1)
+                    self.assertIsNone(outer["halt"])
+                    if outer["pc"] == 0x66:  # Original wrapper has selected and enabled the user bank.
+                        break
+                else:
+                    self.fail("Outer IRQ did not enable its handler bank")
+                engine.request("irq", source=1)
+                self.assertEqual(engine.request("run", steps=1)["pc"], 8)
+                after = self.return_from_irq(engine)
+                self.assertEqual(after["pc"], outer["pc"])
+                self.assertEqual(after["registers"], outer["registers"])
+                for _ in range(1000):
+                    after = engine.request("run", steps=1)
+                    self.assertIsNone(after["halt"])
+                    if after["pc"] == task["pc"]:
+                        break
+                else:
+                    self.fail("Outer IRQ did not resume the interrupted task")
+                self.assertEqual(after["registers"], task["registers"])
+
+    def test_original_warm_boot_completes_adc_board_detection_without_application_probe(self):
+        for model, directory, setup, board_address in self.profiles():
+            with self.subTest(model=model):
+                engine = self.worker(model, directory)
+                engine.request("hardware", enabled=False)
+                engine.request("reset")
+                self.reach_idle(engine)
+                engine.request("call", entry=0x6365E, steps=10_000_000)
+                provisioned = engine.request("call", entry=setup, steps=10_000_000)
+                self.assertEqual(provisioned["halt"], "firmware-reset-requested")
+                # Both original callbacks map 8-bit154..168 to GRev; choose an interior test voltage.
+                engine.request("adc", channel=0, value=640)
+                engine.request("hardware", enabled=True)
+                engine.request("warm_reset")
+                lcd_bytes = 0
+                for _ in range(3):
+                    state = engine.request("run", steps=10_000_000)
+                    self.assertIsNone(state["halt"])
+                    self.assertIsNone(state["model_error"])
+                    self.assertIsNone(state["last_call"])
+                    lcd_bytes += len(state["lcd_bytes"])
+                board = engine.request("read", address=board_address, count=1)["values"][0]
+                self.assertGreater(board, 0)
+                revision, _, label = engine.request("read", address=board, count=3)["values"]
+                self.assertEqual(revision, 11)
+                self.assertEqual(engine.request("read", address=label, count=4)["values"], list(map(ord, "GRev")))
+                self.assertGreater(lcd_bytes, 43)
+
+    def test_original_debugger_ui_initialization_keeps_probe_stack_below_irq_frame(self):
+        # Function probes and hardware interrupts must use separate supervisor-stack space.
+        import sys
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from iridium.engine import Engine
+        from iridium.firmware import load_firmware
+        from iridium.session import Session
+
+        def worker(executable, image, firmware, **arguments):
+            engine = Engine(executable, image, firmware, **arguments)
+            if image == "bc5":
+                engine.request("hardware", enabled=True)
+                engine.request("reset")
+                engine.request("adc", channel=0, value=640)
+            return engine
+
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model), Session(
+                ENGINE, [image for image in load_firmware(directory) if image.image in ("bc5", "avr")],
+                engine_factory=worker, modem_image="none"
+            ) as session:
+                session.control("initialize_ui")
+                self.assertTrue(session.ui_initialized)
+                self.assertIsNone(session.engines["bc5"].request("state")["halt"])
+
+    def test_original_matrix_contacts_deliver_press_and_release_through_gpio_irq_and_debounce(self):
+        import sys
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from iridium.firmware import load_firmware
+        from iridium.session import Session
+
+        codes = ((0x96, 0x82, 0x97, 0x8D, 0x8C),
+                 (0x65, 0x66, 0x67, 0x83, 0x2A),
+                 (0x68, 0x69, 0x6A, 0xA1, 0x2B),
+                 (0x6B, 0x6C, 0x6D, 0xAA, 0x2C),
+                 (0x79, 0x64, 0x78, 0xA0, 0x2D))
+
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model), Session(
+                ENGINE, [image for image in load_firmware(directory) if image.image in ("bc5", "avr")],
+                modem_image="none"
+            ) as session:
+                session.control("initialize_ui")
+                engine = session.engines["bc5"]
+                last_key = 0xF756 if model == "9575" else 0xF743
+                handler = 0x71492 if model == "9575" else 0x713AE
+                expected_callback = (handler // 2 + 0x800C)
+                self.assertEqual(engine.request("read", address=session.profile.key_callback, count=2)["values"],
+                                 [expected_callback >> 16, expected_callback & 0xFFFF])
+                state = engine.request("state")
+                self.assertEqual(state["gpio"]["key_rows"], 0x7C0,
+                                 "Original initialization must leave the electrical scanner armed")
+                probe_before = state["last_call"]
+                scanner = 0xF716 if model == "9575" else 0xF703
+                for row in codes:
+                    for code in row:
+                        with self.subTest(model=model, code=hex(code)):
+                            try:
+                                state = engine.request("key", code=code, pressed=True)
+                                self.assertNotEqual(state["gpio"]["key_columns"], 0)
+                                self.assertNotEqual(state["gpio"]["irq_pending"] & 0x8000, 0)
+                                for _ in range(10):
+                                    session.control("step", steps=50000)
+                                    state = engine.state
+                                    self.assertIsNone(state["halt"])
+                                    self.assertIsNone(state["model_error"])
+                                    if engine.request("read", address=scanner, count=2)["values"] == [1, code]:
+                                        break
+                                else:
+                                    self.fail(f"Original GPIO IRQ/debounce did not scan key {code:#x}")
+                                # The ordinary first soft key also reaches the actual UI callback.
+                                # Later keys may select global actions or close the current screen.
+                                if code == 0x96:
+                                    for _ in range(10):
+                                        if engine.request("read", address=last_key, count=1)["values"] == [code]:
+                                            break
+                                        session.control("step", steps=50000)
+                                    else:
+                                        self.fail("Original UI callback did not receive the left soft key")
+                            finally:
+                                state = engine.request("key", code=code, pressed=False)
+                                self.assertEqual(state["gpio"]["key_contacts"], 0)
+                                for _ in range(10):
+                                    session.control("step", steps=50000)
+                                    state = engine.state
+                                    self.assertIsNone(state["halt"])
+                                    self.assertIsNone(state["model_error"])
+                                    if engine.request("read", address=scanner, count=1)["values"] == [0]:
+                                        break
+                                else:
+                                    self.fail(f"Original GPIO IRQ/debounce did not release key {code:#x}")
+                            if code == 0x96:
+                                for _ in range(10):
+                                    if engine.request("read", address=last_key, count=1)["values"] == [0]:
+                                        break
+                                    session.control("step", steps=50000)
+                                else:
+                                    self.fail("Original UI callback did not release the left soft key")
+                            self.assertEqual(state["last_call"], probe_before)
+
+    def test_unestablished_electrical_sos_contact_is_rejected_atomically_on_both_profiles(self):
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model):
+                engine = self.worker(model, directory)
+                from iridium.engine import EngineError
+                engine.request("key", code=0x96, pressed=True)
+                before = engine.request("state")
+                for pressed in (True, False):
+                    with self.assertRaisesRegex(EngineError, "UnknownKey"):
+                        engine.request("key", code=0xAB, pressed=pressed)
+                    after = engine.request("state")
+                    self.assertEqual(after["steps"], before["steps"])
+                    self.assertEqual(after["registers"], before["registers"])
+                    self.assertEqual(after["gpio"], before["gpio"])
+
+    def test_original_power_button_is_released_high_and_shutdown_requires_a_low_hold(self):
+        import sys
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from iridium.firmware import load_firmware
+        from iridium.session import Session
+
+        for model, directory, _, _ in self.profiles():
+            with self.subTest(model=model), Session(
+                ENGINE, [image for image in load_firmware(directory) if image.image in ("bc5", "avr")],
+                modem_image="none"
+            ) as session:
+                session.control("initialize_ui")
+                bc5, avr = session.engines["bc5"], session.engines["avr"]
+                port, bit = session.profile.power_pin
+                inputs = avr.request("pin_state")["inputs"][port]
+                self.assertNotEqual(inputs & (1 << bit), 0, "Released power button must be high")
+                power_pointer = 0xF72F if model == "9575" else 0xF71C
+                power = bc5.request("read", address=power_pointer, count=1)["values"][0]
+                ui_lock = 0xF74C if model == "9575" else 0xF739
+                session.control("step", steps=5_000_000)
+                self.assertIsNone(bc5.state["halt"])
+                self.assertEqual(bc5.request("read", address=power, count=1)["values"], [3])
+                self.assertEqual(bc5.request("read", address=ui_lock, count=1)["values"], [0])
+                try:
+                    avr.request("pins", port=port, value=inputs & ~(1 << bit))
+                    session.control("step", steps=5_000_000)
+                    self.assertIsNone(bc5.state["halt"])
+                    self.assertIn(bc5.request("read", address=power, count=1)["values"][0], (2, 8))
+                    self.assertEqual(bc5.request("read", address=ui_lock, count=1)["values"], [1])
+                finally:
+                    avr.request("pins", port=port, value=inputs)
 
 
 if __name__ == "__main__":

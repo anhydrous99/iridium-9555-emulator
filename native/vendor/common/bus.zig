@@ -64,6 +64,7 @@ pub fn Bus(comptime cfg: Config) type {
         log: std.ArrayList(Access) = .empty,
         fuel: u64 = std.math.maxInt(u64),
         stop: ?Stop = null,
+        strict_unclassified: bool = false,
         /// Host-side runs (fork-server child) set this to write the result and `_exit`.
         on_stop: ?*const fn (Stop) noreturn = null,
 
@@ -150,6 +151,10 @@ pub fn Bus(comptime cfg: Config) type {
             }
             self.fuel -= 1;
             const kind = self.kindOf(addr);
+            if (self.strict_unclassified and kind == .unclassified) {
+                self.halt(.{ .fault = addr });
+                return 0;
+            }
             switch (kind) {
                 .ram, .scratch => return self.mem(addr, bits, is_write, value),
                 .rom => {
@@ -393,6 +398,26 @@ test "rom write faults, fuel runs out" {
     try testing.expectEqual(@as(?Stop, null), b.stop);
     _ = b.read(0x0100, 16);
     try testing.expectEqual(Stop.fuel_exhausted, b.stop.?);
+}
+
+test "strict unclassified access faults before touching backing memory" {
+    var data: [0x10000]u16 = @splat(0);
+    const ranges = [_]Range{.{ .lo = 0xA000, .hi = 0xA0FF, .kind = .ram }};
+    var b = try testBus16(&data, &ranges);
+    defer b.deinit();
+    b.strict_unclassified = true;
+    b.write(0xA100, 16, 0xBEEF);
+    try testing.expectEqual(Stop{ .fault = 0xA100 }, b.stop.?);
+    try testing.expectEqual(@as(u16, 0), data[0xA100]);
+    b.resetRun(100);
+    b.write(0xA000, 16, 0xCAFE);
+    try testing.expectEqual(@as(u16, 0xCAFE), data[0xA000]);
+    _ = b.read(0xA100, 16);
+    try testing.expectEqual(Stop{ .fault = 0xA100 }, b.stop.?);
+    b.resetRun(100);
+    b.strict_unclassified = false;
+    b.write(0xA100, 16, 0xBEEF);
+    try testing.expectEqual(@as(u16, 0xBEEF), data[0xA100]);
 }
 
 test "wide accesses: BC5 u32 is two word accesses, high word first; SPARC is one BE access" {

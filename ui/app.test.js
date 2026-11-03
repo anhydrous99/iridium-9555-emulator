@@ -134,7 +134,7 @@ test("firmware handset metadata selects the Extreme identity and physical contro
   assert.equal(app.elements.get("phone-bottom-model").textContent, "9575");
   assert.match(app.elements.get("research-heading").textContent, /9575 EXTREME/);
   assert.match(app.elements.get("firmware-profile").textContent, /HL25003/);
-  assert.match(app.elements.get("fidelity-description").textContent, /partial Iridium 9575 Extreme/);
+  assert.match(app.elements.get("fidelity-description").textContent, /Firmware-derived Iridium 9575 Extreme/);
   assert.match(app.elements.get("firmware-input").attributes.get("aria-label"), /9575 Extreme/);
   assert.ok(app.elements.get("handset").classes.has("extreme"));
   assert.equal(app.elements.get("extreme-key-help").hidden, false);
@@ -480,7 +480,7 @@ test("live LCD follows changing firmware pixels and stays distinct from asset pr
   const canvas = app.elements.get("lcd");
   app.context.frame = liveState();
   app.run("drawDisplay(frame)");
-  assert.match(app.elements.get("display-mode").textContent, /Live original firmware LCD.*experimental/);
+  assert.match(app.elements.get("display-mode").textContent, /Live original firmware LCD.*emulated serial controller/);
   assert.equal(app.elements.get("display-orientation").hidden, false);
   assert.equal(app.elements.get("display-orientation").textContent, "9555 panel mapping · SEG127 left, COM0 top");
   assert.equal(canvas.draws, 1);
@@ -535,13 +535,15 @@ test("application initialization is explicit and the button respects loaded and 
   const button = app.elements.get("initialize-button");
   assert.equal(button.disabled, true, "No BC5 image is loaded");
   app.run("renderApplicationStatus({processors:[{image:'bc5'}],ui_initialized:false})");
+  assert.equal(button.disabled, true, "AVR firmware supplies the physical power endpoint");
+  app.run("renderApplicationStatus({processors:[{image:'bc5'},{image:'avr'}],ui_initialized:false})");
   assert.equal(button.disabled, false);
   assert.equal(app.calls.length, 0, "Rendering must not initialize firmware");
   await button.listeners.get("click")();
   assert.deepEqual(app.calls, [{ url: "/api/control", body: { action: "initialize_ui" } }]);
   app.run("renderApplicationStatus({processors:[{image:'bc5'}],ui_initialized:true})");
   assert.equal(button.disabled, true);
-  assert.match(app.elements.get("application-status").textContent, /EXPERIMENTAL/);
+  assert.match(app.elements.get("application-status").textContent, /POWERED ON/);
   await button.listeners.get("click")();
   assert.equal(app.calls.length, 1, "Already initialized application is not invoked again");
 });

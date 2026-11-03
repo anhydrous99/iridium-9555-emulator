@@ -4,8 +4,9 @@
 `iridium/profiles.py` records the two supported builds' layouts and software
 entry points; the loaded image selects the handset throughout the host and UI.
 `iridium/engine.py` owns a native worker and its bounded JSON-lines transport.
-`iridium/session.py` serializes debugger actions and keeps independent CPU state,
-input events and satellite scenarios. `iridium/server.py` exposes that session
+`iridium/session.py` serializes debugger actions, input events and satellite
+scenarios. `iridium/board.py` connects BC5 serial DMA to the executing AVR SPI
+slave and AVR USART0 to the selected modem's UART1. `iridium/server.py` exposes that session
 on all IPv4 interfaces by default (`--host 127.0.0.1` restricts access to loopback).
 `ui/` renders state without synthesizing firmware menus.
 While running it polls 50 ms after each completed response, with only one state
@@ -14,9 +15,10 @@ Paused sessions retain the slower 1,250 ms polling interval.
 
 `native/main.zig` adapts the original CPU/SoC implementations under
 `native/vendor/`. Each processor lives in a separate OS process because the
-inherited models use process-global state. This is not a synchronized board
-simulation. Instruction budgets are deterministic; they are not elapsed time
-on physical hardware. The scenario clock is also an explicitly simulated clock.
+inherited models use process-global state. The host schedules 4096-instruction
+quanta, reducing them to 128 while SPI transfers need service. This is a
+deterministic digital board schedule, not measured physical clock ratios.
+The scenario clock remains separate from the firmware transports.
 
 ## Input and execution boundaries
 
@@ -78,11 +80,14 @@ to 64 stack words before the paused CPU state is restored, including on a probe
 stack-guard failure. The registers are ordered AH, AL, X, Y, XH, UX, UY, flags;
 `stack_address` and `stack_count` identify the valid part of `stack_words`.
 
-BC5-only `warm_reset` resets CPU, device state and observation counters while
+BC5 `warm_reset` resets CPU, device state and observation counters while
 retaining RAM and emulated flash contents. Original reset code validates retained
 persistent-store records before clearing RAM. This is an explicit host operation;
 watchdog timing is not modeled. The ordinary `reset` also clears RAM and restores
 flash from the supplied firmware, returning the worker to a fresh experiment.
+AVR `warm_reset` retains program/EEPROM, fuses, SRAM and external input levels;
+its original reset code executes from the configured reset vector. A cold AVR
+reset restores the supplied program and clears the experiment's device state.
 
 The Python transport applies one 30-second deadline to sending a request and
 receiving its reply. Timeouts, disconnects, malformed replies and oversized replies
@@ -110,14 +115,17 @@ operation changes the original file. The AVR also exposes device stimuli:
 {"op":"spi","value":0}
 ```
 
-UART queues and SPI replies require intervening CPU execution. These interfaces
-are not yet wired to the BC5 or SPARC workers.
+UART queues and SPI replies require intervening CPU execution. The coupled board wires AVR SPI to BC5 and USART0 to the selected modem.
+`uart_io`, `pin_state`, `serial`, `adc`, `comparator`, `async_clock`, `twi`,
+`fuses` and `program_read` expose explicit device stimuli/observations; see the
+[inferred hardware protocol](inferred-hardware.md).
 Each AVR UART output capture holds 255 bytes. Overflow increments cumulative
 per-port `uart_tx_dropped` counts in processor state; `uart_tx` also returns the
 selected port's `dropped` count. Draining the queue preserves the counts, and
 reset clears them. The browser displays any capture loss in the AVR row.
 
-BC5 state includes `lcd_bytes`: low bytes observed at original sender `0x68E48`,
+BC5 state includes `lcd_bytes`: bytes transferred through the serial-controller
+model from the original TX MMU handle (`0xFE94`),
 with a bounded buffer and `lcd_dropped` counter. Observation does not skip its
 instructions. `iridium/lcd.py` decodes this stream using ST7541 command framing,
 tracks which DDRAM bytes have actually been written and exposes nominal logical
@@ -136,43 +144,35 @@ interruption in the middle of a firmware allocation transaction. It allows up to
 three consecutive ten-million-instruction requests to reach idle during a warm
 boot, stopping immediately if the worker reports a halt.
 
-Experimental `initialize_ui` pauses all host workers and follows the original
-application's persistent-store initialization path. The addresses below are for
-HT25003; HL25003 uses setup `0x93788`, power-on helper `0x6BED0`, graphics pointer
-`0xF72C` and key callback `0xF70E:0xF70F`, with the same graphics-init entry:
+`initialize_ui` requires BC5 and AVR images. It starts from a warm reset, reaches
+scheduler idle and invokes original device/factory setup only to provision the
+settings absent from the upgrade package. The original code writes its own
+persistent-store records. The host then warm resets with the active-low AVR
+power button released HIGH. Guest IRQs, ADC completion, GRev classification,
+application setup and power polling perform the rest of startup. No application
+start, charging-state or animation-completion callback is injected after reset.
+AIO0=640 is an explicit virtual GRev board-ID fixture.
 
-1. Reach scheduler idle, invoke original device initialization `0x6365E` if it
-   has not already run, then full application initialization `0x8CC8C`.
-2. On fresh flash, `0x8CC8C` executes the original factory-default writes and
-   requests a watchdog reset. Perform `warm_reset` and run to idle again; original
-   reset code validates the retained records and invokes device initialization.
-   Invoke full `0x8CC8C` again after this reset.
-3. Invoke the original power-on helper `0x6BE4C(AL=0)`, which advances the power
-   state and invokes the registered application-start callback. Then invoke
-   `0x6A092(AL=3)` to advance the charging/UI state, following the original
-   power-on branch. Check the installed key callback and resume the scheduler.
+The AVR executes every SPI command and produces the handshake/attention GPIO
+levels. The host services both processors during bounded probes; `last_call.pending`
+and `call_resume` preserve a live probe while an external peripheral needs CPU
+time. The original instruction budget and bus fuel remain bounded across all
+continuations. A second call, ordinary run/idle or debugger write is rejected
+while a probe is pending; reset cancels it.
 
-Calling the application-start callback directly left the charging state behind;
-a delayed charging-screen update then covered the animation after its third
-frame. The corrected sequence keeps the animation visible until its original
-completion callback. See [boot-animation evidence](boot-animation.md).
+Keys change the emulated 5×5 contacts. Guest row-latch writes and column reads
+feed GPIO IRQ15, debounce, scanning and the original key mapper. UI press/release
+requests include 150,000 instructions for contact settling; native `key` plus
+explicit `run` requests permit timing-sensitive tests. Power drives PC0 on 9555
+or PJ3 on 9575 LOW while pressed, including the original 500ms shutdown hold.
+The 9575 SOS wire is unestablished and retains the original software-input
+boundary. The convenience key, location screens and emergency countdown execute
+in guest code. No GPS coordinates or emergency-service responses are fabricated.
 
-The animation now advances automatically to the original home screen showing
-Searching for Iridium, Acquiring time, Menu and Help. A left soft-key event opens
-the original main menu. The host does not patch firmware instructions, write
-persistent-store keys directly or inject the animation-completion callback.
-This remains an explicit software startup scenario: the natural ADC-completion
-path into the application is unresolved. Initialization failure requires a reset
-before retrying, so partially initialized state is not initialized twice.
-
-After this scenario, mapped key events enter original `0x67F04` with key code
-in AL and transition 1 (down) or 4 (up) in AH. The scheduler dispatches the
-allocated event through the original callback. Before initialization or for the
-physical power control, the host records the event and reports non-delivery.
-The convenience key uses `0xAA` on both builds; the 9575's SOS key uses `0xAB`.
-The original location prompt, location screen and emergency countdown execute in
-the guest. No coordinates or emergency-service responses are invented by the host.
-See [control evidence](9575-controls.md) and [native model evidence](9575-native.md).
+The UI's initialized state clears when original firmware enters shutdown, so a
+new power-on experiment can warm boot retained settings. Failed initialization
+requires reset before retrying. See [inferred hardware](inferred-hardware.md)
+for the register contracts, assumptions and independent/original-image tests.
 
 ## HTTP API
 
@@ -198,9 +198,9 @@ Each page generates a unique ID and increasing sequence; each queued event
 captures `key_epoch` from state. The host compares sequences per client and key,
 including releases that arrive before their press. Only the first owner presses
 the guest key and only the last owner's release releases it. State, key, control
-and firmware responses expose `key_epoch`. Reset or loading BC5 advances the epoch,
-clears owners and cancels older requests; auxiliary image loads preserve keypad
-state. A page cancels queued events and local held sources when the epoch advances,
+and firmware responses expose `key_epoch`. Reset, loading BC5 or replacing AVR on
+a board with BC5 advances the epoch, clears owners and cancels older requests.
+Modem image loads preserve keypad state. A page cancels queued events and local held sources when the epoch advances,
 without retrying stale events. Navigation cancels unsent events and immediately
 sends keepalive releases with newer sequences and the submitted presses' epochs.
 Client IDs contain 1–64 ASCII letters, digits, underscores or hyphens; sequences
@@ -221,6 +221,9 @@ the same transition to be injected twice.
 
 `POST /api/firmware` accepts the raw file body with an `X-Filename` header. It
 validates and starts the replacement worker before disposing of the prior one.
+Replacing BC5 or restarting the board releases held electrical controls. Replacing the AVR with BC5 loaded warm resets
+the retained BC5, preserving writable flash and RAM while cancelling its old SPI
+DMA ownership and application display state. The next power-on starts a new board boot.
 Replacing BC5 with another handset's image closes all old processors and clears
 the old experiment; auxiliary images must match that handset. Identical modem
 payloads uploaded alone retain the current handset context.
@@ -237,6 +240,7 @@ ordering and error paths. Re-run original firmware to establish what progresses
 and record remaining unknowns. A host-generated successful response, hand-drawn
 firmware menu, or copied animation does not prove original handset behavior.
 
-The retained [hardware evidence](hardware-evidence.md) identifies the specific
-BlueCore startup and modem gaps. Firmware hashes and
+Current [inferred hardware](inferred-hardware.md) records the implemented
+contracts. The retained [hardware evidence](hardware-evidence.md) describes the
+earlier baseline. Firmware hashes and
 [upstream source hashes](../native/vendor/SOURCE.tsv) make the baseline reproducible.

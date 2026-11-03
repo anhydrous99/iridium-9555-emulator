@@ -1,5 +1,10 @@
 # HL25003 native execution evidence
 
+This records the initial HL25003 integration. Later IRQ/register-bank, ADC,
+keypad, serial-link and AVR peripheral implementations are documented in
+[current inferred hardware](inferred-hardware.md); the missing-device list
+below describes the earlier baseline.
+
 The 9575 Extreme profile executes the downloaded HL25003 instructions. Source
 identities and acquisition are recorded in [9575-firmware.md](9575-firmware.md).
 The native worker accepts `--model 9575`; the default remains `9555`.

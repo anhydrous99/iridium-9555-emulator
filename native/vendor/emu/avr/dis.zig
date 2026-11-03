@@ -15,6 +15,7 @@ pub fn format(w: *std.Io.Writer, i: dec.Insn) std.Io.Writer.Error!void {
         .invalid => try w.writeAll("<unknown>"),
         .nop, .ret, .reti, .sleep, .@"break", .wdr, .spm, .ijmp, .icall => try w.writeAll(@tagName(i.op)),
         .lpm_r0 => try w.writeAll("lpm"),
+        .elpm_r0 => try w.writeAll("elpm"),
         .add, .adc, .@"and", .eor => {
             const alias: ?[]const u8 = if (i.d != i.r) null else switch (i.op) {
                 .add => "lsl",
@@ -34,6 +35,8 @@ pub fn format(w: *std.Io.Writer, i: dec.Insn) std.Io.Writer.Error!void {
         .st_x, .st_x_inc, .st_x_dec, .st_y_inc, .st_y_dec, .st_z_inc, .st_z_dec => try w.print("st\t{s}, r{d}", .{ ptrMode(i.op), i.r }),
         .lpm => try w.print("lpm\tr{d}, Z", .{i.d}),
         .lpm_inc => try w.print("lpm\tr{d}, Z+", .{i.d}),
+        .elpm => try w.print("elpm\tr{d}, Z", .{i.d}),
+        .elpm_inc => try w.print("elpm\tr{d}, Z+", .{i.d}),
         .pop, .com, .neg, .swap, .inc, .asr, .lsr, .ror, .dec => try w.print("{s}\tr{d}", .{ @tagName(i.op), i.d }),
         .push => try w.print("push\tr{d}", .{i.r}),
         .bset => try w.writeAll(sreg_set[i.r]),

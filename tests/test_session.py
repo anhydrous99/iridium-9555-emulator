@@ -137,6 +137,51 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.key_epoch, epoch + 1)
         self.assertEqual(self.session.state()["processors"][0]["steps"], 0)
 
+    def test_strict_hardware_applies_before_execution_and_to_replacement_workers(self):
+        with Session(Path("unused"), [self.firmware], FakeEngine, strict_hardware=True) as session:
+            old = session.engines["avr"]
+            self.assertEqual(old.calls, [("hardware", {"strict": True})])
+            session.load(self.firmware)
+            self.assertTrue(old.closed)
+            self.assertEqual(session.engines["avr"].calls, [("hardware", {"strict": True})])
+            session.probe("avr", "adc", {"channel": 0, "value": 42})
+            session.probe("avr", "trace", {"enabled": True})
+            self.assertEqual(session.engines["avr"].calls[-2:], [
+                ("adc", {"channel": 0, "value": 42}), ("trace", {"enabled": True})])
+
+    def test_failed_strict_configuration_closes_new_worker_and_preserves_old_experiment(self):
+        old = self.session.engines["avr"]
+        replacement = FakeEngine(Path("unused"), "avr", self._firmware_file())
+        replacement.request = Mock(side_effect=EngineError("configuration failed"))
+        self.session.strict_hardware = True
+        self.session._engine_factory = Mock(return_value=replacement)
+        with self.assertRaisesRegex(EngineError, "configuration failed"):
+            self.session.load(self.firmware)
+        self.assertTrue(replacement.closed)
+        self.assertIs(self.session.engines["avr"], old)
+        self.assertFalse(old.closed)
+
+    def test_failed_input_release_closes_replacement_without_retiring_existing_processors(self):
+        self.session.load(parse_firmware(bytes(0x310FBA), "bc5_main.bin"))
+        primary, old_avr = self.session.engines["bc5"], self.session.engines["avr"]
+        primary.state["bc5_hardware"] = True
+        self.session.keys.add("1")
+        primary.request = Mock(side_effect=EngineError("input release failed"))
+        replacement = FakeEngine(Path("unused"), "avr", self._firmware_file())
+        self.session._engine_factory = Mock(return_value=replacement)
+        with self.assertRaisesRegex(EngineError, "input release failed"):
+            self.session.load(self.firmware)
+        self.assertTrue(replacement.closed)
+        self.assertIs(self.session.engines["avr"], old_avr)
+        self.assertIs(self.session.engines["bc5"], primary)
+        self.assertFalse(old_avr.closed)
+        self.assertFalse(primary.closed)
+
+    def _firmware_file(self):
+        path = Path(self.session._temporary.name) / "fixture.bin"
+        path.write_bytes(self.firmware.data)
+        return path
+
     def test_halted_firmware_not_silently_resumed(self):
         self.session.engines["avr"].state["halt"] = "illegal"
         self.session.control("step", 100)
@@ -221,9 +266,9 @@ class SessionTests(unittest.TestCase):
             self.session.key("1", True, generation)
             self.assertEqual(self.session.keys, set())
 
-    def test_auxiliary_load_preserves_bc5_held_keys_and_their_releases(self):
+    def test_modem_load_preserves_bc5_held_keys_and_their_releases(self):
         worker = self.initialize_key_handler()
-        for sequence, image in enumerate(("avr", "trx", "ptt", "avr"), start=1):
+        for sequence, image in enumerate(("trx", "ptt", "trx", "ptt"), start=1):
             with self.subTest(image=image):
                 before = self.session.state()
                 generation = before["key_generations"]["1"]
@@ -242,6 +287,32 @@ class SessionTests(unittest.TestCase):
                 self.assertTrue(self.browser_key("tab", sequence * 2 + 1, False)["delivered"])
                 self.assertEqual(self.session.keys, set())
         self.assertEqual([call.kwargs["ah"] for call in self.session._call.call_args_list], [1, 4] * 4)
+
+    def test_shared_matrix_contacts_change_only_for_first_press_and_last_release(self):
+        worker = self.initialize_key_handler()
+        worker.state["bc5_hardware"] = True
+        self.session._step = Mock()
+        self.assertTrue(self.browser_key("tab-a", 1, True)["delivered"])
+        self.assertFalse(self.browser_key("tab-b", 1, True)["delivered"])
+        self.assertFalse(self.browser_key("tab-a", 2, False)["delivered"])
+        self.assertEqual(self.session.keys, {"1"})
+        self.assertTrue(self.browser_key("tab-b", 2, False)["delivered"])
+        transitions = [call.kwargs["pressed"] for call in worker.request.call_args_list if call.args[0] == "key"]
+        self.assertEqual(transitions, [True, False])
+        self.assertEqual(self.session.keys, set())
+
+    def test_shared_power_input_changes_only_for_first_press_and_last_release(self):
+        self.initialize_key_handler()
+        self.session._power_input = Mock()
+        self.session._step = Mock()
+        self.assertTrue(self.browser_key("tab-a", 1, True, key="power")["delivered"])
+        self.assertFalse(self.browser_key("tab-b", 1, True, key="power")["delivered"])
+        self.assertFalse(self.browser_key("tab-a", 2, False, key="power")["delivered"])
+        self.assertEqual(self.session.keys, {"power"})
+        self.assertTrue(self.browser_key("tab-b", 2, False, key="power")["delivered"])
+        self.assertEqual([call.args[0] for call in self.session._power_input.call_args_list], [True, False])
+        self.assertEqual([call.args[0] for call in self.session._step.call_args_list], [5200000, 150000])
+        self.assertEqual(self.session.keys, set())
 
     def test_two_clients_inject_only_first_press_and_last_release(self):
         self.initialize_key_handler()

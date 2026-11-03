@@ -22,7 +22,7 @@
       <main>
         <div class="page-heading">
           <div><p id="research-heading" class="eyebrow">IRIDIUM 9555 · RESEARCH BENCH</p><h1>Inside the handset.</h1><p class="intro">Original firmware, observable execution, and a hardware model you can inspect.</p></div>
-          <span class="fidelity-tag"><span aria-hidden="true">◒</span> Partial hardware model</span>
+          <span class="fidelity-tag"><span aria-hidden="true">◒</span> Firmware testing</span>
         </div>
 
         <div class="workspace">
@@ -86,10 +86,10 @@
               <div class="execution-controls"><button id="run-button" class="button button-primary" data-action="run"><span aria-hidden="true">▶</span> Run</button><button class="button" data-action="step"><span aria-hidden="true">▸│</span> Step <span class="button-detail">10k</span></button><button class="button button-quiet" data-action="reset"><span aria-hidden="true">↺</span> Reset</button></div>
               <div class="application-controls">
                 <div class="application-heading">
-                  <button id="initialize-button" class="button button-small" data-action="initialize_ui" disabled>Initialize application</button>
-                  <span id="application-status" class="micro-label">NOT INITIALIZED</span>
+                  <button id="initialize-button" class="button button-small" data-action="initialize_ui" disabled>Power on handset</button>
+                  <span id="application-status" class="micro-label">NOT POWERED ON</span>
                 </div>
-                <p><strong>Experimental:</strong> runs the original firmware to kernel idle, then invokes its application initialization routines. This is not a normal hardware boot.</p>
+                <p>Initializes empty factory settings using original firmware, then keeps the AVR power input released through startup. Load both BC5 and AVR images.</p>
               </div>
               <div id="processors" class="processors"><p class="empty-state">Processor state will appear after an image is loaded.</p></div>
               <p class="small-note">Instruction counts are deterministic model progress, not hardware timing.</p>
@@ -107,7 +107,7 @@
               <div class="scenario-inject"><div class="call-state"><span class="micro-label">CALL STATE</span><span id="call-state">Idle</span></div><label class="field-label" for="remote-number">Remote number</label><input id="remote-number" class="text-input" type="tel" value="+881600000001" maxlength="32" autocomplete="off"><div class="scenario-buttons"><button class="button button-small" data-satellite="incoming_call">Incoming call</button><button class="button button-small button-quiet" data-satellite="answer">Answer</button><button class="button button-small button-quiet" data-satellite="hangup">Hang up</button></div><label class="field-label" for="sms-text">Incoming SMS</label><div class="sms-compose"><input id="sms-text" class="text-input" type="text" value="Test message from the satellite model." maxlength="160" autocomplete="off"><button class="button button-small" data-satellite="incoming_sms">Inject</button></div></div>
             </section>
 
-            <section class="panel fidelity-panel" aria-labelledby="fidelity-heading"><div class="panel-heading"><h2 id="fidelity-heading"><span class="section-number">04</span> Model boundaries</h2><span class="micro-label">EXPLICIT LIMITS</span></div><p id="fidelity-description">This is a partial handset hardware model. Application initialization and software key injection are explicit experimental scenarios.</p><ul id="limitations"><li>Normal handset startup and electrical keypad delivery remain incomplete.</li><li>Live display output comes from captured original firmware LCD traffic.</li><li>The satellite model is independent of the original modem firmware.</li><li>Hardware timing, DSP behavior, and radio protocols are not validated.</li></ul></section>
+            <section class="panel fidelity-panel" aria-labelledby="fidelity-heading"><div class="panel-heading"><h2 id="fidelity-heading"><span class="section-number">04</span> Model boundaries</h2><span class="micro-label">FIRMWARE DERIVED</span></div><p id="fidelity-description">Hardware behavior is inferred from the original handset firmware and component specifications.</p><ul id="limitations"><li>Processor links, keypad scanning and power inputs execute through emulated peripherals.</li><li>Live display output comes from the serial-controller model.</li><li>Satellite service scenarios remain separate from the modem firmware.</li><li>Unshipped ROM/DSP code and unestablished radio behavior are outside the modeled scope.</li></ul></section>
           </div>
         </div>
 

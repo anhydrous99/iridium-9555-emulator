@@ -80,6 +80,8 @@ pub const Core = struct {
     code: []const Segment,
     /// Register aliases 0xFFE0/E1/E3/E4 (main image on, loader off; XA-alias-mode).
     alias_regs: bool = true,
+    /// Firmware-derived IRQ model: FLAGS bit4 switches X/Y with their inactive UX/UY bank.
+    banked_interrupts: bool = false,
     sel: variants.Set = .{},
     touched: variants.Set = .{},
     /// Branches that consumed a flag marked unknown.
@@ -116,11 +118,20 @@ pub const Core = struct {
     }
 
     pub fn read(c: *Core, addr: u16) u16 {
-        return @truncate(c.bus.read(addr, 16));
+        return @truncate(c.bus.read(c.dataAddress(addr), 16));
     }
     pub fn write(c: *Core, addr: u16, v: u16) void {
         if (addr == 0xFF52) c.cpu.ff52 = v;
-        c.bus.write(addr, 16, v);
+        c.bus.write(c.dataAddress(addr), 16, v);
+    }
+
+    /// The IRQ stub stores [Y-3], then reads FFFD after selecting the user bank. Its frame is
+    /// the backing window for compiler scratch registers; live AH/AL/X/Y aliases remain registers.
+    fn dataAddress(c: *const Core, addr: u16) u16 {
+        if (!c.banked_interrupts or addr < 0xFFE0) return addr;
+        if (addr == 0xFFE0 or addr == 0xFFE1 or addr == 0xFFE3 or addr == 0xFFE4) return addr;
+        const supervisor_y = if (c.cpu.flags & IE != 0) c.cpu.uy else c.cpu.y;
+        return supervisor_y +% addr;
     }
 
     fn ea(c: *const Core, i: Insn) u16 {
@@ -210,11 +221,12 @@ pub const Core = struct {
     pub fn unpackFlags(c: *Core, w: u16) void {
         c.touched.set(.flags_layout);
         c.cpu.fq = 0;
-        if (!c.sel.has(.flags_layout)) {
-            c.cpu.flags = w;
-            return;
+        const flags = if (!c.sel.has(.flags_layout)) w else (w & ~ZNCV) | perm(w, 4, Z) | perm(w, 8, N) | perm(w, 2, C) | perm(w, 1, V);
+        if (c.banked_interrupts and (c.cpu.flags ^ flags) & IE != 0) {
+            std.mem.swap(u16, &c.cpu.x, &c.cpu.ux);
+            std.mem.swap(u16, &c.cpu.y, &c.cpu.uy);
         }
-        c.cpu.flags = (w & ~ZNCV) | perm(w, 4, Z) | perm(w, 8, N) | perm(w, 2, C) | perm(w, 1, V);
+        c.cpu.flags = flags;
     }
     fn perm(w: u16, from: u16, to: u16) u16 {
         return if (w & from != 0) to else 0;
@@ -603,13 +615,14 @@ pub const Core = struct {
         const cpu = &c.cpu;
         if (cpu.flags & IE == 0) return false;
         c.touched.set(.irq_entry);
+        const flags = c.packFlags();
+        c.unpackFlags(flags & ~IE);
         const y = cpu.y;
         const hi: u16 = @truncate(cpu.pc >> 16);
         const lo: u16 = @truncate(cpu.pc);
-        c.write(y -% 33, c.packFlags());
+        c.write(y -% 33, flags);
         c.write(y -% 32, if (c.sel.has(.irq_entry)) lo else hi);
         c.write(y -% 31, if (c.sel.has(.irq_entry)) hi else lo);
-        cpu.flags &= ~IE;
         cpu.pc = base + 2;
         return true;
     }

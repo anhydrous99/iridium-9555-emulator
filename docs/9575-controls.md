@@ -1,5 +1,8 @@
 # 9575 Extreme control evidence
 
+This preserves the earlier software-probe investigation. Current startup uses
+the coupled AVR power input and GPIO matrix; see [inferred hardware](inferred-hardware.md).
+
 Observed on 2026-11-02 using the downloaded HL25003 BC5 payload, SHA-256
 `21b9f28484bc1be0a5dc5cce78444e50b265b0b025ee40ed1d332830f7e90da1`.
 Addresses below are image byte offsets unless explicitly called data words.

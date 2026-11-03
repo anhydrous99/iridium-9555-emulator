@@ -1,13 +1,16 @@
 //! ATmega164P peripheral models with a 640/1280-family profile for system runs
 //! (ARCHITECTURE §6.1, §7.4; avr-full §2, §3, §8-§10; docs/9575-native.md):
-//! GPIO ports A-D with pin-change interrupts, Timer0/1/2 (normal, CTC, fast PWM, phase-correct,
+//! GPIO ports A-D (A-H/J/K/L for mega) with external and pin-change interrupts, Timer0/1/2 (normal, CTC, fast PWM, phase-correct,
 //! TEMP-latched 16-bit access), USART0/1 (frame timing from UBRR/U2X/UCSRnC, 2-byte RX FIFO, DOR),
 //! SPI (slave transfers driven by the host side, master transfers), EEPROM (EEMPE/EEPE sequence,
 //! 3.4 ms write), watchdog (timed sequence, interrupt/reset), ADC (conversion timing, Timer0
 //! compare-A auto trigger, host-set analog inputs), PRR clock gating, CLKPR timed sequence, and
-//! plain storage for configuration registers. Registers with no model (ACSR, OCDR, TWI, reserved
-//! addresses) fall back to the tape: a read pops the bus tape, a write is ignored (it is logged).
+//! Timer3/4/5 and compare C in the 640/1280 profile, input capture and external timer clocks, and
+//! digital compare outputs/FOC, analog comparator, asynchronous Timer2 and byte-level master/slave
+//! TWI with explicit host bus stimuli, SPM/fuse/lock semantics and interrupt-vector relocation.
+//! Unimplemented registers (OCDR and reserved addresses) use tape unless strict coverage rejects them.
 //!
+//! 640/1280 register/interrupt/peripheral semantics: Microchip DS40002211A sections 14–26.
 //! In function tests the bus has no device (every mmio read is taped, §7.4); these models drive
 //! system runs (boot, scenarios) through `bus.dev` and the CPU's `Sys` interface.
 const std = @import("std");
@@ -25,6 +28,9 @@ pub const TIFR1 = 0x36;
 pub const TIFR2 = 0x37;
 pub const PCIFR = 0x3B;
 pub const EIFR = 0x3C;
+pub const EIMSK = 0x3D;
+pub const EICRA = 0x69;
+pub const EICRB = 0x6A;
 pub const EECR = 0x3F;
 pub const EEDR = 0x40;
 pub const EEARL = 0x41;
@@ -38,8 +44,12 @@ pub const OCR0B = 0x48;
 pub const SPCR = 0x4C;
 pub const SPSR = 0x4D;
 pub const SPDR = 0x4E;
+pub const ACSR = 0x50;
 pub const SMCR = 0x53;
 pub const MCUSR = 0x54;
+pub const MCUCR = 0x55;
+pub const SPMCSR = 0x57;
+pub const RAMPZ = 0x5B;
 pub const WDTCSR = 0x60;
 pub const CLKPR = 0x61;
 pub const PRR = 0x64;
@@ -69,11 +79,22 @@ pub const TCCR2B = 0xB1;
 pub const TCNT2 = 0xB2;
 pub const OCR2A = 0xB3;
 pub const OCR2B = 0xB4;
+pub const ASSR = 0xB6;
+pub const TWBR = 0xB8;
+pub const TWSR = 0xB9;
+pub const TWAR = 0xBA;
+pub const TWDR = 0xBB;
+pub const TWCR = 0xBC;
+pub const TWAMR = 0xBD;
+const async_registers = [_]u16{ TCCR2B, TCCR2A, OCR2B, OCR2A, TCNT2 };
 pub const UCSR0A = 0xC0;
 pub const UCSR1A = 0xC8;
 pub const UCSR2A = 0xD0;
 pub const UCSR3A = 0x130;
 const uart_bases = [_]u16{ UCSR0A, UCSR1A, UCSR2A, UCSR3A };
+const timer16_bases = [_]u16{ 0x80, 0x90, 0xA0, 0x120 };
+const timer16_flags = [_]u16{ TIFR1, 0x38, 0x39, 0x3A };
+const timer16_masks = [_]u16{ TIMSK1, 0x71, 0x72, 0x73 };
 const port_bases = [_]u16{ 0x20, 0x23, 0x26, 0x29, 0x2C, 0x2F, 0x32, 0x100, 0x103, 0x106, 0x109 };
 
 // PRR bits
@@ -103,8 +124,11 @@ pub const Vec = struct {
     pub const usart0_rx = 20;
     pub const usart0_udre = 21;
     pub const usart0_tx = 22;
+    pub const comparator = 23;
     pub const adc = 24;
     pub const ee_ready = 25;
+    pub const twi = 26;
+    pub const spm_ready = 27;
     pub const usart1_rx = 28;
     pub const usart1_udre = 29;
     pub const usart1_tx = 30;
@@ -116,8 +140,8 @@ const Access = enum { store, model, tape };
 const access: [0x100]Access = blk: {
     var a: [0x100]Access = @splat(.tape);
     for (0x20..0x2C) |x| a[x] = .model; // PINx/DDRx/PORTx
-    for ([_]u8{ TIFR0, TIFR1, TIFR2, PCIFR, EIFR, EECR, GTCCR, TCCR0B, TCNT0, SPSR, SPDR, WDTCSR, CLKPR, ADCL, ADCH, ADCSRA, TCNT1L, TCNT1H, ICR1L, ICR1H, OCR1AL, OCR1AH, OCR1BL, OCR1BH, TCNT2, TCCR2B }) |x| a[x] = .model;
-    for ([_]u8{ 0x3D, 0x3E, EEDR, EEARL, EEARH, TCCR0A, OCR0A, OCR0B, 0x4A, 0x4B, SPCR, SMCR, MCUSR, 0x55, 0x57, PRR, 0x66, PCICR, 0x69, 0x6B, 0x6C, 0x6D, TIMSK0, TIMSK1, TIMSK2, PCMSK3, ADCSRB, ADMUX, 0x7E, 0x7F, TCCR1A, TCCR1B, 0x82, TCCR2A, OCR2A, OCR2B, 0xB6 }) |x| a[x] = .store;
+    for ([_]u8{ MCUSR, MCUCR, SPMCSR, TWSR, TWDR, TWCR, ASSR, ACSR, TIFR0, TIFR1, TIFR2, PCIFR, EIFR, EECR, GTCCR, TCCR0B, TCNT0, SPSR, SPDR, WDTCSR, CLKPR, ADCL, ADCH, ADCSRA, TCNT1L, TCNT1H, ICR1L, ICR1H, OCR1AL, OCR1AH, OCR1BL, OCR1BH, TCNT2, TCCR2B }) |x| a[x] = .model;
+    for ([_]u8{ TWBR, TWAR, TWAMR, 0x3D, 0x3E, EEDR, EEARL, EEARH, TCCR0A, OCR0A, OCR0B, 0x4A, 0x4B, SPCR, SMCR, PRR, 0x66, PCICR, 0x69, 0x6B, 0x6C, 0x6D, TIMSK0, TIMSK1, TIMSK2, PCMSK3, ADCSRB, ADMUX, 0x7E, 0x7F, TCCR1A, TCCR1B, 0x82, TCCR2A, OCR2A, OCR2B }) |x| a[x] = .store;
     for ([_]u8{ UCSR0A, UCSR1A }) |b| {
         a[b] = .model; // UCSRnA
         a[b + 1] = .store; // UCSRnB
@@ -151,24 +175,85 @@ pub const Usart = extern struct {
     out_dropped: u64 = 0,
 };
 
+pub const Fuses = extern struct {
+    low: u8 = 0x77,
+    high: u8 = 0x99,
+    extended: u8 = 0xFE,
+    lock: u8 = 0xEA,
+};
+
+pub const TwiReply = enum(u8) { ack, nack, arbitration_lost, bus_error };
+pub const TwiEvent = extern struct {
+    pub const Kind = enum(u8) { start, address, write, read, stop };
+    kind: Kind,
+    value: u8 = 0,
+};
+
+const Twi = extern struct {
+    busy: u32 = 0,
+    action: Action = .none,
+    master: u8 = 0,
+    slave: u8 = 0, // 1: receiver, 2: general-call receiver, 3: transmitter
+    reply: TwiReply = .nack,
+    reply_value: u8 = 0xFF,
+    out_head: u8 = 0,
+    out_tail: u8 = 0,
+    out_ring: [256]TwiEvent = @splat(.{ .kind = .start }),
+    out_dropped: u64 = 0,
+    const Action = enum(u8) { none, start, address, write, read, stop };
+};
+
+const Timer16 = extern struct {
+    count: u16 = 0,
+    capture: u16 = 0,
+    compare: [3]u16 = @splat(0),
+    output: [3]u8 = @splat(0),
+    buffered: [3]u16 = @splat(0),
+    temp: u8 = 0,
+    down: u8 = 0,
+    external_last: u8 = 0,
+    capture_last: u8 = 0,
+    capture_candidate: u8 = 0,
+    capture_cycles: u8 = 0,
+};
+
 /// Snapshot part "dev": plain data only.
 pub const State = extern struct {
     cycles: u64 = 0,
-    /// Prescaler counters (cycles since the last prescaler reset): Timer0/1 share one, Timer2 has its own.
+    /// Synchronous timers0/1/3/4/5 share a prescaler; Timer2 has its own.
     pre01: u64 = 0,
     pre2: u64 = 0,
+    async_values: [5]u8 = @splat(0),
+    async_pending: [5]u8 = @splat(0),
     wdt_count: u64 = 0,
     ee_busy: u32 = 0,
     adc_busy: u32 = 0,
     master_busy: u32 = 0,
-    tcnt1: u16 = 0,
-    ocr1a: u16 = 0,
-    ocr1b: u16 = 0,
-    icr1: u16 = 0,
-    /// Double-buffered OCR values written in PWM modes (applied at TOP/BOTTOM).
-    ocr1a_buf: u16 = 0,
-    ocr1b_buf: u16 = 0,
-    analog: [8]u16 = @splat(0x3FF),
+    timer: [4]Timer16 = .{ .{}, .{}, .{}, .{} },
+    twi: Twi = .{},
+    fuse: Fuses = .{},
+    spm_buffer: [256]u8 = @splat(0xFF),
+    spm_pending: [256]u8 = @splat(0xFF),
+    spm_busy: u32 = 0,
+    spm_address: u32 = 0,
+    spm_operation: u8 = 0,
+    spm_window: u8 = 0,
+    spm_nrww: u8 = 0,
+    mcu_window: u8 = 0,
+    mcu_irq_hold: u8 = 0,
+    sleeping: u8 = 0,
+    sleep_mode: u8 = 0,
+    jtd_window: u8 = 0,
+    jtd_request: u8 = 0,
+    bod_window: u8 = 0,
+    bod_active: u8 = 0,
+    analog: [16]u16 = @splat(0x3FF),
+    comparator: [2]u16 = @splat(0),
+    bandgap: u16 = 0,
+    ac_candidate: u8 = 0,
+    ac_delay: u8 = 0,
+    ext_last: u8 = 0,
+    external0: u8 = 0,
     /// I/O registers by data address (index < 0x20 unused).
     io: [0x200]u8 = @splat(0),
     pins_in: [11]u8 = @splat(0),
@@ -178,7 +263,6 @@ pub const State = extern struct {
     ocr2a_buf: u8 = 0,
     ocr2b_buf: u8 = 0,
     down: [3]u8 = @splat(0),
-    temp1: u8 = 0,
     spi_rx: u8 = 0,
     spi_tx: u8 = 0,
     spif_seen: u8 = 0,
@@ -195,8 +279,13 @@ pub const State = extern struct {
     adc_hold: u32 = 0,
     adc_held: u16 = 0,
     adc_sampled: u8 = 0,
+    adc_mux: u8 = 0,
+    adc_left: u8 = 0,
+    adc_locked: u8 = 0,
     /// Timer2 output compare B (the OC2B waveform, PD6 while COM2B drives the pin).
     oc2b: u8 = 0,
+    oc2a: u8 = 0,
+    oc0: [2]u8 = @splat(0),
     ow: OneWire = .{},
 };
 
@@ -245,23 +334,33 @@ pub const Devices = struct {
     open_bus: bool = false,
     /// HL25003 uses the 8 KiB-SRAM ATmega640/1280 family register/vector layout.
     mega: bool = false,
+    async_committing: bool = false,
+    program: ?*emu.cpu.Prog = null,
 
     /// Power-on reset (EEPROM keeps its contents; the 1-Wire slave and its memory are on the board).
     pub fn reset(d: *Devices) void {
         const ee = d.st.ee;
         const ow = d.st.ow;
+        const fuse = d.st.fuse;
         d.st = .{};
+        d.st.fuse = fuse;
         d.st.ee = ee;
         d.st.ow = .{ .connected = ow.connected, .present = ow.present, .mem = ow.mem };
         d.st.io[UCSR0A] = 0x20;
         d.st.io[UCSR1A] = 0x20;
         d.st.io[UCSR0A + 2] = 0x06;
         d.st.io[UCSR1A + 2] = 0x06;
-        d.st.io[CLKPR] = 0x03; // CKDIV8 programmed (lfuse 0x77, avr-full §2)
+        d.st.io[CLKPR] = if (d.st.fuse.low & 0x80 == 0) @as(u8, 3) else 0;
         d.st.io[MCUSR] = 0x01; // PORF
         d.st.io[0x66] = 0x80; // OSCCAL: factory value unknown [unk]
         d.st.io[ADCSRA] = 0;
-        for (0..d.portCount()) |p| d.st.pin_last[p] = d.pin(@intCast(p));
+        if (d.st.fuse.high & 0x10 == 0) d.st.io[WDTCSR] = 0x08; // WDTON forces reset mode.
+        d.st.io[TWSR] = 0xF8;
+        d.st.io[TWDR] = 0xFF;
+        d.st.io[TWAR] = 0xFE;
+        d.pinChange();
+        d.st.ext_last = d.extLevels();
+        d.seedTimerPins();
         if (d.mega) for (uart_bases[2..]) |base| {
             d.st.io[base] = 0x20;
             d.st.io[base + 2] = 0x06;
@@ -273,10 +372,29 @@ pub const Devices = struct {
     }
 
     pub fn sys(d: *Devices) emu.cpu.Sys {
-        return .{ .ctx = d, .tick = sysTick, .pending = sysPending, .ack = sysAck, .sleep_enabled = sysSleep, .wdr = sysWdr };
+        return .{ .ctx = d, .tick = sysTick, .pending = sysPending, .ack = sysAck, .sleep_enabled = sysSleep, .wdr = sysWdr, .spm = sysSpm, .program_read = sysProgramRead, .blocked = sysBlocked, .interrupts_enabled = sysInterruptsEnabled, .interrupt_base = sysInterruptBase, .bit_write_value = sysBitWriteValue, .sleeping = sysSleeping, .wake_cycles = sysWakeCycles };
     }
 
     // ---- host side (scenario stimulus) ------------------------------------------------------
+
+    pub fn configureFuses(d: *Devices, low: u8, high: u8, extended: u8, lock: u8) void {
+        d.st.fuse = .{ .low = low, .high = high, .extended = extended, .lock = lock | 0xC0 };
+    }
+
+    pub fn fuses(d: *const Devices) Fuses {
+        return d.st.fuse;
+    }
+
+    pub fn bootStart(d: *const Devices) u16 {
+        const max_words: u32 = if (d.mega) 0x10000 else 0x2000;
+        const maximum: u32 = if (d.mega) 4096 else 1024;
+        const size = maximum >> @as(u2, @truncate(d.st.fuse.high >> 1));
+        return @intCast(max_words - size);
+    }
+
+    pub fn resetVector(d: *const Devices) u16 {
+        return if (d.st.fuse.high & 1 == 0) d.bootStart() else 0;
+    }
 
     /// Input levels, A–D for 164P; A–H/J/K/L for the 640/1280 profile.
     pub fn setPinsIn(d: *Devices, p: u4, levels: u8) void {
@@ -286,6 +404,7 @@ pub const Devices = struct {
 
     /// One byte arrives on USARTn's RXD line (queued behind earlier ones; false if the queue is full).
     pub fn uartPush(d: *Devices, n: u2, b: u8) bool {
+        if (!d.ioRunning()) return false;
         const u = &d.st.usart[n];
         const next: u8 = (u.in_tail + 1) % @as(u8, u.in_ring.len);
         if (next == u.in_head) return false;
@@ -306,7 +425,7 @@ pub const Devices = struct {
     /// null if the SPI is not an enabled slave (then MISO is not driven).
     pub fn spiTransfer(d: *Devices, master_out: u8) ?u8 {
         const spcr = d.st.io[SPCR];
-        if (spcr & 0x40 == 0 or spcr & 0x10 != 0 or d.st.io[PRR] & PRSPI != 0) return null;
+        if (spcr & 0x40 == 0 or spcr & 0x10 != 0 or d.st.io[PRR] & PRSPI != 0 or !d.ioRunning()) return null;
         const out = d.st.spi_tx;
         d.st.spi_rx = master_out;
         d.st.spi_tx = master_out; // without a new SPDR write the shift register sends back what it got
@@ -315,8 +434,103 @@ pub const Devices = struct {
         return out;
     }
 
-    pub fn setAnalog(d: *Devices, ch: u3, v: u10) void {
+    /// Response from an external TWI peer to an in-flight master byte. No peer defaults to NACK
+    /// for writes/addressing and undriven high bits (0xFF) for a master read.
+    pub fn twiReply(d: *Devices, reply: TwiReply, value: u8) bool {
+        const t = &d.st.twi;
+        if (t.busy == 0 or (t.action != .address and t.action != .write and t.action != .read)) return false;
+        t.reply = reply;
+        t.reply_value = value;
+        return true;
+    }
+
+    pub fn twiPop(d: *Devices) ?TwiEvent {
+        const t = &d.st.twi;
+        if (t.out_head == t.out_tail) return null;
+        defer t.out_head +%= 1;
+        return t.out_ring[t.out_head];
+    }
+
+    /// External master sends SLA+R/W to this AVR slave. TWINT stretches the bus until guest ack.
+    pub fn twiAddress(d: *Devices, address: u7, read_mode: bool) bool {
+        const io = &d.st.io;
+        const t = &d.st.twi;
+        if (io[PRR] & 0x80 != 0 or io[TWCR] & 0xC4 != 0x44 or t.master != 0) return false;
+        const general = address == 0 and !read_mode and io[TWAR] & 1 != 0;
+        const mask = io[TWAMR] >> 1;
+        if (!general and ((address ^ (io[TWAR] >> 1)) & ~mask) != 0) return false;
+        t.slave = if (read_mode) 3 else if (general) 2 else 1;
+        d.twiStatus(if (read_mode) @as(u8, 0xA8) else if (general) 0x70 else 0x60);
+        return true;
+    }
+
+    pub fn twiReceive(d: *Devices, value: u8) bool {
+        const io = &d.st.io;
+        const t = &d.st.twi;
+        if (!d.ioRunning() or io[PRR] & 0x80 != 0 or io[TWCR] & 0x84 != 4 or (t.slave != 1 and t.slave != 2)) return false;
+        io[TWDR] = value;
+        const ack = io[TWCR] & 0x40 != 0;
+        d.twiStatus(if (t.slave == 2) (if (ack) @as(u8, 0x90) else 0x98) else (if (ack) @as(u8, 0x80) else 0x88));
+        if (!ack) t.slave = 0;
+        return true;
+    }
+
+    pub fn twiTransmit(d: *Devices, ack: bool) ?u8 {
+        const io = &d.st.io;
+        const t = &d.st.twi;
+        if (!d.ioRunning() or io[PRR] & 0x80 != 0 or io[TWCR] & 0x84 != 4 or t.slave != 3) return null;
+        const value = io[TWDR];
+        d.twiStatus(if (!ack) @as(u8, 0xC0) else if (io[TWCR] & 0x40 == 0) 0xC8 else 0xB8);
+        if (!ack or io[TWCR] & 0x40 == 0) t.slave = 0;
+        return value;
+    }
+
+    pub fn twiStop(d: *Devices) bool {
+        const io = &d.st.io;
+        const t = &d.st.twi;
+        if (t.slave == 0 or io[TWCR] & 0x84 != 4) return false;
+        t.slave = 0;
+        d.twiStatus(0xA0);
+        return true;
+    }
+
+    pub fn setAnalog(d: *Devices, ch: u4, v: u10) void {
         d.st.analog[ch] = v;
+        d.comparatorRefresh();
+    }
+
+    /// AIN0/AIN1 samples in the same normalized reference units as host ADC inputs.
+    pub fn setComparatorInputs(d: *Devices, positive: u10, negative: u10) void {
+        d.st.comparator = .{ positive, negative };
+        d.comparatorRefresh();
+    }
+
+    /// Normalized internal-reference sample supplied explicitly by the test fixture.
+    pub fn setBandgap(d: *Devices, sample: u10) void {
+        d.st.bandgap = sample;
+        d.comparatorRefresh();
+    }
+
+    /// Supply independent Timer2 oscillator edges; CPU instructions do not invent an oscillator.
+    pub fn asyncTick(d: *Devices, oscillator_ticks: u32) void {
+        const io = &d.st.io;
+        if (io[ASSR] & 0x20 == 0 or !d.asyncRunning()) return;
+        const divs = [_]u64{ 0, 1, 8, 32, 64, 128, 256, 1024 };
+        for (0..oscillator_ticks) |_| {
+            const old = d.st.pre2;
+            if (io[GTCCR] & 0x82 != 0x82) d.st.pre2 += 1;
+            d.timer8(2, ticks(old, d.st.pre2, divs[io[TCCR2B] & 7]));
+            for (&d.st.async_pending, 0..) |*remaining, index| {
+                if (remaining.* == 0) continue;
+                remaining.* -= 1;
+                if (remaining.* == 0) {
+                    d.async_committing = true;
+                    d.write(async_registers[index], d.st.async_values[index]);
+                    d.async_committing = false;
+                    io[ASSR] &= ~(@as(u8, 1) << @intCast(index));
+                }
+            }
+        }
     }
 
     /// Connects the 1-Wire bus model to ADC1 (`OneWire`), with the slave answering or not (`present`).
@@ -329,7 +543,7 @@ pub const Devices = struct {
     }
 
     /// The level ADC channel `ch` sees now.
-    fn analogIn(d: *const Devices, ch: u3) u16 {
+    fn analogIn(d: *const Devices, ch: u4) u16 {
         const ow = &d.st.ow;
         if (ch != 1 or ow.connected == 0) return d.st.analog[ch];
         const now = d.st.cycles;
@@ -421,6 +635,14 @@ pub const Devices = struct {
         return if (d.mega) 11 else 4;
     }
 
+    pub fn analogCount(d: *const Devices) usize {
+        return if (d.mega) 16 else 8;
+    }
+
+    fn timerCount(d: *const Devices) usize {
+        return if (d.mega) 4 else 1;
+    }
+
     fn uartIndex(base: u16) u2 {
         return switch (base) {
             UCSR0A => 0,
@@ -444,9 +666,18 @@ pub const Devices = struct {
                 if (a == base or a == base + 6) return .model;
                 if (a > base and a < base + 6 and a != base + 3) return .store;
             }
-            if (a == 0x65) return .store; // PRR1
+            if (a == RAMPZ) return .model;
+            if (a == 0x65 or a == EICRB or a == 0x7D or (a >= 0x71 and a <= 0x73)) return .store;
+            if (a >= 0x38 and a <= 0x3A) return .model;
         }
         return if (a < access.len) access[a] else .tape;
+    }
+
+    pub fn modeledAccess(d: *const Devices, a: u16, write_access: bool) bool {
+        _ = write_access;
+        if (d.portFor(a) != null) return true;
+        if (d.timerFor(a) != null) return true;
+        return d.registerAccess(a) != .tape;
     }
 
     fn vector(d: *const Devices, v: u8) u8 {
@@ -454,7 +685,9 @@ pub const Devices = struct {
         return switch (v) {
             4...6 => v + 5,
             8...14 => v + 4,
-            15...22, 24...25 => v + 5,
+            15...25 => v + 5,
+            26 => 39,
+            27 => 40,
             28...30 => v + 8,
             else => 255,
         };
@@ -482,15 +715,74 @@ pub const Devices = struct {
         return 0;
     }
 
+    const OutputPin = struct { port: u4, bit: u3 };
+
+    fn output8Pin(d: *const Devices, n: u2, c: usize) OutputPin {
+        if (n == 0) return if (d.mega)
+            (if (c == 0) .{ .port = 1, .bit = 7 } else .{ .port = 6, .bit = 5 })
+        else
+            .{ .port = 1, .bit = @intCast(3 + c) };
+        return if (d.mega)
+            (if (c == 0) .{ .port = 1, .bit = 4 } else .{ .port = 7, .bit = 6 })
+        else
+            .{ .port = 3, .bit = @intCast(7 - c) };
+    }
+
+    fn output16Pin(d: *const Devices, n: usize, c: usize) OutputPin {
+        if (!d.mega) return .{ .port = 3, .bit = @intCast(5 - c) };
+        return switch (n) {
+            0 => .{ .port = 1, .bit = @intCast(5 + c) },
+            1 => .{ .port = 4, .bit = @intCast(3 + c) },
+            2 => .{ .port = 7, .bit = @intCast(3 + c) },
+            3 => .{ .port = 10, .bit = @intCast(3 + c) },
+            else => unreachable,
+        };
+    }
+
+    fn output8Enabled(d: *const Devices, n: u2, c: usize) bool {
+        const a: u16 = if (n == 0) TCCR0A else TCCR2A;
+        const b: u16 = if (n == 0) TCCR0B else TCCR2B;
+        const wgm = ((d.st.io[b] >> 1) & 4) | (d.st.io[a] & 3);
+        const com = (d.st.io[a] >> @intCast(6 - 2 * c)) & 3;
+        if (com == 0 or wgm == 4 or wgm == 6) return false;
+        if (com != 1 or wgm == 0 or wgm == 2) return true;
+        return c == 0 and (wgm == 5 or wgm == 7);
+    }
+
+    fn output16Enabled(d: *const Devices, n: usize, c: usize) bool {
+        const a = timer16_bases[n];
+        const wgm = ((d.st.io[a + 1] >> 1) & 0xC) | (d.st.io[a] & 3);
+        const com = (d.st.io[a] >> @intCast(6 - 2 * c)) & 3;
+        if (com == 0 or wgm == 13) return false;
+        if (com != 1 or !timerPwm(&d.st.io, n)) return true;
+        return c == 0 and (wgm == 9 or wgm == 11 or wgm == 14 or wgm == 15);
+    }
+
     pub fn pin(d: *const Devices, p: u4) u8 {
         const ddr = d.st.io[port_bases[p] + 1];
-        const port = d.st.io[port_bases[p] + 2];
+        var port = d.st.io[port_bases[p] + 2];
+        for ([_]u2{ 0, 2 }) |n| for (0..2) |c| {
+            const out = d.output8Pin(n, c);
+            if (out.port == p and d.output8Enabled(n, c)) {
+                const bit = @as(u8, 1) << out.bit;
+                const level = if (n == 0) d.st.oc0[c] else if (c == 0) d.st.oc2a else d.st.oc2b;
+                port = (port & ~bit) | (@as(u8, level) << out.bit);
+            }
+        };
+        for (0..d.timerCount()) |n| for (0..if (d.mega) @as(usize, 3) else 2) |c| {
+            const out = d.output16Pin(n, c);
+            if (out.port == p and d.output16Enabled(n, c)) {
+                const bit = @as(u8, 1) << out.bit;
+                port = (port & ~bit) | (d.st.timer[n].output[c] << out.bit);
+            }
+        };
         return (ddr & port) | (~ddr & d.st.pins_in[p]);
     }
 
     pub fn read(d: *Devices, a: u16) u8 {
         if (a >= (if (d.mega) @as(u16, 0x200) else 0x100)) return d.tapeRead(a);
         if (d.portFor(a)) |p| return if (a == port_bases[p]) d.pin(p) else d.st.io[a];
+        if (d.timerFor(a)) |n| return d.timerRead(n, a - timer16_bases[n]);
         switch (d.registerAccess(a)) {
             .tape => return d.tapeRead(a),
             .store => return d.st.io[a],
@@ -499,19 +791,16 @@ pub const Devices = struct {
         const io = &d.st.io;
         switch (a) {
             0x20, 0x23, 0x26, 0x29 => return d.pin(@intCast((a - 0x20) / 3)),
-            TCNT1L => {
-                d.st.temp1 = @truncate(d.st.tcnt1 >> 8);
-                return @truncate(d.st.tcnt1);
+            RAMPZ => return io[a] & 1,
+            CLKPR => return io[a] | (if (d.st.clk_window != 0) @as(u8, 0x80) else 0),
+            ADCL => {
+                d.st.adc_locked = 1;
+                return io[ADCL];
             },
-            ICR1L => {
-                d.st.temp1 = @truncate(d.st.icr1 >> 8);
-                return @truncate(d.st.icr1);
+            ADCH => {
+                d.st.adc_locked = 0;
+                return io[ADCH];
             },
-            TCNT1H, ICR1H => return d.st.temp1,
-            OCR1AL => return @truncate(d.st.ocr1a_buf),
-            OCR1AH => return @truncate(d.st.ocr1a_buf >> 8),
-            OCR1BL => return @truncate(d.st.ocr1b_buf),
-            OCR1BH => return @truncate(d.st.ocr1b_buf >> 8),
             SPSR => {
                 if (io[SPSR] & 0x80 != 0) d.st.spif_seen = 1;
                 return io[SPSR];
@@ -544,10 +833,22 @@ pub const Devices = struct {
 
     pub fn write(d: *Devices, a: u16, v: u8) void {
         if (a >= (if (d.mega) @as(u16, 0x200) else 0x100)) return;
+        if (d.st.io[ASSR] & 0x20 != 0 and !d.async_committing) {
+            for (async_registers, 0..) |address, index| if (a == address) {
+                d.st.async_values[index] = v;
+                d.st.async_pending[index] = 2;
+                d.st.io[ASSR] |= @as(u8, 1) << @intCast(index);
+                return;
+            };
+        }
         if (d.portFor(a)) |p| {
             if (a == port_bases[p]) d.st.io[a + 2] ^= v else d.st.io[a] = v;
             d.pinChange();
             d.owDrive();
+            return;
+        }
+        if (d.timerFor(a)) |n| {
+            d.timerWrite(n, a - timer16_bases[n], v);
             return;
         }
         switch (d.registerAccess(a)) {
@@ -555,7 +856,12 @@ pub const Devices = struct {
             .store => {
                 d.st.io[a] = v;
                 if (a == PCMSK0 or a == 0x6C or a == 0x6D or a == PCMSK3) d.pinChange();
-                if (a == TCCR2A) d.owDrive();
+                if (a == EICRA or a == EICRB) d.externalInterrupts();
+                if (a == ADMUX or a == ADCSRB) d.comparatorRefresh();
+                if (a == TCCR0A or a == TCCR2A) {
+                    d.pinChange();
+                    d.owDrive();
+                }
                 return;
             },
             .model => {},
@@ -564,7 +870,58 @@ pub const Devices = struct {
         switch (a) {
             0x20, 0x23, 0x26, 0x29 => io[a + 2] ^= v, // writing PINx toggles PORTx
             0x21, 0x22, 0x24, 0x25, 0x27, 0x28, 0x2A, 0x2B => io[a] = v,
-            TIFR0, TIFR1, TIFR2, PCIFR, EIFR => io[a] &= ~v,
+            TIFR0, TIFR1, TIFR2, 0x38, 0x39, 0x3A, PCIFR, EIFR => io[a] &= ~v,
+            RAMPZ => io[a] = v & 1,
+            SPMCSR => d.spmControl(v),
+            MCUSR => io[a] &= v & 0x1F,
+            MCUCR => {
+                const previous = io[a];
+                const selected = previous & 2;
+                io[a] = (previous & 0xE0) | (v & 0x10) | selected;
+                const requested_jtd = v & 0x80;
+                if (requested_jtd != previous & 0x80) {
+                    if (d.st.jtd_window != 0 and requested_jtd == d.st.jtd_request) {
+                        io[a] = (io[a] & ~@as(u8, 0x80)) | requested_jtd;
+                        d.st.jtd_window = 0;
+                    } else {
+                        d.st.jtd_request = requested_jtd;
+                        d.st.jtd_window = 4;
+                    }
+                } else d.st.jtd_window = 0;
+                if (!d.mega) {
+                    if (v & 0x60 == 0x60) {
+                        io[a] |= 0x60;
+                        d.st.bod_window = 4;
+                    } else if (d.st.bod_window != 0) {
+                        io[a] = (io[a] & ~@as(u8, 0x60)) | (v & 0x60);
+                        d.st.bod_window = 0;
+                        if (v & 0x60 == 0x40) d.st.bod_active = 3;
+                    }
+                }
+                if (v & 1 != 0) {
+                    d.st.mcu_window = 4;
+                    io[a] |= 1;
+                } else if (d.st.mcu_window != 0) {
+                    io[a] = (io[a] & ~@as(u8, 2)) | (v & 2);
+                    d.st.mcu_window = 0;
+                    d.st.mcu_irq_hold = 1;
+                }
+            },
+            TWSR => io[a] = (io[a] & 0xF8) | (v & 3),
+            TWDR => {
+                if (io[TWCR] & 0x80 != 0) {
+                    io[a] = v;
+                    io[TWCR] &= ~@as(u8, 8);
+                } else io[TWCR] |= 8;
+            },
+            TWCR => d.twiControl(v),
+            ASSR => {
+                io[a] = (io[a] & 0x1F) | (v & 0x60);
+                if (v & 0x20 == 0) {
+                    d.st.async_pending = @splat(0);
+                    io[a] &= 0x60;
+                }
+            },
             GTCCR => {
                 io[a] = v & 0x80;
                 if (v & 0x01 != 0) d.st.pre01 = 0;
@@ -572,21 +929,20 @@ pub const Devices = struct {
                 if (v & 0x80 != 0) io[a] |= v & 0x03; // TSM holds the prescalers in reset
             },
             TCCR0B, TCCR2B => {
-                io[a] = v & 0x0F; // FOC bits read as zero
-                if (a == TCCR2B) d.owDrive(); // WGM22: whether COM2B 1 gives OC2B the pin
+                io[a] = v & 0x0F;
+                const n: u2 = if (a == TCCR0B) 0 else 2;
+                const ca: u16 = if (n == 0) TCCR0A else TCCR2A;
+                const wgm = ((io[a] >> 1) & 4) | (io[ca] & 3);
+                if (wgm == 0 or wgm == 2) {
+                    for (0..2) |c| if (v & (@as(u8, 0x80) >> @intCast(c)) != 0) {
+                        const level = if (n == 0) &d.st.oc0[c] else if (c == 0) &d.st.oc2a else &d.st.oc2b;
+                        compareOutput(level, @truncate(io[ca] >> @intCast(6 - 2 * c)), false, false, true, false, false, false, false);
+                    };
+                }
+                d.pinChange();
+                d.owDrive();
             },
             TCNT0, TCNT2 => io[a] = v,
-            TCNT1H, ICR1H, OCR1AH, OCR1BH => d.st.temp1 = v,
-            TCNT1L => d.st.tcnt1 = @as(u16, d.st.temp1) << 8 | v,
-            ICR1L => d.st.icr1 = @as(u16, d.st.temp1) << 8 | v,
-            OCR1AL => {
-                d.st.ocr1a_buf = @as(u16, d.st.temp1) << 8 | v;
-                if (!t1Pwm(io)) d.st.ocr1a = d.st.ocr1a_buf;
-            },
-            OCR1BL => {
-                d.st.ocr1b_buf = @as(u16, d.st.temp1) << 8 | v;
-                if (!t1Pwm(io)) d.st.ocr1b = d.st.ocr1b_buf;
-            },
             SPSR => io[a] = (io[a] & 0xFE) | (v & 0x01),
             SPDR => {
                 d.spiClearSeen();
@@ -630,6 +986,11 @@ pub const Devices = struct {
                     d.st.clk_window = 0;
                 }
             },
+            ACSR => {
+                io[a] = (io[a] & 0x30 & ~(v & 0x10)) | (v & 0xCF);
+                d.comparatorRefresh();
+                d.timerPinEdges();
+            },
             ADCSRA => {
                 const flags = io[a] & 0x10;
                 io[a] = (v & 0xEF) | (flags & ~(v & 0x10)); // ADIF write-one-to-clear
@@ -638,6 +999,7 @@ pub const Devices = struct {
                     d.st.adc_busy = 0;
                     d.st.adc_first = 1;
                 } else if (v & 0x40 != 0 and d.st.adc_busy == 0) d.adcStart(false) else if (d.st.adc_busy != 0) io[a] |= 0x40; // ADSC: writing 0 has no effect
+                d.comparatorRefresh();
             },
             ADCL, ADCH => {},
             else => io[a] = v,
@@ -645,6 +1007,103 @@ pub const Devices = struct {
         if (a >= 0x20 and a <= 0x2B) {
             d.pinChange();
             d.owDrive();
+        }
+    }
+
+    fn twiStatus(d: *Devices, status: u8) void {
+        d.st.io[TWSR] = (d.st.io[TWSR] & 3) | status;
+        d.st.io[TWCR] |= 0x80;
+    }
+
+    fn twiCapture(d: *Devices, event: TwiEvent) void {
+        const t = &d.st.twi;
+        if (t.out_tail +% 1 == t.out_head) {
+            t.out_dropped +|= 1;
+            return;
+        }
+        t.out_ring[t.out_tail] = event;
+        t.out_tail +%= 1;
+    }
+
+    fn twiControl(d: *Devices, value: u8) void {
+        const io = &d.st.io;
+        const t = &d.st.twi;
+        const old_interrupt = io[TWCR] & 0x80;
+        io[TWCR] = (value & 0x75) | (io[TWCR] & 8) | (old_interrupt & ~(value & 0x80));
+        if (value & 4 == 0) {
+            t.busy = 0;
+            t.action = .none;
+            t.master = 0;
+            t.slave = 0;
+            return;
+        }
+        if (value & 0x80 == 0) return;
+        if (value & 0x10 != 0) {
+            if (t.master == 0) {
+                io[TWCR] &= ~@as(u8, 0x10);
+                t.slave = 0;
+                return;
+            }
+            t.action = .stop;
+        } else if (value & 0x20 != 0) {
+            t.action = .start;
+        } else if (t.master != 0) {
+            t.action = switch (io[TWSR] & 0xF8) {
+                0x08, 0x10 => .address,
+                0x18, 0x28 => .write,
+                0x40, 0x50 => .read,
+                else => .none,
+            };
+        } else return; // slave waits for the external master's next byte
+        if (t.action == .none) return;
+        const bit_cycles: u32 = 16 + 2 * @as(u32, io[TWBR]) * (@as(u32, 1) << @intCast(2 * (io[TWSR] & 3)));
+        t.busy = bit_cycles * (if (t.action == .start or t.action == .stop) @as(u32, 1) else 9);
+        t.reply = .nack;
+        t.reply_value = 0xFF;
+    }
+
+    fn twiDone(d: *Devices) void {
+        const io = &d.st.io;
+        const t = &d.st.twi;
+        const action = t.action;
+        t.action = .none;
+        if (action != .start and action != .stop) {
+            if (t.reply == .arbitration_lost or t.reply == .bus_error) {
+                t.master = 0;
+                t.slave = 0;
+                d.twiStatus(if (t.reply == .arbitration_lost) @as(u8, 0x38) else 0);
+                return;
+            }
+        }
+        switch (action) {
+            .none => {},
+            .start => {
+                d.twiCapture(.{ .kind = .start });
+                d.twiStatus(if (t.master != 0) @as(u8, 0x10) else 0x08);
+                t.master = 1;
+                t.slave = 0;
+            },
+            .stop => {
+                d.twiCapture(.{ .kind = .stop });
+                t.master = 0;
+                io[TWCR] &= ~@as(u8, 0x10);
+                io[TWSR] = (io[TWSR] & 3) | 0xF8;
+            },
+            .address => {
+                d.twiCapture(.{ .kind = .address, .value = io[TWDR] });
+                const read_mode = io[TWDR] & 1 != 0;
+                const ack = t.reply == .ack;
+                d.twiStatus(if (read_mode) (if (ack) @as(u8, 0x40) else 0x48) else (if (ack) @as(u8, 0x18) else 0x20));
+            },
+            .write => {
+                d.twiCapture(.{ .kind = .write, .value = io[TWDR] });
+                d.twiStatus(if (t.reply == .ack) @as(u8, 0x28) else 0x30);
+            },
+            .read => {
+                io[TWDR] = t.reply_value;
+                d.twiCapture(.{ .kind = .read, .value = io[TWDR] });
+                d.twiStatus(if (io[TWCR] & 0x40 != 0) @as(u8, 0x50) else 0x58);
+            },
         }
     }
 
@@ -666,7 +1125,120 @@ pub const Devices = struct {
         return divs[sel];
     }
 
+    fn extCount(d: *const Devices) usize {
+        return if (d.mega) 8 else 3;
+    }
+
+    fn extLevels(d: *const Devices) u8 {
+        if (d.mega) return (d.pin(3) & 0x0F) | (d.pin(4) & 0xF0);
+        return ((d.pin(3) >> 2) & 3) | (d.pin(1) & 4);
+    }
+
+    fn extMode(d: *const Devices, n: usize) u2 {
+        return @truncate(d.st.io[if (n < 4) @as(usize, EICRA) else EICRB] >> @intCast((n % 4) * 2));
+    }
+
+    fn externalInterrupts(d: *Devices) void {
+        const now = d.extLevels();
+        for (0..d.extCount()) |n| {
+            const bit = @as(u8, 1) << @intCast(n);
+            const changed = (now ^ d.st.ext_last) & bit != 0;
+            const mode = d.extMode(n);
+            if (mode == 0) {
+                d.st.io[EIFR] &= ~bit;
+            } else if (changed and (mode == 1 or (mode == 2 and now & bit == 0) or (mode == 3 and now & bit != 0))) {
+                const rising = d.st.io[EIFR] & bit == 0;
+                d.st.io[EIFR] |= bit;
+                if (n == 0 and rising) d.adcTrigger(2);
+            }
+        }
+        d.st.ext_last = now;
+    }
+
+    fn extPending(d: *const Devices) ?u8 {
+        const levels = d.extLevels();
+        for (0..d.extCount()) |n| {
+            const bit = @as(u8, 1) << @intCast(n);
+            if (d.st.io[EIMSK] & bit == 0) continue;
+            if (if (d.extMode(n) == 0) levels & bit == 0 else d.st.io[EIFR] & bit != 0)
+                return @intCast(n + 1);
+        }
+        return null;
+    }
+
+    fn timerClockLevel(d: *const Devices, n: usize) u8 {
+        if (!d.mega) return (d.pin(1) >> @intCast(n)) & 1;
+        return switch (n) {
+            0 => (d.pin(3) >> 7) & 1,
+            1 => (d.pin(3) >> 6) & 1,
+            2 => (d.pin(4) >> 6) & 1,
+            3 => (d.pin(7) >> 7) & 1,
+            4 => (d.pin(10) >> 2) & 1,
+            else => unreachable,
+        };
+    }
+
+    fn captureLevel(d: *const Devices, n: usize) u8 {
+        if (n == 0 and d.st.io[ACSR] & 4 != 0) return (d.st.io[ACSR] >> 5) & 1;
+        if (!d.mega) return (d.pin(3) >> 6) & 1;
+        return switch (n) {
+            0 => (d.pin(3) >> 4) & 1,
+            1 => (d.pin(4) >> 7) & 1,
+            2 => d.pin(10) & 1,
+            3 => (d.pin(10) >> 1) & 1,
+            else => unreachable,
+        };
+    }
+
+    fn seedTimerPins(d: *Devices) void {
+        d.st.external0 = d.timerClockLevel(0);
+        for (0..d.timerCount()) |n| {
+            d.st.timer[n].external_last = d.timerClockLevel(n + 1);
+            d.st.timer[n].capture_last = d.captureLevel(n);
+            d.st.timer[n].capture_candidate = d.captureLevel(n);
+        }
+    }
+
+    fn timerPinEdges(d: *Devices) void {
+        if (!d.ioRunning()) return;
+        const level0 = d.timerClockLevel(0);
+        const clock0 = d.st.io[TCCR0B] & 7;
+        if (level0 != d.st.external0 and (clock0 == 6 or clock0 == 7) and level0 == clock0 - 6 and d.st.io[PRR] & PRTIM0 == 0) d.timer8(0, 1);
+        d.st.external0 = level0;
+        for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
+            const t = &d.st.timer[n];
+            const level = d.timerClockLevel(n + 1);
+            const clock = d.st.io[base + 1] & 7;
+            const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
+            if (level != t.external_last and (clock == 6 or clock == 7) and level == clock - 6 and d.st.io[if (n == 0) @as(usize, PRR) else 0x65] & power == 0) d.timer16(n, 1);
+            t.external_last = level;
+            const capture = d.captureLevel(n);
+            if (capture != t.capture_candidate) {
+                t.capture_candidate = capture;
+                t.capture_cycles = 0;
+            }
+            if (d.st.io[base + 1] & 0x80 == 0) d.captureEdge(n, capture);
+        }
+    }
+
+    fn captureEdge(d: *Devices, n: usize, level: u8) void {
+        const t = &d.st.timer[n];
+        if (level == t.capture_last) return;
+        t.capture_last = level;
+        const control = d.st.io[timer16_bases[n] + 1];
+        const wgm = ((control >> 1) & 0xC) | (d.st.io[timer16_bases[n]] & 3);
+        if (wgm == 8 or wgm == 10 or wgm == 12 or wgm == 14) return; // ICRn supplies TOP.
+        if (level == ((control >> 6) & 1)) {
+            t.capture = t.count;
+            const rising = d.st.io[timer16_flags[n]] & 0x20 == 0;
+            d.st.io[timer16_flags[n]] |= 0x20;
+            if (n == 0 and rising) d.adcTrigger(7);
+        }
+    }
+
     fn pinChange(d: *Devices) void {
+        d.externalInterrupts();
+        d.timerPinEdges();
         if (d.mega) {
             const now = [_]u8{ d.pin(1), (d.pin(4) & 1) | (d.pin(8) << 1), d.pin(9) };
             for (now, 0..) |value, p| {
@@ -696,6 +1268,7 @@ pub const Devices = struct {
             d.st.wdt_window = 0;
         } else if (v & 0x08 != 0) nv |= 0x08; // WDE can be set any time
         if (io[MCUSR] & 0x08 != 0) nv |= 0x08; // WDRF forces WDE
+        if (d.st.fuse.high & 0x10 == 0) nv = (nv | 0x08) & ~@as(u8, 0x40);
         if (v & 0x18 == 0x18) d.st.wdt_window = 4;
         io[WDTCSR] = nv | (old & 0x80 & ~(v & 0x80));
     }
@@ -707,15 +1280,51 @@ pub const Devices = struct {
         return (@as(u64, 2048) << wdp) * d.fCpu() / 128_000;
     }
 
-    // shortcut: conversion time and sample-and-hold point in ADC clocks per the datasheet's "ADC
-    // Conversion Time" table (first 25 / S&H 13.5, auto-triggered 13.5 / 2, normal 13 / 1.5), not
-    // checked offline (hypothesis AV-adc-sh); the input is sampled at the S&H point, not at the end.
+    fn comparatorRefresh(d: *Devices) void {
+        const io = &d.st.io;
+        if (io[ACSR] & 0x80 != 0) {
+            d.st.ac_delay = 0;
+            return;
+        }
+        const positive = if (io[ACSR] & 0x40 != 0) d.st.bandgap else d.st.comparator[0];
+        const mux: u4 = @intCast((io[ADMUX] & 7) | (if (d.mega) io[ADCSRB] & 8 else @as(u8, 0)));
+        const negative = if (io[ADCSRB] & 0x40 != 0 and io[ADCSRA] & 0x80 == 0 and io[PRR] & PRADC == 0) d.analogIn(mux) else d.st.comparator[1];
+        const next: u8 = @intFromBool(positive > negative);
+        if (next == (io[ACSR] >> 5) & 1) {
+            d.st.ac_delay = 0;
+        } else if (d.st.ac_delay == 0 or next != d.st.ac_candidate) {
+            d.st.ac_candidate = next;
+            d.st.ac_delay = 2;
+        }
+    }
+
+    fn comparatorDone(d: *Devices) void {
+        const io = &d.st.io;
+        const next = d.st.ac_candidate;
+        io[ACSR] = (io[ACSR] & ~@as(u8, 0x20)) | (next << 5);
+        const mode = io[ACSR] & 3;
+        if (mode == 0 or (mode == 2 and next == 0) or (mode == 3 and next != 0)) {
+            const rising = io[ACSR] & 0x10 == 0;
+            io[ACSR] |= 0x10;
+            if (rising) d.adcTrigger(1);
+        }
+        if (io[ACSR] & 4 != 0) d.timerPinEdges();
+    }
+
+    fn adcTrigger(d: *Devices, source: u3) void {
+        const io = &d.st.io;
+        if (d.adcRunning() and io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == source and d.st.adc_busy == 0 and io[PRR] & PRADC == 0) d.adcStart(true);
+    }
+
+    // Conversion and sample-and-hold points follow the datasheet ADC Conversion Time table.
     fn adcStart(d: *Devices, auto: bool) void {
         const io = &d.st.io;
         const ps = [8]u32{ 2, 2, 4, 8, 16, 32, 64, 128 };
         // in half ADC clocks: conversion time, sample-and-hold point
         const conv: u32, const sh: u32 = if (d.st.adc_first != 0) .{ 50, 27 } else if (auto) .{ 27, 4 } else .{ 26, 3 };
         const half = ps[io[ADCSRA] & 7] / 2;
+        d.st.adc_mux = (io[ADMUX] & 0x1F) | (if (d.mega) (io[ADCSRB] & 8) << 2 else @as(u8, 0));
+        d.st.adc_left = io[ADMUX] & 0x20;
         d.st.adc_first = 0;
         d.st.adc_busy = conv * half;
         d.st.adc_hold = (conv - sh) * half;
@@ -726,10 +1335,29 @@ pub const Devices = struct {
     fn adcDone(d: *Devices) void {
         const io = &d.st.io;
         const v = d.st.adc_held;
-        const res: u16 = if (io[ADMUX] & 0x20 != 0) v << 6 else v; // ADLAR
-        io[ADCL] = @truncate(res);
-        io[ADCH] = @truncate(res >> 8);
+        const res: u16 = if (d.st.adc_left != 0) v << 6 else v;
+        if (d.st.adc_locked == 0) {
+            io[ADCL] = @truncate(res);
+            io[ADCH] = @truncate(res >> 8);
+        }
         io[ADCSRA] = (io[ADCSRA] & ~@as(u8, 0x40)) | 0x10;
+        if (io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == 0) d.adcStart(false);
+    }
+
+    fn adcInput(d: *const Devices) u16 {
+        const mux = d.st.adc_mux;
+        const group: u4 = if (mux & 0x20 != 0) 8 else 0;
+        const sel = mux & 0x1F;
+        if (sel < 8) return d.analogIn(group + @as(u4, @intCast(sel)));
+        if (sel == 31) return 0;
+        if (sel == 30) return d.st.bandgap;
+        const positive: u4, const negative: u4, const gain: i32 = if (sel < 16)
+            .{ group + (if (sel < 12) @as(u4, 0) else 2) + @as(u4, @intCast(sel & 1)), group + (if (sel < 12) @as(u4, 0) else 2), if (sel & 2 == 0) 10 else 200 }
+        else
+            .{ group + @as(u4, @intCast(sel & 7)), group + (if (sel < 24) @as(u4, 1) else 2), 1 };
+        const diff = (@as(i32, d.analogIn(positive)) - @as(i32, d.analogIn(negative))) * gain;
+        const result: i16 = @intCast(std.math.clamp(@divTrunc(diff, 2), -512, 511));
+        return @as(u16, @bitCast(result)) & 0x3FF;
     }
 
     fn uartFrameCycles(io: *const [0x200]u8, base: u16) u32 {
@@ -752,14 +1380,199 @@ pub const Devices = struct {
 
     // ---- time ------------------------------------------------------------------------------
 
+    fn pageSize(d: *const Devices) u32 {
+        return if (d.mega) 256 else 128;
+    }
+
+    fn rwwLimit(d: *const Devices) u32 {
+        return if (d.mega) 0x1E000 else 0x3800;
+    }
+
+    fn spmControl(d: *Devices, value: u8) void {
+        const io = &d.st.io;
+        if (d.st.ee_busy != 0) return;
+        if (d.st.spm_busy != 0) {
+            io[SPMCSR] = (io[SPMCSR] & 0x7F) | (value & 0x80);
+            return;
+        }
+        const command = value & 0x3F;
+        io[SPMCSR] = (io[SPMCSR] & 0x40) | (value & 0x80);
+        switch (command) {
+            1, 3, 5, 9, 0x11, 0x21 => {
+                io[SPMCSR] |= command;
+                d.st.spm_window = 4;
+            },
+            else => d.st.spm_window = 0,
+        }
+    }
+
+    fn sysSpm(ctx: *anyopaque, cpu: *emu.Cpu, address: u32, word: u16) void {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        const io = &d.st.io;
+        if (cpu.st.pc < d.bootStart() or d.st.spm_window == 0 or d.st.spm_busy != 0 or d.st.ee_busy != 0) return;
+        const command = io[SPMCSR] & 0x3F;
+        d.st.spm_window = 0;
+        d.program = cpu.prog;
+        io[SPMCSR] &= 0xC0;
+        switch (command) {
+            1 => {
+                const offset = (address & (d.pageSize() - 1)) & ~@as(u32, 1);
+                d.st.spm_buffer[offset] &= @truncate(word);
+                d.st.spm_buffer[offset + 1] &= @truncate(word >> 8);
+                io[SPMCSR] &= ~@as(u8, 0x40);
+            },
+            3, 5 => {
+                const byte_mask: u32 = if (d.mega) 0x1FFFF else 0x3FFF;
+                const target = (address & byte_mask) & ~(d.pageSize() - 1);
+                const boot = target >= @as(u32, d.bootStart()) * 2;
+                if (d.st.fuse.lock & (if (boot) @as(u8, 0x10) else 4) == 0) return;
+                d.st.spm_address = target;
+                d.st.spm_pending = d.st.spm_buffer;
+                d.st.spm_operation = command;
+                // Use the specified maximum 4.5 ms rather than inventing per-chip RC calibration.
+                d.st.spm_busy = @intCast(d.fCpu() * 45 / 10_000);
+                d.st.spm_nrww = @intFromBool(target >= d.rwwLimit());
+                io[SPMCSR] |= command;
+                if (d.st.spm_nrww == 0) io[SPMCSR] |= 0x40;
+            },
+            9 => {
+                d.st.spm_pending[0] = @truncate(word);
+                d.st.spm_operation = command;
+                d.st.spm_busy = @intCast(d.fCpu() * 45 / 10_000);
+                io[SPMCSR] |= command;
+            },
+            0x11 => {
+                d.st.spm_buffer = @splat(0xFF);
+                io[SPMCSR] &= ~@as(u8, 0x40);
+            },
+            else => {},
+        }
+    }
+
+    fn spmDone(d: *Devices) void {
+        if (d.st.spm_operation == 9) {
+            d.st.fuse.lock &= d.st.spm_pending[0] | 0xC0;
+        } else if (d.program) |program| {
+            const target = d.st.spm_address;
+            const size = d.pageSize();
+            if (d.st.spm_operation == 3) {
+                @memset(program[target..][0..size], 0xFF);
+            } else if (d.st.spm_operation == 5) {
+                for (program[target..][0..size], d.st.spm_pending[0..size]) |*byte, value| byte.* &= value;
+                d.st.spm_buffer = @splat(0xFF);
+            }
+        }
+        d.st.spm_nrww = 0;
+        d.st.spm_operation = 0;
+        d.st.io[SPMCSR] &= 0xC0;
+    }
+
+    fn sysProgramRead(ctx: *anyopaque, address: u32, pc: u16) ?u8 {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        const io = &d.st.io;
+        if (d.st.spm_window != 0) {
+            const command = io[SPMCSR] & 0x3F;
+            if (command == 9 or command == 0x21) {
+                io[SPMCSR] &= 0xC0;
+                d.st.spm_window = 0;
+                if (command == 9) return switch (address) {
+                    0 => d.st.fuse.low,
+                    1 => d.st.fuse.lock,
+                    2 => d.st.fuse.extended,
+                    3 => d.st.fuse.high,
+                    else => 0,
+                };
+                return switch (address) {
+                    0 => 0x1E,
+                    1 => d.st.io[0x66],
+                    2 => if (d.mega) @as(u8, 0x97) else 0x94,
+                    4 => if (d.mega) @as(u8, 3) else 0x0A,
+                    else => 0,
+                };
+            }
+        }
+        const boot = @as(u32, d.bootStart()) * 2;
+        if ((address >= boot and pc < d.bootStart() and d.st.fuse.lock & 0x20 == 0) or
+            (address < boot and pc >= d.bootStart() and d.st.fuse.lock & 8 == 0)) return 0;
+        if (address < d.rwwLimit() and io[SPMCSR] & 0x40 != 0) return 0xFF;
+        return null;
+    }
+
+    fn sysBlocked(ctx: *anyopaque, pc: u16) bool {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        return d.st.spm_nrww != 0 or (d.st.io[SPMCSR] & 0x40 != 0 and @as(u32, pc) * 2 < d.rwwLimit());
+    }
+
+    fn sysInterruptsEnabled(ctx: *anyopaque, pc: u16) bool {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        if (d.st.mcu_window != 0) return false;
+        if (d.st.mcu_irq_hold != 0) {
+            d.st.mcu_irq_hold = 0;
+            return false;
+        }
+        const relocated = d.st.io[MCUCR] & 2 != 0;
+        return !((relocated and pc < d.bootStart() and d.st.fuse.lock & 8 == 0) or
+            (!relocated and pc >= d.bootStart() and d.st.fuse.lock & 0x20 == 0));
+    }
+
+    fn sysInterruptBase(ctx: *anyopaque) u16 {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        return if (d.st.io[MCUCR] & 2 != 0) d.bootStart() else 0;
+    }
+
+    fn sysBitWriteValue(ctx: *anyopaque, address: u16, bit: u3, set: bool) ?u8 {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        if (d.portFor(address)) |p| if (address == port_bases[p]) return if (set) @as(u8, 1) << bit else 0;
+        if (address == TIFR0 or address == TIFR1 or address == TIFR2 or
+            (d.mega and address >= 0x38 and address <= 0x3A) or address == PCIFR or address == EIFR)
+            return if (set) @as(u8, 1) << bit else 0;
+        return null;
+    }
+
     fn sysTick(ctx: *anyopaque, cycles: u32) void {
         const d: *Devices = @ptrCast(@alignCast(ctx));
         d.tick(cycles);
     }
 
     pub fn tick(d: *Devices, cycles: u32) void {
+        if (cycles > 1 and d.ioRunning()) {
+            for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
+                const t = &d.st.timer[n];
+                if (d.st.io[base + 1] & 0x80 != 0 and t.capture_last != t.capture_candidate) {
+                    const until = @min(cycles, 4 - @min(t.capture_cycles, @as(u8, 4)));
+                    for (0..until) |_| d.tick(1);
+                    d.tick(cycles - until);
+                    return;
+                }
+            }
+        }
         const io = &d.st.io;
         d.st.cycles += cycles;
+        if (d.ioRunning() and d.st.ac_delay != 0) {
+            d.st.ac_delay -|= @intCast(@min(cycles, 2));
+            if (d.st.ac_delay == 0) d.comparatorDone();
+        }
+        d.st.jtd_window -|= @intCast(@min(cycles, 4));
+        if (d.st.bod_window != 0) {
+            d.st.bod_window -|= @intCast(@min(cycles, 4));
+            if (d.st.bod_window == 0) io[MCUCR] &= ~@as(u8, 0x60);
+        }
+        if (d.st.bod_active != 0) {
+            d.st.bod_active -|= @intCast(@min(cycles, 3));
+            if (d.st.bod_active == 0) io[MCUCR] &= ~@as(u8, 0x40);
+        }
+        if (d.st.mcu_window != 0) {
+            d.st.mcu_window -|= @intCast(@min(cycles, 4));
+            if (d.st.mcu_window == 0) io[MCUCR] &= ~@as(u8, 1);
+        }
+        if (d.st.spm_window != 0) {
+            d.st.spm_window -|= @intCast(@min(cycles, 4));
+            if (d.st.spm_window == 0 and d.st.spm_busy == 0) io[SPMCSR] &= 0xC0;
+        }
+        if (d.st.spm_busy != 0) {
+            d.st.spm_busy -|= cycles;
+            if (d.st.spm_busy == 0) d.spmDone();
+        }
         if (d.st.ee_window > 0) {
             d.st.ee_window -|= @intCast(@min(cycles, 255));
             if (d.st.ee_window == 0) io[EECR] &= ~@as(u8, 0x04);
@@ -767,35 +1580,52 @@ pub const Devices = struct {
         if (d.st.wdt_window > 0) d.st.wdt_window -|= @intCast(@min(cycles, 255));
         if (d.st.clk_window > 0) d.st.clk_window -|= @intCast(@min(cycles, 255));
         // before the timers: a conversion they trigger in this tick counts from the next one
-        if (d.st.adc_busy > 0 and io[PRR] & PRADC == 0) {
+        if (d.adcRunning() and d.st.adc_busy > 0 and io[PRR] & PRADC == 0) {
             d.st.adc_busy -|= cycles;
             if (d.st.adc_sampled == 0 and d.st.adc_busy <= d.st.adc_hold) {
-                d.st.adc_held = d.analogIn(@truncate(io[ADMUX]));
+                d.st.adc_held = d.adcInput();
                 d.st.adc_sampled = 1;
             }
             if (d.st.adc_busy == 0) d.adcDone();
         }
-        // Timer0/Timer1 share a prescaler, Timer2 has its own (GTCCR.TSM holds them).
+        // Synchronous timers share a prescaler; Timer2 has its own (GTCCR.TSM holds them).
         const old01 = d.st.pre01;
         const old2 = d.st.pre2;
-        if (io[GTCCR] & 0x81 != 0x81) d.st.pre01 += cycles;
-        if (io[GTCCR] & 0x82 != 0x82) d.st.pre2 += cycles;
+        if (d.ioRunning() and io[GTCCR] & 0x81 != 0x81) d.st.pre01 += cycles;
+        if (d.timer2Running() and io[GTCCR] & 0x82 != 0x82 and io[ASSR] & 0x20 == 0) d.st.pre2 += cycles;
         const div01 = [8]u64{ 0, 1, 8, 64, 256, 1024, 0, 0 };
         const div2 = [8]u64{ 0, 1, 8, 32, 64, 128, 256, 1024 };
-        // shortcut: external clock sources (T0/T1 pins, CS = 6/7) and Timer2 asynchronous mode
-        // (ASSR.AS2) do not count; the image uses neither.
-        const ocf0a = io[TIFR0] & 2;
+        // External clocks arrive through GPIO edges; asynchronous Timer2 uses host oscillator ticks.
+        const flags0 = io[TIFR0];
+        const flags1 = io[TIFR1];
         if (io[PRR] & PRTIM0 == 0) d.timer8(0, ticks(old01, d.st.pre01, div01[io[TCCR0B] & 7]));
-        // ADC auto trigger on Timer0 compare A (ADTS = 011): the flag's rising edge starts a conversion,
-        // whether or not the interrupt is taken (a flag still set gives no edge)
-        if (ocf0a == 0 and io[TIFR0] & 2 != 0 and io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == 3 and d.st.adc_busy == 0 and io[PRR] & PRADC == 0) d.adcStart(true);
-        if (io[PRR] & PRTIM1 == 0) d.timer16(ticks(old01, d.st.pre01, div01[io[TCCR1B] & 7]));
-        if (io[PRR] & PRTIM2 == 0) d.timer8(2, ticks(old2, d.st.pre2, div2[io[TCCR2B] & 7]));
+        for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
+            const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
+            if (io[if (n == 0) @as(usize, PRR) else 0x65] & power == 0)
+                d.timer16(n, ticks(old01, d.st.pre01, div01[io[base + 1] & 7]));
+        }
+        if (d.timer2Running() and io[PRR] & PRTIM2 == 0 and io[ASSR] & 0x20 == 0) d.timer8(2, ticks(old2, d.st.pre2, div2[io[TCCR2B] & 7]));
+        for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
+            if (d.ioRunning() and io[base + 1] & 0x80 != 0) {
+                const t = &d.st.timer[n];
+                t.capture_cycles +|= @intCast(@min(cycles, 4));
+                if (t.capture_cycles >= 4) d.captureEdge(n, t.capture_candidate);
+            }
+        }
+        if (flags0 & 2 == 0 and io[TIFR0] & 2 != 0) d.adcTrigger(3);
+        if (flags0 & 1 == 0 and io[TIFR0] & 1 != 0) d.adcTrigger(4);
+        if (flags1 & 4 == 0 and io[TIFR1] & 4 != 0) d.adcTrigger(5);
+        if (flags1 & 1 == 0 and io[TIFR1] & 1 != 0) d.adcTrigger(6);
+        if (flags1 & 0x20 == 0 and io[TIFR1] & 0x20 != 0) d.adcTrigger(7);
         for (0..d.uartCount()) |k| {
             const mask: u8 = if (k == 0) PRUSART0 else if (d.mega) @as(u8, 1) << @intCast(k - 1) else PRUSART1;
-            if (io[if (d.mega and k > 0) 0x65 else PRR] & mask == 0) d.uartTick(@intCast(k), cycles);
+            if (d.ioRunning() and io[if (d.mega and k > 0) 0x65 else PRR] & mask == 0) d.uartTick(@intCast(k), cycles);
         }
-        if (d.st.master_busy > 0) {
+        if (d.ioRunning() and io[PRR] & 0x80 == 0 and d.st.twi.busy != 0) {
+            d.st.twi.busy -|= cycles;
+            if (d.st.twi.busy == 0) d.twiDone();
+        }
+        if (d.ioRunning() and io[PRR] & PRSPI == 0 and d.st.master_busy > 0) {
             d.st.master_busy -|= cycles;
             if (d.st.master_busy == 0) {
                 d.st.spi_rx = d.st.master_in;
@@ -883,6 +1713,8 @@ pub const Devices = struct {
             const ob = if (pwm) (if (n == 0) &d.st.ocr0b_buf else &d.st.ocr2b_buf) else &io[rob];
             const top: u8 = if (wgm == 2) io[roa] else if (wgm == 5 or wgm == 7) oa.* else 0xFF;
             const old = io[rc];
+            const old_compare = [_]u8{ oa.*, ob.* };
+            const was_down = d.st.down[n] != 0;
             var flags: u8 = 0;
             if (old == oa.*) flags |= 2; // OCFnA
             if (old == ob.*) flags |= 4; // OCFnB
@@ -912,104 +1744,238 @@ pub const Devices = struct {
                     oa.* = io[roa];
                     ob.* = io[rob];
                 }
-            } else io[rc] = old +% 1;
+            } else {
+                io[rc] = old +% 1;
+                if (wgm == 2 and old == 0xFF) flags |= 1; // CTC missed TOP still overflows at MAX.
+            }
             io[rf] |= flags;
-            if (n == 2) d.oc2bStep(wgm, flags & 4 != 0, old == top and !phase);
+            var changed = false;
+            for (0..2) |c| {
+                if (!d.output8Enabled(n, c)) continue;
+                const level = if (n == 0) &d.st.oc0[c] else if (c == 0) &d.st.oc2a else &d.st.oc2b;
+                const before = level.*;
+                const compare = old_compare[c];
+                compareOutput(level, @truncate(io[ra] >> @intCast(6 - 2 * c)), pwm, phase, flags & (@as(u8, 2) << @intCast(c)) != 0, old == top and !phase, was_down, compare == top, compare == 0);
+                changed = changed or level.* != before;
+            }
+            if (changed) {
+                d.pinChange();
+                d.owDrive();
+            }
         }
     }
 
-    /// OC2B after one Timer2 count (`match`: compare B; `bottom`: TOP -> BOTTOM in fast PWM), then the
-    /// 1-Wire master's drive. Fast PWM: COM2B 2 clears on match and sets at BOTTOM, 3 the opposite;
-    /// normal/CTC: 1 toggles, 2 clears, 3 sets on match.
-    /// shortcut: phase-correct PWM and the other timers' compare outputs are not modelled (the image
-    /// drives only OC2B, in fast PWM, avr-full §9).
-    fn oc2bStep(d: *Devices, wgm: u8, match: bool, bottom: bool) void {
-        const com = (d.st.io[TCCR2A] >> 4) & 3;
-        const was = d.st.oc2b;
-        if (wgm == 3 or wgm == 7) {
-            if (match and com >= 2) d.st.oc2b = @intFromBool(com == 3);
-            if (bottom and com >= 2) d.st.oc2b = @intFromBool(com == 2);
-        } else if (wgm == 0 or wgm == 2) {
-            if (match) d.st.oc2b = switch (com) {
-                1 => was ^ 1,
+    fn compareOutput(level: *u8, com: u2, pwm: bool, phase: bool, match: bool, bottom: bool, down: bool, compare_top: bool, compare_zero: bool) void {
+        if (com == 0) return;
+        if (!pwm or com == 1) {
+            if (match) level.* = switch (com) {
+                1 => level.* ^ 1,
                 2 => 0,
                 3 => 1,
-                else => was,
+                0 => level.*,
             };
+        } else if (phase) {
+            if (compare_top) level.* = @intFromBool(com == 2) else if (compare_zero) level.* = @intFromBool(com == 3) else if (match) level.* = @intFromBool(if (com == 2) down else !down);
+        } else {
+            if (match and !compare_top) level.* = @intFromBool(com == 3);
+            if (bottom) level.* = @intFromBool(com == 2);
         }
-        if (d.st.oc2b != was) d.owDrive();
     }
 
-    fn t1Pwm(io: *const [0x200]u8) bool {
-        const wgm = ((io[TCCR1B] >> 1) & 0xC) | (io[TCCR1A] & 3);
+    fn timerFor(d: *const Devices, a: u16) ?usize {
+        for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
+            const end: u16 = if (d.mega) 14 else 12;
+            if (a >= base and a < base + end and a != base + 3) return n;
+        }
+        return null;
+    }
+
+    fn timerPwm(io: *const [0x200]u8, n: usize) bool {
+        const base = timer16_bases[n];
+        const wgm = ((io[base + 1] >> 1) & 0xC) | (io[base] & 3);
         return wgm != 0 and wgm != 4 and wgm != 12 and wgm != 13;
     }
 
-    fn timer16(d: *Devices, k: u64) void {
+    fn timerRead(d: *Devices, n: usize, off: u16) u8 {
+        const t = &d.st.timer[n];
+        switch (off) {
+            2 => return 0, // Force-output-compare bits are write-only.
+            4, 6 => {
+                const value = if (off == 4) t.count else t.capture;
+                t.temp = @truncate(value >> 8);
+                return @truncate(value);
+            },
+            5, 7 => return t.temp,
+            8...13 => {
+                const value = t.buffered[(off - 8) / 2];
+                return if (off & 1 == 0) @truncate(value) else @truncate(value >> 8);
+            },
+            else => return d.st.io[timer16_bases[n] + off],
+        }
+    }
+
+    fn timerWrite(d: *Devices, n: usize, off: u16, value: u8) void {
+        const t = &d.st.timer[n];
+        switch (off) {
+            2 => {
+                if (!timerPwm(&d.st.io, n)) {
+                    for (0..if (d.mega) @as(usize, 3) else 2) |c| if (value & (@as(u8, 0x80) >> @intCast(c)) != 0) {
+                        compareOutput(&t.output[c], @truncate(d.st.io[timer16_bases[n]] >> @intCast(6 - 2 * c)), false, false, true, false, false, false, false);
+                    };
+                    d.pinChange();
+                }
+            },
+            5, 7, 9, 11, 13 => t.temp = value,
+            4 => t.count = @as(u16, t.temp) << 8 | value,
+            6 => t.capture = @as(u16, t.temp) << 8 | value,
+            8, 10, 12 => {
+                const c = (off - 8) / 2;
+                t.buffered[c] = @as(u16, t.temp) << 8 | value;
+                if (!timerPwm(&d.st.io, n)) t.compare[c] = t.buffered[c];
+            },
+            else => {
+                d.st.io[timer16_bases[n] + off] = value;
+                d.pinChange();
+            },
+        }
+    }
+
+    fn timer16(d: *Devices, n: usize, k: u64) void {
         const io = &d.st.io;
-        const wgm = ((io[TCCR1B] >> 1) & 0xC) | (io[TCCR1A] & 3);
-        const top: u16 = switch (wgm) {
-            0, 13 => 0xFFFF,
-            1, 5 => 0x00FF,
-            2, 6 => 0x01FF,
-            3, 7 => 0x03FF,
-            4, 9, 11, 15 => d.st.ocr1a,
-            else => d.st.icr1, // 8, 10, 12, 14
-        };
+        const t = &d.st.timer[n];
+        const base = timer16_bases[n];
+        const wgm = ((io[base + 1] >> 1) & 0xC) | (io[base] & 3);
         const phase = (wgm >= 1 and wgm <= 3) or (wgm >= 8 and wgm <= 11);
         const ctc = wgm == 4 or wgm == 12;
         var i: u64 = 0;
         while (i < k) : (i += 1) {
-            const old = d.st.tcnt1;
+            const top: u16 = switch (wgm) {
+                0, 13 => 0xFFFF,
+                1, 5 => 0x00FF,
+                2, 6 => 0x01FF,
+                3, 7 => 0x03FF,
+                4, 9, 11, 15 => t.compare[0],
+                else => t.capture,
+            };
+            const old = t.count;
+            const was_down = t.down != 0;
+            const old_compare = t.compare;
             var flags: u8 = 0;
-            if (old == d.st.ocr1a) flags |= 2;
-            if (old == d.st.ocr1b) flags |= 4;
+            for (t.compare[0..if (d.mega) @as(usize, 3) else 2], 0..) |compare, c| {
+                if (old == compare) flags |= @as(u8, 2) << @intCast(c);
+            }
             if (phase) {
-                if (d.st.down[1] == 0) {
+                if (t.down == 0) {
                     if (old >= top) {
-                        d.st.down[1] = 1;
-                        d.st.tcnt1 = old -% 1;
-                        if (wgm == 10 or wgm == 11 or wgm <= 3) d.applyOcr1();
-                    } else d.st.tcnt1 = old + 1;
+                        t.down = 1;
+                        t.count = old -% 1;
+                        if (wgm == 10 or wgm == 11 or wgm <= 3) t.compare = t.buffered;
+                    } else t.count = old + 1;
                 } else if (old == 0) {
-                    d.st.down[1] = 0;
-                    d.st.tcnt1 = 1;
+                    t.down = 0;
+                    t.count = 1;
                 } else {
-                    d.st.tcnt1 = old - 1;
+                    t.count = old - 1;
                     if (old == 1) {
                         flags |= 1;
-                        if (wgm == 8 or wgm == 9) d.applyOcr1(); // PFC updates at BOTTOM
+                        if (wgm == 8 or wgm == 9) t.compare = t.buffered;
                     }
                 }
             } else if (old == top) {
-                d.st.tcnt1 = 0;
+                t.count = 0;
                 if (!ctc or top == 0xFFFF) flags |= 1;
-                if (ctc and wgm == 12) flags |= 0x20; // ICF1 when ICR1 is TOP
-                if (!ctc and wgm != 0) d.applyOcr1();
-            } else d.st.tcnt1 = old +% 1;
-            io[TIFR1] |= flags;
+                if (wgm == 12 or wgm == 14) flags |= 0x20;
+                if (!ctc and wgm != 0) t.compare = t.buffered;
+            } else {
+                t.count = old +% 1;
+                if (ctc and old == 0xFFFF) flags |= 1;
+            }
+            io[timer16_flags[n]] |= flags;
+            var changed = false;
+            for (old_compare[0..if (d.mega) @as(usize, 3) else 2], 0..) |compare, c| {
+                if (!d.output16Enabled(n, c)) continue;
+                const before = t.output[c];
+                compareOutput(&t.output[c], @truncate(io[base] >> @intCast(6 - 2 * c)), timerPwm(io, n), phase, flags & (@as(u8, 2) << @intCast(c)) != 0, old == top and !phase, was_down, compare == top, compare == 0);
+                changed = changed or t.output[c] != before;
+            }
+            if (changed) d.pinChange();
         }
-    }
-
-    fn applyOcr1(d: *Devices) void {
-        d.st.ocr1a = d.st.ocr1a_buf;
-        d.st.ocr1b = d.st.ocr1b_buf;
     }
 
     // ---- interrupts ----------------------------------------------------------------------------
 
     fn sysPending(ctx: *anyopaque) ?u8 {
         const d: *Devices = @ptrCast(@alignCast(ctx));
-        return d.pending();
+        return if (d.st.sleeping != 0 and d.st.sleep_mode != 0) d.wakePending() else d.pending();
+    }
+
+    fn wakePending(d: *const Devices) ?u8 {
+        const io = &d.st.io;
+        var next: ?u8 = null;
+        const levels = d.extLevels();
+        for (0..d.extCount()) |n| {
+            const bit = @as(u8, 1) << @intCast(n);
+            if (io[EIMSK] & bit == 0) continue;
+            const mode = d.extMode(n);
+            if (n >= (if (d.mega) @as(usize, 4) else 2) and mode != 0) continue;
+            if (if (mode == 0) levels & bit == 0 else io[EIFR] & bit != 0)
+                next = firstVector(next, @intCast(n + 1));
+        }
+        const pc = io[PCIFR] & io[PCICR];
+        if (pc != 0) next = firstVector(next, d.vector(Vec.pcint0 + @as(u8, @ctz(pc))));
+        if (io[WDTCSR] & 0xC0 == 0xC0) next = firstVector(next, d.vector(Vec.wdt));
+        const twi_address = switch (io[TWSR] & 0xF8) {
+            0x60, 0x68, 0x70, 0x78, 0xA8, 0xB0 => true,
+            else => false,
+        };
+        if (twi_address and io[TWCR] & 0x85 == 0x85) next = firstVector(next, d.vector(Vec.twi));
+        const adc_noise = d.st.sleep_mode == 1;
+        if ((adc_noise and io[ASSR] & 0x20 != 0) or d.st.sleep_mode == 3 or d.st.sleep_mode == 7) {
+            const flags = io[TIFR2] & io[TIMSK2] & 7;
+            if (flags & 2 != 0) next = firstVector(next, d.vector(Vec.t2_compa));
+            if (flags & 4 != 0) next = firstVector(next, d.vector(Vec.t2_compb));
+            if (flags & 1 != 0) next = firstVector(next, d.vector(Vec.t2_ovf));
+        }
+        if (adc_noise) {
+            if (io[ADCSRA] & 0x18 == 0x18) next = firstVector(next, d.vector(Vec.adc));
+            if (io[EECR] & 0x0A == 0x08) next = firstVector(next, d.vector(Vec.ee_ready));
+            if (io[SPMCSR] & 0x81 == 0x80) next = firstVector(next, d.vector(Vec.spm_ready));
+        }
+        return next;
     }
 
     /// Lowest pending and enabled vector.
     pub fn pending(d: *const Devices) ?u8 {
-        if (d.pendingBase()) |vec| return d.vector(vec);
+        var next: ?u8 = d.extPending();
+        if (d.pendingBase()) |vec| next = firstVector(next, d.vector(vec));
+        for (0..d.timerCount()) |n| if (d.timerPending(n)) |vec| {
+            next = firstVector(next, vec);
+        };
+        if (d.st.io[TWCR] & 0x85 == 0x85) next = firstVector(next, d.vector(Vec.twi));
+        if (d.st.io[SPMCSR] & 0x81 == 0x80) next = firstVector(next, d.vector(Vec.spm_ready));
         if (d.mega) {
-            if (d.usartPending(2)) |vec| return vec;
-            return d.usartPending(3);
+            if (d.usartPending(2)) |vec| next = firstVector(next, vec);
+            if (d.usartPending(3)) |vec| next = firstVector(next, vec);
         }
+        return next;
+    }
+
+    fn firstVector(previous: ?u8, candidate: u8) u8 {
+        return if (previous) |old| @min(old, candidate) else candidate;
+    }
+
+    fn timerVector(d: *const Devices, n: usize) u8 {
+        return if (!d.mega) Vec.t1_capt else ([_]u8{ 16, 31, 41, 46 })[n];
+    }
+
+    fn timerPending(d: *const Devices, n: usize) ?u8 {
+        const flags = d.st.io[timer16_flags[n]] & d.st.io[timer16_masks[n]];
+        const vector_number = d.timerVector(n);
+        if (flags & 0x20 != 0) return vector_number;
+        if (flags & 2 != 0) return vector_number + 1;
+        if (flags & 4 != 0) return vector_number + 2;
+        if (d.mega and flags & 8 != 0) return vector_number + 3;
+        if (flags & 1 != 0) return vector_number + (if (d.mega) @as(u8, 4) else 3);
         return null;
     }
 
@@ -1022,17 +1988,13 @@ pub const Devices = struct {
         if (t2 & 2 != 0) return Vec.t2_compa;
         if (t2 & 4 != 0) return Vec.t2_compb;
         if (t2 & 1 != 0) return Vec.t2_ovf;
-        const t1 = io[TIFR1] & io[TIMSK1] & 0x27;
-        if (t1 & 0x20 != 0) return Vec.t1_capt;
-        if (t1 & 2 != 0) return Vec.t1_compa;
-        if (t1 & 4 != 0) return Vec.t1_compb;
-        if (t1 & 1 != 0) return Vec.t1_ovf;
         const t0 = io[TIFR0] & io[TIMSK0] & 7;
         if (t0 & 2 != 0) return Vec.t0_compa;
         if (t0 & 4 != 0) return Vec.t0_compb;
         if (t0 & 1 != 0) return Vec.t0_ovf;
         if (io[SPSR] & 0x80 != 0 and io[SPCR] & 0x80 != 0) return Vec.spi;
         if (d.usartPending(0)) |v| return v;
+        if (io[ACSR] & 0x18 == 0x18) return Vec.comparator;
         if (io[ADCSRA] & 0x18 == 0x18) return Vec.adc;
         if (io[EECR] & 0x0A == 0x08) return Vec.ee_ready;
         return d.usartPending(1);
@@ -1052,6 +2014,19 @@ pub const Devices = struct {
     fn sysAck(ctx: *anyopaque, actual_vec: u8) void {
         const d: *Devices = @ptrCast(@alignCast(ctx));
         const io = &d.st.io;
+        if (actual_vec >= 1 and actual_vec <= d.extCount()) {
+            io[EIFR] &= ~(@as(u8, 1) << @intCast(actual_vec - 1));
+            return;
+        }
+        for (0..d.timerCount()) |n| {
+            const first = d.timerVector(n);
+            const last = first + (if (d.mega) @as(u8, 4) else 3);
+            if (actual_vec >= first and actual_vec <= last) {
+                const bits = if (d.mega) &[_]u8{ 0x20, 2, 4, 8, 1 } else &[_]u8{ 0x20, 2, 4, 1 };
+                io[timer16_flags[n]] &= ~bits[actual_vec - first];
+                return;
+            }
+        }
         if (d.mega and (actual_vec == 53 or actual_vec == 56)) {
             io[if (actual_vec == 53) UCSR2A else UCSR3A] &= ~@as(u8, 0x40);
             return;
@@ -1084,6 +2059,7 @@ pub const Devices = struct {
             Vec.spi => io[SPSR] &= ~@as(u8, 0x80),
             Vec.usart0_tx => io[UCSR0A] &= ~@as(u8, 0x40),
             Vec.usart1_tx => io[UCSR1A] &= ~@as(u8, 0x40),
+            Vec.comparator => io[ACSR] &= ~@as(u8, 0x10),
             Vec.adc => io[ADCSRA] &= ~@as(u8, 0x10),
             else => {},
         }
@@ -1091,7 +2067,39 @@ pub const Devices = struct {
 
     fn sysSleep(ctx: *anyopaque) bool {
         const d: *Devices = @ptrCast(@alignCast(ctx));
-        return d.st.io[SMCR] & 1 != 0;
+        const mode = (d.st.io[SMCR] >> 1) & 7;
+        return d.st.io[SMCR] & 1 != 0 and mode != 4 and mode != 5;
+    }
+
+    fn sysSleeping(ctx: *anyopaque, asleep: bool) void {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        d.st.sleeping = @intFromBool(asleep);
+        if (!asleep) return;
+        d.st.sleep_mode = (d.st.io[SMCR] >> 1) & 7;
+        if (d.st.sleep_mode <= 1 and d.st.io[ADCSRA] & 0x80 != 0 and d.st.adc_busy == 0 and d.st.io[PRR] & PRADC == 0) d.adcStart(false);
+    }
+
+    fn sysWakeCycles(ctx: *anyopaque) u32 {
+        const d: *Devices = @ptrCast(@alignCast(ctx));
+        // Crystal stabilization is a separate analog startup qualification; digital wake latency
+        // is four clocks, or six for the crystal-running standby modes.
+        return if (d.st.sleep_mode == 6 or d.st.sleep_mode == 7) 6 else 4;
+    }
+
+    fn ioRunning(d: *const Devices) bool {
+        return d.st.sleeping == 0 or d.st.sleep_mode == 0;
+    }
+
+    fn adcRunning(d: *const Devices) bool {
+        return d.st.sleeping == 0 or d.st.sleep_mode <= 1;
+    }
+
+    fn timer2Running(d: *const Devices) bool {
+        return d.ioRunning() or d.st.sleep_mode == 3 or d.st.sleep_mode == 7;
+    }
+
+    fn asyncRunning(d: *const Devices) bool {
+        return d.st.sleeping == 0 or d.st.sleep_mode == 0 or d.st.sleep_mode == 1 or d.st.sleep_mode == 3 or d.st.sleep_mode == 7;
     }
 
     fn sysWdr(ctx: *anyopaque) void {
@@ -1120,11 +2128,11 @@ test "Timer1 normal mode at clk/1024; TEMP-latched 16-bit read; PRR gating" {
     try testing.expectEqual(@as(u8, 1), d.read(TCNT1L)); // the prescaler kept running: 6023/1024 - 5000/1024
     d.write(TCNT1H, 0x12);
     d.write(TCNT1L, 0x34);
-    try testing.expectEqual(@as(u16, 0x1234), d.st.tcnt1);
+    try testing.expectEqual(@as(u16, 0x1234), d.st.timer[0].count);
     try testing.expectEqual(@as(u8, 0x34), d.read(TCNT1L));
-    d.st.tcnt1 = 0xABCD; // changes between the two reads
+    d.st.timer[0].count = 0xABCD; // changes between the two reads
     try testing.expectEqual(@as(u8, 0x12), d.read(TCNT1H)); // high byte latched by the low read
-    d.st.tcnt1 = 0xFFFF;
+    d.st.timer[0].count = 0xFFFF;
     d.tick(1024);
     try testing.expectEqual(@as(u8, 1), d.st.io[TIFR1] & 1); // TOV1
     try testing.expectEqual(@as(u8, 6), d.st.io[TIFR1] & 6); // OCF1A/B: OCR1A/B are 0, passed at 0 -> 1
@@ -1257,6 +2265,50 @@ test "watchdog: timed sequence, interrupt mode timeout" {
     try testing.expectEqual(@as(u8, 0x80), d.st.io[WDTCSR]);
 }
 
+test "programmed WDTON fuse forces a watchdog reset despite runtime disable or interrupt requests" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.configureFuses(0x77, 0x89, 0xFE, 0xFF);
+        d.reset();
+        try testing.expectEqual(@as(u8, 0x08), d.read(WDTCSR) & 0x48);
+        d.write(MCUSR, 0);
+        d.write(WDTCSR, 0x18);
+        d.write(WDTCSR, 0x40); // Attempt to replace reset mode with interrupt-only mode.
+        try testing.expectEqual(@as(u8, 0x08), d.read(WDTCSR) & 0x48);
+        d.tick(@intCast(d.wdtPeriod()));
+        try testing.expectEqual(@as(u8, 1), d.st.reset_request);
+        try testing.expectEqual(@as(u8, 0), d.read(WDTCSR) & 0x40);
+    }
+}
+
+test "CTC missed TOP still sets overflow on the 8-bit and 16-bit MAX wrap" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]u16{ TCCR0A, TCCR2A }) |base| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            d.write(base, 2); // CTC; TOP=OCRnA.
+            d.write(base + 1, 1); // Clock/1.
+            d.write(base + 3, 10);
+            d.write(base + 2, 0xFF); // Software has already passed TOP.
+            d.tick(1);
+            try testing.expectEqual(@as(u8, 0), d.read(base + 2));
+            try testing.expectEqual(@as(u8, 1), d.read(if (base == TCCR0A) TIFR0 else TIFR2) & 1);
+        }
+        for (timer16_bases[0..if (mega) @as(usize, 4) else 1], 0..) |base, n| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            d.write(base + 1, 0x09); // CTC mode4, clock/1.
+            d.write(base + 9, 0);
+            d.write(base + 8, 10);
+            d.write(base + 5, 0xFF);
+            d.write(base + 4, 0xFF);
+            d.tick(1);
+            try testing.expectEqual(@as(u16, 0), d.st.timer[n].count);
+            try testing.expectEqual(@as(u8, 1), d.read(timer16_flags[n]) & 1);
+        }
+    }
+}
+
 test "A17 open bus: a read above SRAM or of a register without a model returns 0, the tape first" {
     var bus = try Bus.init(testing.allocator, &.{.{ .lo = 0x20, .hi = 0xFF, .kind = .mmio }}, &.{});
     defer bus.deinit();
@@ -1264,14 +2316,14 @@ test "A17 open bus: a read above SRAM or of a register without a model returns 0
     d.reset();
     bus.dev = d.device();
     bus.resetRun(100);
-    try testing.expectEqual(@as(u64, 0), bus.read(0xB9, 8)); // TWSR, no model
+    try testing.expectEqual(@as(u64, 0), bus.read(0x51, 8)); // OCDR, no model
     try testing.expectEqual(@as(u64, 0), bus.read(0xF0F0, 8)); // above SRAM
     try testing.expectEqual(@as(?common.bus.Stop, null), bus.stop);
-    var t = try common.tape.Tape.init(testing.allocator, &.{.{ .addr = 0xB9, .value = 0xF8 }});
+    var t = try common.tape.Tape.init(testing.allocator, &.{.{ .addr = 0x51, .value = 0xF8 }});
     defer t.deinit(testing.allocator);
     bus.tape = &t;
-    try testing.expectEqual(@as(u64, 0xF8), bus.read(0xB9, 8)); // a tape still answers first
-    try testing.expectEqual(@as(u64, 0), bus.read(0xB9, 8));
+    try testing.expectEqual(@as(u64, 0xF8), bus.read(0x51, 8)); // a tape still answers first
+    try testing.expectEqual(@as(u64, 0), bus.read(0x51, 8));
 }
 
 test "registers without a model come from the tape" {
@@ -1280,15 +2332,15 @@ test "registers without a model come from the tape" {
     const map = [_]common.bus.Range{.{ .lo = 0x20, .hi = 0xFF, .kind = .mmio }};
     var bus = try Bus.init(testing.allocator, &map, &backing);
     defer bus.deinit();
-    var t = try common.tape.Tape.init(testing.allocator, &.{.{ .addr = 0xB9, .value = 0xF8 }}); // TWSR
+    var t = try common.tape.Tape.init(testing.allocator, &.{.{ .addr = 0x51, .value = 0xF8 }}); // OCDR
     defer t.deinit(testing.allocator);
     bus.tape = &t;
     var d = fresh();
     d.bus = &bus;
     bus.dev = d.device();
-    try testing.expectEqual(@as(u64, 0xF8), bus.read(0xB9, 8));
+    try testing.expectEqual(@as(u64, 0xF8), bus.read(0x51, 8));
     try testing.expectEqual(@as(u64, 0x03), bus.read(CLKPR, 8)); // modelled: no tape
-    _ = bus.read(0xB9, 8);
+    _ = bus.read(0x51, 8);
     try testing.expectEqual(common.bus.Stop.tape_exhausted, bus.stop.?);
 }
 
@@ -1437,4 +2489,884 @@ test "640/1280 extended GPIO, interrupt acknowledgement and full EEPROM addressi
     d.tick(@intCast(d.fCpu() * 34 / 10_000));
     try testing.expectEqual(@as(u8, 0x5A), d.st.ee[0xF80]);
     try testing.expectEqual(@as(u8, 0xFF), d.st.ee[0x180]);
+}
+
+test "640/1280 timers3-5: independent TEMP latches, all compare flags, vectors, PRR1 and TSM" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    const system = d.sys();
+    for (timer16_bases[1..], 1..) |base, n| {
+        d.write(base + 5, 0xAB);
+        d.write(base + 4, 0xCD);
+        d.write(timer16_bases[0] + 5, 0x12); // a different timer has its own TEMP register
+        try testing.expectEqual(@as(u8, 0xCD), d.read(base + 4));
+        d.st.timer[n].count = 0x5678;
+        try testing.expectEqual(@as(u8, 0xAB), d.read(base + 5));
+        d.write(base + 5, 0);
+        d.write(base + 4, 0);
+        for ([_]u16{ 8, 10, 12 }, 0..) |off, compare| {
+            d.write(base + off + 1, 0);
+            d.write(base + off, @intCast(compare + 2));
+        }
+        d.write(base + 1, 1); // clk/1, normal mode
+        d.write(timer16_masks[n], 0x0E);
+        d.tick(5);
+        try testing.expectEqual(@as(u8, 0x0E), d.read(timer16_flags[n]));
+        for (0..3) |compare| {
+            const vector_number = d.timerVector(n) + 1 + @as(u8, @intCast(compare));
+            try testing.expectEqual(@as(?u8, vector_number), d.pending());
+            system.ack(system.ctx, vector_number);
+        }
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        const count = d.st.timer[n].count;
+        d.write(0x65, @as(u8, 1) << @intCast(n + 2));
+        d.tick(20);
+        try testing.expectEqual(count, d.st.timer[n].count);
+        d.write(0x65, 0);
+        d.write(GTCCR, 0x81); // synchronous prescalers held reset
+        d.tick(20);
+        try testing.expectEqual(count, d.st.timer[n].count);
+        d.write(GTCCR, 0);
+        d.write(base + 5, 0xFF);
+        d.write(base + 4, 0xFF);
+        d.write(timer16_masks[n], 1);
+        d.tick(1);
+        try testing.expectEqual(@as(u16, 0), d.st.timer[n].count);
+        try testing.expectEqual(@as(?u8, d.timerVector(n) + 4), d.pending());
+        d.write(timer16_flags[n], 1);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        d.write(base + 1, 0);
+    }
+}
+
+test "640/1280 compare C and timer3 retain hardware interrupt priority against UART1" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(TIMSK1, 9); // compare C and overflow enabled
+    d.st.io[TIFR1] = 9;
+    d.st.io[0x38] = 2;
+    d.write(0x71, 2);
+    d.write(UCSR1A + 1, 0x20); // UART1 data-register-empty vector36
+    try testing.expectEqual(@as(?u8, 19), d.pending());
+    Devices.sysAck(&d, 19);
+    try testing.expectEqual(@as(?u8, 20), d.pending());
+    Devices.sysAck(&d, 20);
+    try testing.expectEqual(@as(?u8, 32), d.pending());
+    Devices.sysAck(&d, 32);
+    try testing.expectEqual(@as(?u8, 37), d.pending());
+}
+
+test "640/1280 timer3 CTC and PWM update all channels at the specified counter boundary" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(0x99, 0);
+    d.write(0x98, 3); // OCR3A = TOP
+    d.write(0x91, 9); // CTC, clk/1
+    d.tick(4);
+    try testing.expectEqual(@as(u16, 0), d.st.timer[1].count);
+    try testing.expectEqual(@as(u8, 2), d.read(0x38) & 3); // compare at TOP, no overflow
+    d.write(0x38, 0xFF);
+    d.write(0x90, 1);
+    d.write(0x91, 9); // mode5, fast 8-bit PWM
+    d.write(0x99, 0);
+    d.write(0x98, 12);
+    d.write(0x9D, 0);
+    d.write(0x9C, 9);
+    try testing.expectEqual(@as(u16, 3), d.st.timer[1].compare[0]);
+    d.tick(256);
+    try testing.expectEqual(@as(u16, 12), d.st.timer[1].compare[0]);
+    try testing.expectEqual(@as(u16, 9), d.st.timer[1].compare[2]);
+    try testing.expectEqual(@as(u8, 1), d.read(0x38) & 1);
+}
+
+test "external interrupts: model pin maps, edge flags without masks, low-level retrigger and W1C" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.setPinsIn(3, 0xFF);
+        if (mega) d.setPinsIn(4, 0xFF) else d.setPinsIn(1, 0xFF);
+        d.write(EICRA, 0xAA); // falling edges, no interrupt masks yet
+        if (mega) d.write(EICRB, 0xAA);
+        d.setPinsIn(3, if (mega) 0xFE else 0xFB);
+        try testing.expectEqual(@as(u8, 1), d.read(EIFR) & 1);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        d.write(EIMSK, 1);
+        try testing.expectEqual(@as(?u8, 1), d.pending());
+        Devices.sysAck(&d, 1);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        d.write(EICRA, 0); // low level while INT0 remains low
+        try testing.expectEqual(@as(?u8, 1), d.pending());
+        Devices.sysAck(&d, 1);
+        try testing.expectEqual(@as(?u8, 1), d.pending()); // level remains asserted
+        d.setPinsIn(3, 0xFF);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        d.write(EICRA, 0xFF); // rising edges
+        if (mega) d.write(EICRB, 0xFF);
+        d.setPinsIn(if (mega) 4 else 1, 0);
+        d.setPinsIn(if (mega) 4 else 1, if (mega) 0x80 else 4);
+        const bit: u8 = if (mega) 0x80 else 4;
+        d.write(EIMSK, bit);
+        try testing.expectEqual(@as(?u8, if (mega) 8 else 3), d.pending());
+        d.write(EIFR, bit);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+    }
+}
+
+test "external timer clocks and noise-cancelled capture use actual model pins" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(0x91, 7); // Timer3 counts rising PE6 edges
+    d.setPinsIn(4, 0x40);
+    d.setPinsIn(4, 0);
+    d.setPinsIn(4, 0x40);
+    try testing.expectEqual(@as(u16, 2), d.st.timer[1].count);
+    d.tick(100);
+    try testing.expectEqual(@as(u16, 2), d.st.timer[1].count);
+    d.write(0x91, 0xC1); // noise cancellation, rising ICP3 PE7, clk/1
+    d.write(0x71, 0x20);
+    d.setPinsIn(4, 0xC0);
+    d.tick(3);
+    try testing.expectEqual(@as(?u8, null), d.pending());
+    d.setPinsIn(4, 0x40); // pulse shorter than four cycles must be ignored
+    d.tick(10);
+    try testing.expectEqual(@as(?u8, null), d.pending());
+    const count = d.st.timer[1].count;
+    d.setPinsIn(4, 0xC0);
+    d.tick(10);
+    try testing.expectEqual(@as(?u8, 31), d.pending());
+    try testing.expectEqual(count + 4, d.st.timer[1].capture);
+    try testing.expectEqual(@as(u8, @truncate(count + 4)), d.read(0x96));
+    try testing.expectEqual(@as(u8, @truncate((count + 4) >> 8)), d.read(0x97));
+    var small = fresh();
+    small.write(TCCR0B, 7);
+    small.setPinsIn(1, 1);
+    try testing.expectEqual(@as(u8, 1), small.read(TCNT0));
+    small.write(TCCR1B, 6);
+    small.setPinsIn(1, 3);
+    small.setPinsIn(1, 1);
+    try testing.expectEqual(@as(u16, 1), small.st.timer[0].count);
+}
+
+test "ADC extended mux is latched, differential conversion signed, and ADCL locks paired results" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    try testing.expectEqual(@as(usize, 16), d.analogCount());
+    d.setAnalog(0, 123);
+    d.setAnalog(8, 900);
+    d.write(ADCSRB, 8); // MUX5 selects ADC8
+    d.write(ADCSRA, 0xC0);
+    d.write(ADCSRB, 0); // a mux change during conversion applies to the next conversion
+    d.tick(50);
+    try testing.expectEqual(@as(u8, @truncate(@as(u16, 900))), d.read(ADCL));
+    try testing.expectEqual(@as(u8, 900 >> 8), d.read(ADCH));
+    d.write(ADCSRA, 0xC0);
+    d.tick(26);
+    try testing.expectEqual(@as(u8, 123), d.read(ADCL));
+    d.setAnalog(0, 400);
+    d.write(ADCSRA, 0xC0);
+    d.tick(26);
+    try testing.expectEqual(@as(u8, 0), d.read(ADCH)); // locked prior result
+    try testing.expectEqual(@as(u8, 123), d.read(ADCL));
+    _ = d.read(ADCH);
+    d.setAnalog(1, 600);
+    d.write(ADMUX, 16); // ADC0 - ADC1, gain1, signed result = (400-600)/2
+    d.write(ADCSRA, 0xC0);
+    d.tick(26);
+    const negative: u16 = @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8;
+    try testing.expectEqual(@as(u16, 0x39C), negative);
+    var small = fresh();
+    try testing.expectEqual(@as(usize, 8), small.analogCount());
+}
+
+test "ADC free running and timer1 overflow auto trigger preserve hardware flags" {
+    var d = fresh();
+    d.setAnalog(0, 333);
+    d.write(ADCSRA, 0xE0); // enable, start, auto-trigger; source0 free-running
+    d.tick(50);
+    try testing.expectEqual(@as(u8, 0x50), d.read(ADCSRA) & 0x50); // ADIF and new ADSC
+    _ = d.read(ADCL);
+    _ = d.read(ADCH);
+    d.write(ADCSRA, 0); // terminate free-running
+    d.write(ADCSRB, 6); // timer1 overflow
+    d.write(ADCSRA, 0xA0);
+    d.write(TCNT1H, 0xFF);
+    d.write(TCNT1L, 0xFF);
+    d.write(TCCR1B, 1);
+    d.tick(1);
+    try testing.expectEqual(@as(u8, 0x40), d.read(ADCSRA) & 0x40);
+    d.tick(50);
+    try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x50);
+    d.write(TCNT1H, 0xFF);
+    d.write(TCNT1L, 0xFF);
+    d.tick(1); // TOV remains set: no new edge
+    try testing.expectEqual(@as(u8, 0), d.read(ADCSRA) & 0x40);
+    d.write(TIFR1, 1);
+    d.write(TCNT1H, 0xFF);
+    d.write(TCNT1L, 0xFF);
+    d.tick(1);
+    try testing.expectEqual(@as(u8, 0x40), d.read(ADCSRA) & 0x40);
+}
+
+test "strict peripheral coverage rejects unsupported blocks and selects the actual AVR profile" {
+    var small = fresh();
+    var large: Devices = .{ .mega = true };
+    large.reset();
+    try testing.expect(!small.modeledAccess(0x94, false)); // Timer3 absent on 164P
+    try testing.expect(large.modeledAccess(0x94, false));
+    try testing.expect(!small.modeledAccess(0x8C, false)); // Timer1 compare C absent on 164P
+    try testing.expect(large.modeledAccess(0x8C, false));
+    try testing.expect(!large.modeledAccess(0x51, false)); // OCDR
+    try testing.expect(large.modeledAccess(ASSR, false)); // asynchronous Timer2
+    try testing.expect(large.modeledAccess(SPMCSR, true)); // guest self-programming
+    try testing.expect(large.modeledAccess(0x92, true)); // FOC drives modeled compare pins
+    try testing.expect(large.modeledAccess(0x92, false)); // reads zero
+}
+
+test "timer force compare drives model-specific pins without changing counters or flags" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        const port: u4 = if (mega) 1 else 3;
+        const bit: u8 = if (mega) 0x20 else 0x20; // OC1A = PB5/PD5
+        d.write(port_bases[port] + 1, bit);
+        d.write(TCCR1A, 0x40); // toggle OC1A, non-PWM
+        d.write(TCCR1A + 2, 0x80);
+        try testing.expectEqual(bit, d.pin(port) & bit);
+        try testing.expectEqual(@as(u8, 0), d.read(TCCR1A + 2));
+        try testing.expectEqual(@as(u16, 0), d.st.timer[0].count);
+        try testing.expectEqual(@as(u8, 0), d.read(TIFR1));
+        d.write(TCCR1A + 2, 0x80);
+        try testing.expectEqual(@as(u8, 0), d.pin(port) & bit);
+        d.write(TCCR1A, 0xC0); // set OC1A on forced match
+        d.write(TCCR1A + 2, 0x80);
+        try testing.expectEqual(bit, d.pin(port) & bit);
+        d.write(port_bases[port] + 1, 0); // DDR still controls whether the timer drives the pad
+        try testing.expectEqual(@as(u8, 0), d.pin(port) & bit);
+        d.write(port_bases[port] + 1, bit);
+        d.write(TCCR1A, 0); // disconnected: PORT latch supplies the level
+        try testing.expectEqual(@as(u8, 0), d.pin(port) & bit);
+    }
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(0x2D, 0x20); // DDRE5, OC3C
+    d.write(0x90, 0x0C); // set OC3C
+    d.write(0x92, 0x20); // FOC3C
+    try testing.expectEqual(@as(u8, 0x20), d.pin(4) & 0x20);
+    try testing.expectEqual(@as(u8, 0), d.read(0x38));
+}
+
+test "digital PWM outputs expose fast and phase-correct compare behavior on GPIO" {
+    var d = fresh();
+    d.write(0x24, 0x10); // DDRB4 = OC0B
+    d.write(TCCR0A, 0x23); // fast PWM, non-inverting OC0B
+    d.write(OCR0B, 3);
+    d.st.ocr0b_buf = 3;
+    d.write(TCNT0, 0xFF);
+    d.write(TCCR0B, 1);
+    d.tick(1); // BOTTOM sets output
+    try testing.expectEqual(@as(u8, 0x10), d.pin(1) & 0x10);
+    d.tick(4); // compare clears output
+    try testing.expectEqual(@as(u8, 0), d.pin(1) & 0x10);
+    d.write(TCCR0B, 0x41); // FOC0B in PWM must have no effect
+    try testing.expectEqual(@as(u8, 0), d.pin(1) & 0x10);
+    d.write(TCCR0A, 0x21); // phase correct
+    d.write(TCNT0, 2);
+    d.st.down[0] = 1;
+    d.tick(1); // no compare yet
+    try testing.expectEqual(@as(u8, 0), d.pin(1) & 0x10);
+    d.write(TCNT0, 3);
+    d.tick(1); // compare while down-counting sets non-inverting output
+    try testing.expectEqual(@as(u8, 0x10), d.pin(1) & 0x10);
+    d.st.down[0] = 0;
+    d.write(TCNT0, 3);
+    d.tick(1);
+    try testing.expectEqual(@as(u8, 0), d.pin(1) & 0x10);
+}
+
+test "comparator synchronizes output, reports family interrupts, acknowledges and captures Timer1" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(ACSR, 0x0F); // interrupt enabled, rising edge, capture enabled
+        d.write(TCCR1B, 0x41); // Timer1 clk/1, capture rising
+        d.write(TIMSK1, 0x20);
+        d.setComparatorInputs(800, 100);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x20);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 0x30), d.read(ACSR) & 0x30);
+        try testing.expectEqual(@as(?u8, if (mega) 16 else Vec.t1_capt), d.pending());
+        Devices.sysAck(&d, if (mega) 16 else Vec.t1_capt);
+        try testing.expectEqual(@as(?u8, if (mega) 28 else Vec.comparator), d.pending());
+        Devices.sysAck(&d, if (mega) 28 else Vec.comparator);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        d.setComparatorInputs(0, 500); // falling edge ignored by rising-only comparator mode
+        d.tick(2);
+        try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x30);
+        d.write(ACSR, 0x08); // toggle mode, capture disconnected
+        d.setComparatorInputs(600, 500);
+        d.tick(2);
+        try testing.expectEqual(@as(u8, 0x30), d.read(ACSR) & 0x30);
+        d.write(ACSR, 0x18); // ACI write-one-to-clear; ACO is read-only
+        try testing.expectEqual(@as(u8, 0x20), d.read(ACSR) & 0x30);
+        d.write(ACSR, 0x80); // disable: host input changes do not signal interrupts
+        d.setComparatorInputs(0, 500);
+        d.tick(10);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+    }
+}
+
+test "comparator ADC mux, explicit bandgap sample and ADC comparator-edge trigger" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.setAnalog(10, 800);
+    d.setComparatorInputs(600, 100);
+    d.write(ADMUX, 2);
+    d.write(ADCSRB, 0x48); // ACME and MUX5: negative input ADC10
+    d.tick(2);
+    try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x20);
+    d.setAnalog(10, 400);
+    d.tick(2);
+    try testing.expectEqual(@as(u8, 0x20), d.read(ACSR) & 0x20);
+    d.setBandgap(225);
+    d.write(ACSR, 0x50); // bandgap positive, clear previous ACI
+    d.tick(2);
+    try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x20);
+    d.write(ADMUX, 30);
+    d.write(ADCSRB, 0);
+    d.write(ADCSRA, 0xC0);
+    d.tick(50);
+    const bandgap = @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8;
+    try testing.expectEqual(@as(u16, 225), bandgap);
+    d.write(ACSR, 0x10); // external comparator inputs, clear ACI
+    d.write(ADCSRB, 1); // comparator ADC trigger
+    d.write(ADCSRA, 0xA0);
+    d.setComparatorInputs(0, 100);
+    d.tick(2);
+    d.write(ACSR, 0x10);
+    d.setComparatorInputs(600, 100);
+    d.tick(2);
+    try testing.expectEqual(@as(u8, 0x40), d.read(ADCSRA) & 0x40);
+}
+
+test "asynchronous Timer2 commits each register after two oscillator edges and ignores CPU clock" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(ASSR, 0x20);
+        d.write(TCCR2B, 1);
+        d.write(TCNT2, 0xFE);
+        d.write(OCR2A, 0xFF);
+        try testing.expectEqual(@as(u8, 0x19), d.read(ASSR) & 0x1F);
+        d.tick(1000);
+        try testing.expectEqual(@as(u8, 0), d.read(TCNT2));
+        d.asyncTick(1);
+        try testing.expectEqual(@as(u8, 0), d.read(TCNT2));
+        try testing.expectEqual(@as(u8, 0x19), d.read(ASSR) & 0x1F);
+        d.asyncTick(1);
+        try testing.expectEqual(@as(u8, 0xFE), d.read(TCNT2));
+        try testing.expectEqual(@as(u8, 0), d.read(ASSR) & 0x1F);
+        d.write(PRR, PRTIM2); // PRR stops only synchronous Timer2
+        d.asyncTick(2);
+        try testing.expectEqual(@as(u8, 0), d.read(TCNT2));
+        try testing.expectEqual(@as(u8, 3), d.read(TIFR2) & 3);
+        d.write(TIMSK2, 2);
+        try testing.expectEqual(@as(?u8, if (mega) 13 else Vec.t2_compa), d.pending());
+        d.write(ASSR, 0);
+        d.write(PRR, 0);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 1), d.read(TCNT2));
+    }
+}
+
+test "TWI master has timed address/data ACK or NACK, repeated START, reads and auto-clearing STOP" {
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    d.write(TWBR, 2);
+    d.write(TWSR, 1); // bit time = 16 + 2*2*4 = 32 clocks
+    d.write(TWCR, 0xA5); // START, enable, interrupt enabled
+    d.tick(31);
+    try testing.expectEqual(@as(u8, 0), d.read(TWCR) & 0x80);
+    d.tick(1);
+    try testing.expectEqual(@as(u8, 0x09), d.read(TWSR));
+    try testing.expectEqual(@as(?u8, 39), d.pending());
+    Devices.sysAck(&d, 39); // TWI interrupt flag is software-cleared only
+    try testing.expectEqual(@as(?u8, 39), d.pending());
+    d.write(TWDR, 0xA0);
+    d.write(TWCR, 0x85);
+    try testing.expect(d.twiReply(.ack, 0));
+    d.tick(32 * 9);
+    try testing.expectEqual(@as(u8, 0x19), d.read(TWSR));
+    d.write(TWDR, 0x42);
+    d.write(TWCR, 0x85);
+    try testing.expect(d.twiReply(.ack, 0));
+    d.tick(32 * 9);
+    try testing.expectEqual(@as(u8, 0x29), d.read(TWSR));
+    d.write(TWCR, 0xA5); // repeated START keeps master ownership
+    d.tick(32);
+    try testing.expectEqual(@as(u8, 0x11), d.read(TWSR));
+    d.write(TWDR, 0xA1);
+    d.write(TWCR, 0x85);
+    try testing.expect(d.twiReply(.ack, 0));
+    d.tick(32 * 9);
+    try testing.expectEqual(@as(u8, 0x41), d.read(TWSR));
+    d.write(TWCR, 0xC5); // receive and ACK first byte
+    try testing.expect(d.twiReply(.ack, 0xAB));
+    d.tick(32 * 9);
+    try testing.expectEqual(@as(u8, 0x51), d.read(TWSR));
+    try testing.expectEqual(@as(u8, 0xAB), d.read(TWDR));
+    d.write(TWCR, 0x85); // receive and NACK last byte
+    try testing.expect(d.twiReply(.ack, 0xCD));
+    d.tick(32 * 9);
+    try testing.expectEqual(@as(u8, 0x59), d.read(TWSR));
+    try testing.expectEqual(@as(u8, 0xCD), d.read(TWDR));
+    d.write(TWCR, 0x95); // STOP is not an interrupt event
+    d.tick(32);
+    try testing.expectEqual(@as(u8, 0), d.read(TWCR) & 0x90);
+    try testing.expectEqual(@as(u8, 0xF9), d.read(TWSR));
+    try testing.expectEqual(@as(?u8, null), d.pending());
+    const kinds = [_]TwiEvent.Kind{ .start, .address, .write, .start, .address, .read, .read, .stop };
+    const values = [_]u8{ 0, 0xA0, 0x42, 0, 0xA1, 0xAB, 0xCD, 0 };
+    for (kinds, values) |kind, value| {
+        const event = d.twiPop().?;
+        try testing.expectEqual(kind, event.kind);
+        try testing.expectEqual(value, event.value);
+    }
+    try testing.expectEqual(@as(?TwiEvent, null), d.twiPop());
+}
+
+test "TWI no peer NACK, collision, clock gating, arbitration loss and bus errors remain visible" {
+    var d = fresh();
+    d.write(TWDR, 0x55); // TWINT clear: writing data is forbidden
+    try testing.expectEqual(@as(u8, 0xFF), d.read(TWDR));
+    try testing.expectEqual(@as(u8, 8), d.read(TWCR) & 8);
+    d.write(TWCR, 0xA4);
+    d.write(PRR, 0x80);
+    d.tick(1000);
+    try testing.expectEqual(@as(u8, 0), d.read(TWCR) & 0x80);
+    d.write(PRR, 0);
+    d.tick(16);
+    d.write(TWDR, 0x20);
+    try testing.expectEqual(@as(u8, 0), d.read(TWCR) & 8);
+    d.write(TWCR, 0x84);
+    d.tick(16 * 9);
+    try testing.expectEqual(@as(u8, 0x20), d.read(TWSR)); // unacknowledged address
+    for ([_]TwiReply{ .arbitration_lost, .bus_error }, [_]u8{ 0x38, 0 }) |reply, expected| {
+        d.write(TWCR, 0xA4);
+        d.tick(16);
+        d.write(TWDR, 0x20);
+        d.write(TWCR, 0x84);
+        try testing.expect(d.twiReply(reply, 0));
+        d.tick(16 * 9);
+        try testing.expectEqual(expected, d.read(TWSR));
+        try testing.expectEqual(@as(u8, 0), d.st.twi.master);
+    }
+    try testing.expect(!d.twiReply(.ack, 0)); // no in-flight byte
+}
+
+test "TWI slave address masks, general call, clock stretching, data ACK and transmitted bytes" {
+    var d = fresh();
+    d.write(TWAR, 0x51); // own address0x28, general calls enabled
+    d.write(TWAMR, 2); // low address bit is don't-care
+    d.write(TWCR, 0x44); // enable and ACK
+    try testing.expect(!d.twiAddress(0x30, false));
+    try testing.expect(d.twiAddress(0x29, false));
+    try testing.expectEqual(@as(u8, 0x60), d.read(TWSR));
+    try testing.expect(!d.twiReceive(1)); // TWINT stretches SCL until guest services it
+    d.write(TWCR, 0xC4);
+    try testing.expect(d.twiReceive(0xA5));
+    try testing.expectEqual(@as(u8, 0x80), d.read(TWSR));
+    try testing.expectEqual(@as(u8, 0xA5), d.read(TWDR));
+    d.write(TWCR, 0xC4);
+    try testing.expect(d.twiStop());
+    try testing.expectEqual(@as(u8, 0xA0), d.read(TWSR));
+    d.write(TWCR, 0xC4);
+    try testing.expect(d.twiAddress(0, false));
+    try testing.expectEqual(@as(u8, 0x70), d.read(TWSR));
+    d.write(TWCR, 0x84); // next receive NACK
+    try testing.expect(d.twiReceive(0x33));
+    try testing.expectEqual(@as(u8, 0x98), d.read(TWSR));
+    d.write(TWCR, 0xC4);
+    try testing.expect(d.twiAddress(0x28, true));
+    try testing.expectEqual(@as(u8, 0xA8), d.read(TWSR));
+    d.write(TWDR, 0x12);
+    d.write(TWCR, 0xC4);
+    try testing.expectEqual(@as(?u8, 0x12), d.twiTransmit(true));
+    try testing.expectEqual(@as(u8, 0xB8), d.read(TWSR));
+    d.write(TWDR, 0x34);
+    d.write(TWCR, 0xC4);
+    try testing.expectEqual(@as(?u8, 0x34), d.twiTransmit(false));
+    try testing.expectEqual(@as(u8, 0xC0), d.read(TWSR));
+    try testing.expectEqual(@as(?u8, null), d.twiTransmit(true));
+}
+
+test "ELPM reads the1280 upper flash and increments RAMPZ across the physical wrap, LPM ignores it" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{ 0x9107, 0x95D8, 0x9114 }); // ELPM r16,Z+; ELPM; LPM r17,Z
+    defer t.deinit();
+    var d: Devices = .{ .mega = true };
+    d.reset();
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    t.cpu.program_mask = 0xFFFF;
+    t.prog[0x1FFFF] = 0xA5;
+    t.prog[0x10100] = 0x5A;
+    t.prog[0x100] = 0xC3;
+    t.cpu.setSreg(0x55);
+    t.cpu.setReg16(30, 0xFFFF);
+    d.write(RAMPZ, 0xFF);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0xA5), t.cpu.reg(16));
+    try testing.expectEqual(@as(u16, 0), t.cpu.reg16(30));
+    try testing.expectEqual(@as(u8, 0), d.read(RAMPZ));
+    t.cpu.setReg16(30, 0x100);
+    d.write(RAMPZ, 1);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0x5A), t.cpu.reg(0));
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0xC3), t.cpu.reg(17));
+    try testing.expectEqual(@as(u8, 0x55), t.cpu.sregByte());
+    try testing.expectEqual(@as(u64, 9), t.cpu.st.cycles);
+    var small: emu.cpu.TestRig = .{};
+    try small.init(&.{0x95D8});
+    defer small.deinit();
+    small.cpu.step();
+    try testing.expectEqual(emu.cpu.Stop{ .invalid = 0 }, small.cpu.stop.?);
+}
+
+const SpmTest = struct {
+    fn command(t: *emu.cpu.TestRig, d: *Devices, control: u8, address: u32, word: u16) !void {
+        t.cpu.st.pc = d.bootStart();
+        t.cpu.setReg16(30, @truncate(address));
+        if (d.mega) d.write(RAMPZ, @truncate(address >> 16));
+        t.cpu.setReg16(0, word);
+        t.cpu.write(SPMCSR, control);
+        try t.steps(1);
+    }
+};
+
+test "SPM instructions enforce boot and lock permissions, page erase/write timing, NOR writes and RWW enable" {
+    for ([_]bool{ false, true }) |mega| {
+        var t: emu.cpu.TestRig = .{};
+        try t.init(&.{0x95E8}); // application SPM cannot self-program
+        defer t.deinit();
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        t.bus.dev = d.device();
+        t.cpu.sys = d.sys();
+        t.cpu.program_mask = if (mega) 0xFFFF else emu.cpu.pc_mask;
+        const boot = @as(usize, d.bootStart()) * 2;
+        std.mem.writeInt(u16, t.prog[boot..][0..2], 0x95E8, .little);
+        @memset(t.prog[0x100..0x200], 0);
+        t.cpu.write(SPMCSR, 3);
+        t.cpu.setReg16(30, 0x100);
+        try t.steps(1);
+        try testing.expectEqual(@as(u32, 0), d.st.spm_busy);
+        try testing.expectEqual(@as(u8, 0), t.prog[0x100]);
+        try SpmTest.command(&t, &d, 3, 0x100, 0); // observed lock0xEA denies application writes
+        try testing.expectEqual(@as(u32, 0), d.st.spm_busy);
+        d.configureFuses(0x77, 0x99, 0xFE, 0xFF); // explicit unlocked programmer fixture
+        try SpmTest.command(&t, &d, 1, 0x100, 0xE50A); // LDI r16,0x5A
+        try SpmTest.command(&t, &d, 3, 0x100, 0);
+        try testing.expect(d.st.spm_busy > 0);
+        const remaining = d.st.spm_busy;
+        d.tick(remaining - 1);
+        try testing.expectEqual(@as(u8, 0), t.prog[0x100]);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 0xFF), t.prog[0x100]);
+        try SpmTest.command(&t, &d, 5, 0x100, 0);
+        d.tick(d.st.spm_busy);
+        try testing.expectEqual(@as(u16, 0xE50A), std.mem.readInt(u16, t.prog[0x100..][0..2], .little));
+        try testing.expectEqual(@as(u8, 0x40), d.read(SPMCSR));
+        t.cpu.st.pc = 0x80;
+        const cycles = t.cpu.st.cycles;
+        try t.steps(1); // instruction fetch is blocked until RWW is explicitly re-enabled
+        try testing.expectEqual(@as(u16, 0x80), t.cpu.st.pc);
+        try testing.expectEqual(cycles + 1, t.cpu.st.cycles);
+        try SpmTest.command(&t, &d, 0x11, 0, 0);
+        t.cpu.st.pc = 0x80;
+        try t.steps(1);
+        try testing.expectEqual(@as(u8, 0x5A), t.cpu.reg(16));
+        try SpmTest.command(&t, &d, 1, 0x100, 0xFFFF);
+        try SpmTest.command(&t, &d, 5, 0x100, 0); // programming cannot turn zero bits back to ones
+        d.tick(d.st.spm_busy);
+        try testing.expectEqual(@as(u16, 0xE50A), std.mem.readInt(u16, t.prog[0x100..][0..2], .little));
+        try SpmTest.command(&t, &d, 0x11, 0, 0);
+        t.cpu.write(SPMCSR, 1);
+        d.tick(4); // expired enable window
+        t.cpu.st.pc = d.bootStart();
+        t.cpu.setReg16(0, 0);
+        try t.steps(1);
+        try testing.expectEqual(@as(u8, 0xFF), d.st.spm_buffer[0]);
+    }
+}
+
+test "NRWW self-programming stalls the CPU and lock programming never restores bits" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{0x0000});
+    defer t.deinit();
+    var d: Devices = .{};
+    d.reset();
+    d.configureFuses(0x77, 0x99, 0xFE, 0xFF);
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    const boot = @as(usize, d.bootStart()) * 2;
+    std.mem.writeInt(u16, t.prog[boot..][0..2], 0x95E8, .little);
+    try SpmTest.command(&t, &d, 9, 1, 0xEA);
+    d.tick(d.st.spm_busy);
+    try testing.expectEqual(@as(u8, 0xEA), d.fuses().lock);
+    try SpmTest.command(&t, &d, 9, 1, 0xFF);
+    d.tick(d.st.spm_busy);
+    try testing.expectEqual(@as(u8, 0xEA), d.fuses().lock);
+    d.configureFuses(0x77, 0x99, 0xFE, 0xFF);
+    try SpmTest.command(&t, &d, 3, d.rwwLimit(), 0);
+    const paused = t.cpu.st.pc;
+    const remaining = d.st.spm_busy;
+    try t.steps(10);
+    try testing.expectEqual(paused, t.cpu.st.pc);
+    try testing.expectEqual(remaining - 10, d.st.spm_busy);
+    d.tick(d.st.spm_busy);
+    try testing.expectEqual(@as(u8, 0xFF), t.prog[boot]);
+    try testing.expectEqual(@as(u8, 0), d.read(SPMCSR));
+}
+
+test "LPM reads configured fuses/signature and boot lock protection through real guest instructions" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{0x95C8}); // LPM r0,Z
+    defer t.deinit();
+    var d: Devices = .{};
+    d.reset();
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    for ([_]u8{ 0x77, 0xEA, 0xFE, 0x99 }, 0..) |expected, address| {
+        t.cpu.st.pc = 0;
+        t.cpu.setReg16(30, @intCast(address));
+        t.cpu.write(SPMCSR, 9);
+        try t.steps(1);
+        try testing.expectEqual(expected, t.cpu.reg(0));
+        try testing.expectEqual(@as(u8, 0), d.read(SPMCSR));
+    }
+    for ([_]u16{ 0, 2, 4 }, [_]u8{ 0x1E, 0x94, 0x0A }) |address, expected| {
+        t.cpu.st.pc = 0;
+        t.cpu.setReg16(30, address);
+        t.cpu.write(SPMCSR, 0x21);
+        try t.steps(1);
+        try testing.expectEqual(expected, t.cpu.reg(0));
+    }
+    d.configureFuses(0x77, 0x99, 0xFE, 0xDF); // BLB12 blocks application LPM of boot flash
+    t.prog[@as(usize, d.bootStart()) * 2] = 0xAB;
+    t.cpu.st.pc = 0;
+    t.cpu.setReg16(30, d.bootStart() * 2);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0), t.cpu.reg(0));
+}
+
+test "MCUCR interrupt relocation uses fuse-sized boot vectors and waits through the next instruction" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{ 0x0000, 0x0000, 0x0000, 0x0000 });
+    defer t.deinit();
+    var d: Devices = .{};
+    d.reset();
+    d.configureFuses(0x77, 0x99, 0xFE, 0xFF);
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    d.write(EIMSK, 1); // INT0 low-level input held low
+    t.cpu.setSreg(0x80);
+    t.cpu.write(MCUCR, 1);
+    try t.steps(1); // IVCE disables interrupts, preserves SREG.I
+    try testing.expectEqual(@as(u16, 1), t.cpu.st.pc);
+    try testing.expectEqual(@as(u8, 0x80), t.cpu.sregByte());
+    t.cpu.write(MCUCR, 2);
+    try t.steps(1); // next instruction also completes before an IRQ
+    try testing.expectEqual(@as(u16, 2), t.cpu.st.pc);
+    try t.steps(1);
+    try testing.expectEqual(d.bootStart() + 2, t.cpu.st.pc);
+    try testing.expectEqual(@as(u16, 2), t.cpu.popPc());
+    d.reset();
+    d.write(MCUCR, 2); // no timed enable: IVSEL remains clear
+    try testing.expectEqual(@as(u8, 0), d.read(MCUCR) & 2);
+    d.write(MCUCR, 1);
+    d.tick(4);
+    d.write(MCUCR, 2); // expired timed enable
+    try testing.expectEqual(@as(u8, 0), d.read(MCUCR) & 3);
+    d.configureFuses(0x77, 0x98, 0xFE, 0xFF);
+    try testing.expectEqual(@as(u16, 0x1C00), d.resetVector());
+    d.reset();
+    try testing.expectEqual(@as(u16, 0x1C00), d.resetVector());
+}
+
+test "SBI/CBI preserve unrelated write-one-to-clear flags and do not toggle other PIN bits" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{ 0x9AA9, 0x98A8, 0x9A00 }); // SBI TIFR0,1; CBI TIFR0,0; SBI PINA,0
+    defer t.deinit();
+    var d: Devices = .{};
+    d.reset();
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    d.st.io[TIFR0] = 7;
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 5), d.read(TIFR0));
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 5), d.read(TIFR0));
+    d.setPinsIn(0, 0xFF);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 1), d.read(0x22));
+}
+
+test "SPM ready is a level IRQ, EEPROM excludes SPM, and MCUCR/MCUSR keep timed/W0C semantics" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(SPMCSR, 0x80);
+        const vector_number: u8 = if (mega) 40 else Vec.spm_ready;
+        try testing.expectEqual(@as(?u8, vector_number), d.pending());
+        Devices.sysAck(&d, vector_number);
+        try testing.expectEqual(@as(?u8, vector_number), d.pending());
+        d.write(SPMCSR, 0);
+        d.write(EECR, 4);
+        d.write(EECR, 2);
+        d.write(SPMCSR, 3);
+        try testing.expectEqual(@as(u8, 0), d.read(SPMCSR));
+        d.write(MCUCR, 0x80);
+        try testing.expectEqual(@as(u8, 0), d.read(MCUCR) & 0x80);
+        d.tick(4);
+        d.write(MCUCR, 0x80); // expired first attempt cannot change JTD
+        try testing.expectEqual(@as(u8, 0), d.read(MCUCR) & 0x80);
+        d.write(MCUCR, 0x80);
+        try testing.expectEqual(@as(u8, 0x80), d.read(MCUCR) & 0x80);
+        d.write(MCUSR, 0xFF); // software cannot set hardware reset-cause flags
+        try testing.expectEqual(@as(u8, 1), d.read(MCUSR));
+        d.write(MCUSR, 0);
+        try testing.expectEqual(@as(u8, 0), d.read(MCUSR));
+        d.write(CLKPR, 0x80);
+        try testing.expectEqual(@as(u8, 0x83), d.read(CLKPR));
+        d.tick(4);
+        try testing.expectEqual(@as(u8, 3), d.read(CLKPR));
+    }
+    var d = fresh();
+    d.write(MCUCR, 0x60);
+    d.tick(1);
+    d.write(MCUCR, 0x40);
+    try testing.expectEqual(@as(u8, 0x40), d.read(MCUCR) & 0x60);
+    d.tick(3);
+    try testing.expectEqual(@as(u8, 0), d.read(MCUCR) & 0x60);
+}
+
+test "SLEEP with global interrupts clear wakes on enabled IRQ without vectoring or clearing flags" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{ 0x9588, 0xE50A }); // SLEEP; LDI r16,0x5A
+    defer t.deinit();
+    var d: Devices = .{};
+    d.reset();
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    d.write(SMCR, 5); // power-down, SE
+    d.write(EICRA, 3); // INT0 rising edge
+    d.write(EIMSK, 1);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 1), t.cpu.st.sleeping);
+    try t.steps(2);
+    try testing.expectEqual(@as(u16, 1), t.cpu.st.pc);
+    d.setPinsIn(3, 4); // INT0/PD2 rising
+    const cycles = t.cpu.st.cycles;
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0), t.cpu.st.sleeping);
+    try testing.expectEqual(@as(u16, 1), t.cpu.st.pc);
+    try testing.expectEqual(cycles + 4, t.cpu.st.cycles);
+    try testing.expectEqual(@as(u16, 0x4FF), t.cpu.st.sp);
+    try testing.expectEqual(@as(u8, 1), d.read(EIFR));
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0x5A), t.cpu.reg(16));
+}
+
+test "SEI followed by SLEEP takes pending IRQ after wake latency and returns after SLEEP" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{ 0x9478, 0x9588, 0xE50A }); // SEI; SLEEP; LDI r16,0x5A
+    defer t.deinit();
+    std.mem.writeInt(u16, t.prog[0x40..][0..2], 0x9518, .little); // RETI, Timer0 compareA vector16
+    var d: Devices = .{};
+    d.reset();
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    d.write(SMCR, 1); // Idle sleep
+    d.write(TIMSK0, 2);
+    d.st.io[TIFR0] = 2;
+    try t.steps(2);
+    try testing.expectEqual(@as(u8, 1), t.cpu.st.sleeping);
+    try testing.expectEqual(@as(u16, 2), t.cpu.st.pc);
+    const cycles = t.cpu.st.cycles;
+    try t.steps(1);
+    try testing.expectEqual(@as(u16, 0x20), t.cpu.st.pc);
+    try testing.expectEqual(cycles + 8, t.cpu.st.cycles);
+    try testing.expectEqual(@as(u8, 0), d.read(TIFR0));
+    try t.steps(2);
+    try testing.expectEqual(@as(u8, 0x5A), t.cpu.reg(16));
+}
+
+test "sleep clock domains stop synchronous peripherals, preserve watchdog and gate asynchronous Timer2" {
+    for ([_]u8{ 1, 2, 3, 6, 7 }) |mode| {
+        var t: emu.cpu.TestRig = .{};
+        try t.init(&.{ 0x9588, 0x0000 });
+        defer t.deinit();
+        var d: Devices = .{};
+        d.reset();
+        t.bus.dev = d.device();
+        t.cpu.sys = d.sys();
+        d.write(TCCR0B, 1);
+        d.write(TCCR1B, 1);
+        d.write(UCSR0A + 1, 8);
+        d.write(UCSR0A + 6, 0x41);
+        d.write(SPCR, 0x50); // SPI master, clk/4
+        d.write(SPDR, 0x55);
+        d.write(ASSR, 0x20);
+        d.write(TCCR2B, 1);
+        d.asyncTick(2); // commit asynchronous clock source register
+        d.write(SMCR, 1 | mode << 1);
+        d.write(WDTCSR, 0x40); // watchdog interrupt remains active in every supported sleep mode
+        try t.steps(1);
+        const timer0 = d.read(TCNT0);
+        const timer1 = d.st.timer[0].count;
+        const timer2 = d.read(TCNT2);
+        const uart_busy = d.st.usart[0].tx_busy;
+        const spi_busy = d.st.master_busy;
+        const watchdog = d.st.wdt_count;
+        try t.steps(20);
+        try testing.expectEqual(timer0, d.read(TCNT0));
+        try testing.expectEqual(timer1, d.st.timer[0].count);
+        try testing.expectEqual(uart_busy, d.st.usart[0].tx_busy);
+        try testing.expectEqual(spi_busy, d.st.master_busy);
+        try testing.expectEqual(watchdog + 20, d.st.wdt_count);
+        d.asyncTick(10);
+        try testing.expectEqual(timer2 + (if (mode == 2 or mode == 6) @as(u8, 0) else 10), d.read(TCNT2));
+        try testing.expectEqual(@as(u8, 1), t.cpu.st.sleeping);
+        d.tick(@intCast(d.wdtPeriod()));
+        const cycles = t.cpu.st.cycles;
+        try t.steps(1); // WDT wakes even though globalI remains clear
+        try testing.expectEqual(@as(u8, 0), t.cpu.st.sleeping);
+        try testing.expectEqual(cycles + (if (mode == 6 or mode == 7) @as(u64, 6) else 4), t.cpu.st.cycles);
+    }
+}
+
+test "ADC noise reduction starts a conversion and wakes only eligible clock-domain interrupts" {
+    var t: emu.cpu.TestRig = .{};
+    try t.init(&.{ 0x9588, 0xE007 });
+    defer t.deinit();
+    var d: Devices = .{};
+    d.reset();
+    t.bus.dev = d.device();
+    t.cpu.sys = d.sys();
+    d.setAnalog(0, 600);
+    d.write(ADCSRA, 0x88); // ADC enabled, ADC interrupt enabled, no software start
+    d.write(TIMSK0, 2);
+    d.st.io[TIFR0] = 2; // synchronous Timer0 flag cannot wake ADC-noise sleep
+    d.write(SMCR, 3);
+    try t.steps(1);
+    try testing.expect(d.st.adc_busy != 0);
+    try t.steps(50);
+    try testing.expectEqual(@as(u8, 1), t.cpu.st.sleeping);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 0), t.cpu.st.sleeping);
+    try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x10);
+    try t.steps(1);
+    try testing.expectEqual(@as(u8, 7), t.cpu.reg(16));
 }
