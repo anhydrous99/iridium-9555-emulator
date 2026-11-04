@@ -18,8 +18,10 @@ with fabricated code or successful service responses.
   source file is read-only. Program reads and fuse configuration are exposed
   through the native protocol; reset restores the supplied program bytes and
   retains the configured fuse fixture.
-  External reset preserves an active flash erase/write and its remaining time,
-  while clearing the temporary page buffer. On the 9555, EEPROM programming
+  External reset preserves active flash and EEPROM programming, including the
+  pending data and remaining time. Programming continues while the board holds
+  reset, without executing AVR instructions or clocking its other peripherals.
+  Reset clears the temporary page buffer. On the 9555, EEPROM programming
   invalidates loaded page-buffer data; a page write then stops with
   `undefined_spm_buffer` rather than inventing unspecified bytes. Clear the
   buffer with RWWSRE and reload it before retrying. The Extreme retains its
@@ -137,6 +139,9 @@ Raw debugger memory reads are observational and are not added to the bus trace.
 The AVR-only comparator and asynchronous-clock operations do not execute guest
 instructions. `adc` accepts the BC5's four AIO inputs or the AVR profile's 8/16
 normalized 10-bit channels.
+The AVR-only `reset_clock` operation accepts `cycles` from 1 to 10,000,000 and
+advances only pending flash/EEPROM programming. The board scheduler uses it
+while reset is held, in ordinary execution and function-probe service.
 `key` and `serial` apply to BC5; `pin_state` observes AVR electrical/external
 levels. The BC5 `gpio` state contains live direction/output, edge masks,
 key-latch/contact state and pending IRQs; raw memory reads do not substitute

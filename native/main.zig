@@ -767,6 +767,11 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
             if (handset == .@"9575") avr_cpu.st.sp = 0x21FF;
         } else return error.ResetUnavailable;
         resetCounters();
+    } else if (std.mem.eql(u8, op.string, "reset_clock")) {
+        if (current_image != .avr) return error.AvrOnly;
+        const cycles = try number(u32, obj, "cycles", null);
+        if (cycles == 0 or cycles > max_steps) return error.StepLimit;
+        avr_dev.tickReset(cycles);
     } else if (std.mem.eql(u8, op.string, "read")) {
         return readMemory(out, try number(u32, obj, "address", null), try number(u32, obj, "count", 1));
     } else if (std.mem.eql(u8, op.string, "program_read")) {

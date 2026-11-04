@@ -228,6 +228,7 @@ pub const State = extern struct {
     async_pending: [5]u8 = @splat(0),
     wdt_count: u64 = 0,
     ee_busy: u32 = 0,
+    ee_pending: extern struct { address: u16 = 0, data: u8 = 0, mode: u8 = 0 } = .{},
     adc_busy: u32 = 0,
     master_busy: u32 = 0,
     timer: [4]Timer16 = .{ .{}, .{}, .{}, .{} },
@@ -348,6 +349,8 @@ pub const Devices = struct {
 
     pub fn resetWithCause(d: *Devices, cause: ResetCause) void {
         const ee = d.st.ee;
+        const ee_busy = d.st.ee_busy;
+        const ee_pending = d.st.ee_pending;
         const ow = d.st.ow;
         const fuse = d.st.fuse;
         const analog = d.st.analog;
@@ -364,6 +367,11 @@ pub const Devices = struct {
         d.st = .{};
         d.st.fuse = fuse;
         d.st.ee = ee;
+        if (cause == .external and ee_busy != 0) {
+            d.st.ee_busy = ee_busy;
+            d.st.ee_pending = ee_pending;
+            d.st.io[EECR] = 2;
+        }
         d.st.ow = .{ .connected = ow.connected, .present = ow.present, .mem = ow.mem };
         d.st.analog = analog;
         d.st.comparator = comparator;
@@ -905,6 +913,7 @@ pub const Devices = struct {
                 }
                 if (a == PCMSK0 or a == 0x6C or a == 0x6D or a == PCMSK3) d.pinChange();
                 if (a == EICRA or a == EICRB) d.externalInterrupts();
+                if ((a == PRR or (d.mega and a == 0x65)) and previous & ~v != 0) d.captureInputs();
                 if (a == ADMUX or a == ADCSRB or (a == PRR and (previous ^ v) & PRADC != 0)) d.comparatorRefresh();
                 if (a == ADCSRB and !trigger and d.adcTriggerLevel()) d.adcTrigger(@truncate(v));
                 if (a == TCCR0A or a == TCCR2A) {
@@ -1022,6 +1031,7 @@ pub const Devices = struct {
                 if (v & 0x02 != 0 and mpe and d.st.ee_busy == 0 and d.st.spm_busy == 0) {
                     if (!d.mega and d.st.spm_buffer_state == .loaded) d.st.spm_buffer_state = .invalid;
                     d.st.ee_busy = @intCast(d.fCpu() * 34 / 10_000); // 3.4 ms
+                    d.st.ee_pending = .{ .address = d.eeAddr(), .data = io[EEDR], .mode = (v >> 4) & 3 };
                     d.st.ee_window = 0;
                     io[a] = (io[a] & 0x02) | (v & 0x38) | 0x02;
                 } else {
@@ -1103,7 +1113,7 @@ pub const Devices = struct {
         } else if (t.master != 0) {
             t.action = switch (io[TWSR] & 0xF8) {
                 0x08, 0x10 => .address,
-                0x18, 0x28 => .write,
+                0x18, 0x20, 0x28, 0x30 => .write,
                 0x40, 0x50 => .read,
                 else => .none,
             };
@@ -1141,6 +1151,7 @@ pub const Devices = struct {
                 t.master = 0;
                 io[TWCR] &= ~@as(u8, 0x10);
                 io[TWSR] = (io[TWSR] & 3) | 0xF8;
+                if (io[TWCR] & 0x20 != 0) d.twiControl(io[TWCR] | 0x80);
             },
             .address => {
                 d.twiCapture(.{ .kind = .address, .value = io[TWDR] });
@@ -1271,14 +1282,24 @@ pub const Devices = struct {
             t.external_last = level;
             const clock = d.st.io[base + 1] & 7;
             if (level != previous and (clock == 6 or clock == 7) and level == clock - 6 and d.timerPowered(n)) d.timer16(n, 1);
-            if (!d.timerPowered(n)) continue;
-            const capture = d.captureLevel(n);
-            if (capture != t.capture_candidate) {
-                t.capture_candidate = capture;
-                t.capture_cycles = 0;
-            }
-            if (d.st.io[base + 1] & 0x80 == 0) d.captureEdge(n, capture);
+            d.captureInput(n);
         }
+    }
+
+    fn captureInputs(d: *Devices) void {
+        if (!d.ioRunning()) return;
+        for (0..d.timerCount()) |n| d.captureInput(n);
+    }
+
+    fn captureInput(d: *Devices, n: usize) void {
+        if (!d.timerPowered(n)) return;
+        const t = &d.st.timer[n];
+        const capture = d.captureLevel(n);
+        if (capture != t.capture_candidate) {
+            t.capture_candidate = capture;
+            t.capture_cycles = 0;
+        }
+        if (d.st.io[timer16_bases[n] + 1] & 0x80 == 0) d.captureEdge(n, capture);
     }
 
     fn timerPowered(d: *const Devices, n: usize) bool {
@@ -1636,7 +1657,7 @@ pub const Devices = struct {
         if (cycles > 1 and d.ioRunning()) {
             for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
                 const t = &d.st.timer[n];
-                if (d.st.io[base + 1] & 0x80 != 0 and t.capture_last != t.capture_candidate) {
+                if (d.timerPowered(n) and d.st.io[base + 1] & 0x80 != 0 and t.capture_last != t.capture_candidate) {
                     const until = @min(cycles, 4 - @min(t.capture_cycles, @as(u8, 4)));
                     for (0..until) |_| d.tick(1);
                     d.tick(cycles - until);
@@ -1667,10 +1688,7 @@ pub const Devices = struct {
             d.st.spm_window -|= @intCast(@min(cycles, 4));
             if (d.st.spm_window == 0 and d.st.spm_busy == 0) io[SPMCSR] &= 0xC0;
         }
-        if (d.st.spm_busy != 0) {
-            d.st.spm_busy -|= cycles;
-            if (d.st.spm_busy == 0) d.spmDone();
-        }
+        d.tickReset(cycles);
         if (d.st.ee_window > 0) {
             d.st.ee_window -|= @intCast(@min(cycles, 255));
             if (d.st.ee_window == 0) io[EECR] &= ~@as(u8, 0x04);
@@ -1711,25 +1729,20 @@ pub const Devices = struct {
             const mask: u8 = if (k == 0) PRUSART0 else if (d.mega) @as(u8, 1) << @intCast(k - 1) else PRUSART1;
             if (d.ioRunning() and io[if (d.mega and k > 0) 0x65 else PRR] & mask == 0) d.uartTick(@intCast(k), cycles);
         }
-        if (d.ioRunning() and io[PRR] & 0x80 == 0 and d.st.twi.busy != 0) {
-            d.st.twi.busy -|= cycles;
-            if (d.st.twi.busy == 0) d.twiDone();
+        if (d.ioRunning() and io[PRR] & 0x80 == 0) {
+            var remaining = cycles;
+            while (d.st.twi.busy != 0 and remaining >= d.st.twi.busy) {
+                remaining -= d.st.twi.busy;
+                d.st.twi.busy = 0;
+                d.twiDone();
+            }
+            d.st.twi.busy -|= remaining;
         }
         if (d.ioRunning() and io[PRR] & PRSPI == 0 and d.st.master_busy > 0) {
             d.st.master_busy -|= cycles;
             if (d.st.master_busy == 0) {
                 d.st.spi_rx = d.st.master_in;
                 io[SPSR] |= 0x80;
-            }
-        }
-        if (d.st.ee_busy > 0) {
-            d.st.ee_busy -|= cycles;
-            if (d.st.ee_busy == 0) {
-                const a = d.eeAddr();
-                const mode = (io[EECR] >> 4) & 3;
-                if (mode != 2) d.st.ee[a] = 0xFF; // erase
-                if (mode != 1) d.st.ee[a] &= io[EEDR]; // write
-                io[EECR] &= ~@as(u8, 0x02);
             }
         }
         const wdt = io[WDTCSR];
@@ -1741,6 +1754,23 @@ pub const Devices = struct {
                     io[MCUSR] |= 0x08;
                     d.st.reset_request = 1;
                 }
+            }
+        }
+    }
+
+    /// Nonvolatile programming has its own clock and continues while external reset is held.
+    pub fn tickReset(d: *Devices, cycles: u32) void {
+        if (d.st.spm_busy != 0) {
+            d.st.spm_busy -|= cycles;
+            if (d.st.spm_busy == 0) d.spmDone();
+        }
+        if (d.st.ee_busy != 0) {
+            d.st.ee_busy -|= cycles;
+            if (d.st.ee_busy == 0) {
+                const transaction = d.st.ee_pending;
+                if (transaction.mode != 2) d.st.ee[transaction.address] = 0xFF; // erase
+                if (transaction.mode != 1) d.st.ee[transaction.address] &= transaction.data; // write
+                d.st.io[EECR] &= ~@as(u8, 0x02);
             }
         }
     }
@@ -1962,29 +1992,30 @@ pub const Devices = struct {
             const old_compare = t.compare;
             const blocked = t.compare_blocked != 0;
             t.compare_blocked = 0;
+            const top_match = old == top and !(blocked and (ctc or (wgm >= 8 and wgm != 13)));
             var flags: u8 = 0;
             for (t.compare[0..if (d.mega) @as(usize, 3) else 2], 0..) |compare, c| {
                 if (!blocked and old == compare) flags |= @as(u8, 2) << @intCast(c);
             }
             if (phase) {
                 if (t.down == 0) {
-                    if (old >= top) {
+                    if (top_match) {
                         t.down = 1;
                         t.count = old -% 1;
                         if (wgm == 10 or wgm == 11 or wgm <= 3) t.compare = t.buffered;
-                    } else t.count = old + 1;
-                } else if (old == 0) {
+                    } else t.count = old +% 1;
+                } else if (old == 0 and !blocked) {
                     t.down = 0;
                     t.count = 1;
                 } else {
-                    t.count = old - 1;
+                    t.count = old -% 1;
                     if (old == 1) {
                         flags |= 1;
                         if (wgm == 8 or wgm == 9) t.compare = t.buffered;
                     }
                 }
                 if ((wgm == 8 or wgm == 10) and !was_down and t.count == top) flags |= 0x20;
-            } else if (old == top and !(wgm == 4 and blocked)) {
+            } else if (top_match) {
                 t.count = 0;
                 if (!ctc or top == 0xFFFF) flags |= 1;
                 if (wgm == 12 or wgm == 14) flags |= 0x20;
@@ -1998,7 +2029,7 @@ pub const Devices = struct {
             for (old_compare[0..if (d.mega) @as(usize, 3) else 2], 0..) |compare, c| {
                 if (!d.output16Enabled(n, c)) continue;
                 const before = t.output[c];
-                compareOutput(&t.output[c], @truncate(io[base] >> @intCast(6 - 2 * c)), timerPwm(io, n), phase, flags & (@as(u8, 2) << @intCast(c)) != 0, old == top and !phase, was_down, compare == top, compare == 0);
+                compareOutput(&t.output[c], @truncate(io[base] >> @intCast(6 - 2 * c)), timerPwm(io, n), phase, flags & (@as(u8, 2) << @intCast(c)) != 0, top_match and !phase, was_down, compare == top, compare == 0);
                 changed = changed or t.output[c] != before;
             }
             if (changed) d.pinChange();
@@ -2179,6 +2210,7 @@ pub const Devices = struct {
         d.st.sleeping = @intFromBool(asleep);
         if (!asleep) {
             d.externalInterrupts();
+            d.captureInputs();
             return;
         }
         d.st.sleep_mode = (d.st.io[SMCR] >> 1) & 7;
@@ -3980,4 +4012,228 @@ test "ADC noise reduction starts a conversion and wakes only eligible clock-doma
     try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x10);
     try t.steps(1);
     try testing.expectEqual(@as(u8, 7), t.cpu.reg(16));
+}
+
+test "round4 external reset preserves the latched EEPROM transaction and programming time" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]u8{ 0, 1, 2 }) |mode| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            const address: u16 = if (mega) 0x823 else 0x123;
+            d.st.ee[address] = 0xA5;
+            d.write(EEARH, @truncate(address >> 8));
+            d.write(EEARL, @truncate(address));
+            d.write(EEDR, 0x5A);
+            d.write(EECR, (mode << 4) | 4);
+            d.write(EECR, (mode << 4) | 2);
+            d.tick(37);
+            const remaining = d.st.ee_busy;
+            try testing.expect(remaining > 1);
+            d.resetWithCause(.external);
+            try testing.expectEqual(remaining, d.st.ee_busy);
+            try testing.expectEqual(@as(u8, 2), d.read(EECR) & 2);
+            d.write(EEARH, 0);
+            d.write(EEARL, 0);
+            d.write(EEDR, 0);
+            d.write(EECR, 0x30); // New register contents must not alter the active write.
+            d.tickReset(remaining - 1);
+            try testing.expectEqual(@as(u8, 0xA5), d.st.ee[address]);
+            d.resetWithCause(.external);
+            d.tickReset(1);
+            try testing.expectEqual(@as(u8, if (mode == 0) 0x5A else if (mode == 1) 0xFF else 0), d.st.ee[address]);
+            try testing.expectEqual(@as(u8, 0xFF), d.st.ee[0]);
+            try testing.expectEqual(@as(u8, 0), d.read(EECR) & 2);
+            try testing.expectEqual(@as(u16, 0), d.st.timer[0].count);
+            try testing.expectEqual(@as(u64, 0), d.st.cycles);
+        }
+    }
+}
+
+test "round4 writing variable PWM TOP suppresses transitions until the next match after MAX" {
+    for ([_]bool{ false, true }) |mega| {
+        const count: usize = if (mega) 4 else 1;
+        for (timer16_bases[0..count], 0..) |base, n| {
+            for ([_]u8{ 8, 9, 10, 11, 14, 15 }) |mode| {
+                var d: Devices = .{ .mega = mega };
+                d.reset();
+                d.write(base + 8, 7); // Set OCR-A before enabling its double buffer.
+                d.write(base, mode & 3);
+                d.write(base + 1, (mode & 12) << 1);
+                if (mode == 8 or mode == 10 or mode == 14) d.write(base + 6, 7);
+                d.write(base + 4, 7);
+                d.tick(10); // Suppression survives while the timer is stopped.
+                d.write(base + 1, ((mode & 12) << 1) | 7);
+                const port: u4 = if (!mega) 1 else ([_]u4{ 3, 4, 7, 10 })[n];
+                const bit: u8 = if (!mega) 2 else ([_]u8{ 0x40, 0x40, 0x80, 4 })[n];
+                d.setPinsIn(port, bit);
+                try testing.expectEqual(@as(u16, 8), d.st.timer[n].count);
+                try testing.expectEqual(@as(u8, 0), d.st.timer[n].down);
+                d.timer16(n, 2);
+                try testing.expectEqual(@as(u16, 10), d.st.timer[n].count);
+                d.timer16(n, 0x10000 - 10 + 7);
+                try testing.expectEqual(@as(u16, 7), d.st.timer[n].count);
+                try testing.expectEqual(@as(u8, 0), d.st.timer[n].down);
+                d.timer16(n, 1);
+                try testing.expectEqual(@as(u16, if (mode >= 14) 0 else 6), d.st.timer[n].count);
+            }
+        }
+    }
+}
+
+test "round4 capture samples held inputs after power or sleep clock restart with filter delay" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]bool{ false, true }) |sleep| {
+            for ([_]bool{ false, true }) |noise| {
+                const count: usize = if (mega) 4 else 1;
+                for (timer16_bases[0..count], 0..) |base, n| {
+                    var d: Devices = .{ .mega = mega };
+                    d.reset();
+                    d.write(base + 1, if (noise) 0xC0 else 0x40);
+                    d.write(base + 5, 0x12);
+                    d.write(base + 4, 0x34);
+                    const power_register: u16 = if (n == 0) PRR else 0x65;
+                    const power: u8 = if (n == 0) PRTIM1 else @as(u8, 1) << @intCast(n + 2);
+                    if (sleep) {
+                        d.write(SMCR, 5);
+                        Devices.sysSleeping(&d, true);
+                    } else d.write(power_register, power);
+                    const port: u4 = if (!mega) 3 else ([_]u4{ 3, 4, 10, 10 })[n];
+                    const bit: u8 = if (!mega) 0x40 else ([_]u8{ 0x10, 0x80, 1, 2 })[n];
+                    d.setPinsIn(port, bit);
+                    d.tick(10);
+                    try testing.expectEqual(@as(u8, 0), d.read(timer16_flags[n]) & 0x20);
+                    if (sleep) Devices.sysSleeping(&d, false) else d.write(power_register, 0);
+                    if (noise) {
+                        d.tick(3);
+                        try testing.expectEqual(@as(u8, 0), d.read(timer16_flags[n]) & 0x20);
+                    }
+                    d.tick(1);
+                    try testing.expectEqual(@as(u8, 0x20), d.read(timer16_flags[n]) & 0x20);
+                    try testing.expectEqual(@as(u16, 0x1234), d.st.timer[n].capture);
+                }
+            }
+        }
+    }
+}
+
+test "round4 TWI continues transmitting after address and data NACK" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]bool{ false, true }) |data_nack| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            d.write(TWCR, 0xA4);
+            d.tick(16);
+            d.write(TWDR, 0xA0);
+            d.write(TWCR, 0x84);
+            try testing.expect(d.twiReply(if (data_nack) .ack else .nack, 0));
+            d.tick(16 * 9);
+            if (data_nack) {
+                d.write(TWDR, 0x11);
+                d.write(TWCR, 0x84);
+                try testing.expect(d.twiReply(.nack, 0));
+                d.tick(16 * 9);
+            }
+            try testing.expectEqual(@as(u8, if (data_nack) 0x30 else 0x20), d.read(TWSR));
+            d.write(TWDR, 0x22);
+            d.write(TWCR, 0x84);
+            try testing.expect(d.twiReply(.ack, 0));
+            d.tick(16 * 9 - 1);
+            try testing.expectEqual(@as(u8, 0), d.read(TWCR) & 0x80);
+            d.tick(1);
+            try testing.expectEqual(@as(u8, 0x28), d.read(TWSR));
+            try testing.expectEqual(@as(u8, 0x80), d.read(TWCR) & 0x80);
+            var last: ?TwiEvent = null;
+            while (d.twiPop()) |event| last = event;
+            try testing.expectEqual(TwiEvent.Kind.write, last.?.kind);
+            try testing.expectEqual(@as(u8, 0x22), last.?.value);
+        }
+    }
+}
+
+test "round4 combined TWI STOP and START schedules a fresh timed START" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(TWCR, 0xA4);
+        d.tick(16);
+        try testing.expectEqual(TwiEvent.Kind.start, d.twiPop().?.kind);
+        d.write(TWCR, 0xB4);
+        d.tick(15);
+        try testing.expectEqual(@as(?TwiEvent, null), d.twiPop());
+        d.tick(1);
+        try testing.expectEqual(TwiEvent.Kind.stop, d.twiPop().?.kind);
+        try testing.expectEqual(@as(u8, 0x20), d.read(TWCR) & 0xB0);
+        d.tick(15);
+        try testing.expectEqual(@as(?TwiEvent, null), d.twiPop());
+        try testing.expectEqual(@as(u8, 0), d.read(TWCR) & 0x80);
+        d.tick(1);
+        try testing.expectEqual(TwiEvent.Kind.start, d.twiPop().?.kind);
+        try testing.expectEqual(@as(u8, 0x08), d.read(TWSR));
+        try testing.expectEqual(@as(u8, 0x80), d.read(TWCR) & 0x80);
+        d.write(TWCR, 0xB4);
+        d.tick(32); // A batched tick must finish both STOP and the following START.
+        try testing.expectEqual(TwiEvent.Kind.stop, d.twiPop().?.kind);
+        try testing.expectEqual(TwiEvent.Kind.start, d.twiPop().?.kind);
+        try testing.expectEqual(@as(u8, 0x08), d.read(TWSR));
+        try testing.expectEqual(@as(u8, 0x80), d.read(TWCR) & 0x80);
+    }
+}
+
+test "round4 reset clock advances nonvolatile programming without clocking other devices" {
+    var d = fresh();
+    d.write(EEDR, 0x5A);
+    d.write(EECR, 4);
+    d.write(EECR, 2);
+    d.write(TCCR0B, 1);
+    d.write(0x81, 1);
+    d.write(ADCSRA, 0xC0);
+    d.write(UCSR0A + 1, 0x08);
+    d.write(UCSR0A + 6, 0x51);
+    d.write(WDTCSR, 0x40);
+    d.write(TWCR, 0xA4);
+    const before = d.st;
+    d.tickReset(before.ee_busy);
+    try testing.expectEqual(@as(u8, 0x5A), d.st.ee[0]);
+    try testing.expectEqual(before.cycles, d.st.cycles);
+    try testing.expectEqual(before.pre01, d.st.pre01);
+    try testing.expectEqual(before.pre2, d.st.pre2);
+    try testing.expectEqualDeep(before.timer, d.st.timer);
+    try testing.expectEqualDeep(before.usart, d.st.usart);
+    try testing.expectEqual(before.adc_busy, d.st.adc_busy);
+    try testing.expectEqual(before.wdt_count, d.st.wdt_count);
+    try testing.expectEqualDeep(before.twi, d.st.twi);
+}
+
+test "round4 writing phase PWM BOTTOM while downcounting suppresses reversal until the next BOTTOM" {
+    for ([_]bool{ false, true }) |mega| {
+        const count: usize = if (mega) 4 else 1;
+        for (timer16_bases[0..count], 0..) |base, n| {
+            for ([_]u8{ 1, 2, 3, 8, 9, 10, 11 }) |mode| {
+                var d: Devices = .{ .mega = mega };
+                d.reset();
+                d.write(base + 8, 7);
+                d.write(base, mode & 3);
+                d.write(base + 1, ((mode & 12) << 1) | 1);
+                if (mode == 8 or mode == 10) d.write(base + 6, 7);
+                const top: u16 = if (mode >= 8) 7 else (@as(u16, 1) << @intCast(mode + 7)) - 1;
+                d.tick(@as(u32, top) + 1);
+                try testing.expectEqual(@as(u8, 1), d.st.timer[n].down);
+                d.write(base + 1, (mode & 12) << 1);
+                d.write(base + 4, 0);
+                d.tick(10);
+                d.write(base + 1, ((mode & 12) << 1) | 1);
+                d.tick(1);
+                try testing.expectEqual(@as(u16, 0xFFFF), d.st.timer[n].count);
+                try testing.expectEqual(@as(u8, 1), d.st.timer[n].down);
+                d.timer16(n, 2);
+                try testing.expectEqual(@as(u16, 0xFFFD), d.st.timer[n].count);
+                d.timer16(n, 0xFFFD);
+                try testing.expectEqual(@as(u16, 0), d.st.timer[n].count);
+                try testing.expectEqual(@as(u8, 1), d.st.timer[n].down);
+                d.timer16(n, 1);
+                try testing.expectEqual(@as(u16, 1), d.st.timer[n].count);
+                try testing.expectEqual(@as(u8, 0), d.st.timer[n].down);
+            }
+        }
+    }
 }

@@ -35,6 +35,91 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_yielding_reset_probes_discard_modem_backlog_and_keep_later_traffic(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            for image, size in (("trx", 0x260760), ("ptt", 0xA7BF8)):
+                for operation, later in (("call", False), ("call_resume", False), ("call", True)):
+                    data = bytearray(bc5.data)
+                    words = []
+                    for address, value in ((0x62, 0x8000), (0x61, 0x8000), (0x62, 0), (0x62, 0x8000)):
+                        words.extend(operand(0x14, value) + operand(0x25, address))
+                    words += [0x0114] * 5000 + [0x00E2]
+                    data[0x100:0x100 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+                    # Cold startup sleeps with reception disabled; EXTRF enables USART0.
+                    receiver = [0x9100, 0x54, 0xFF01, 0xC00A, 0xE100, 0x9300, 0xC1,
+                                0x9110, 0xC0, 0xFF17, 0xCFFC, 0x9120, 0xC6, 0xCFFF,
+                                0xE005, 0x9300, 0x53, 0x9588, 0xCFFE]
+                    sender = [0x01000000] * (1200 if later else 0)
+                    sender += [0x03200000, 0x82106200, 0x84102051, 0xC4206000, 0x10800000, 0x01000000]
+                    firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                                parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(len(avr.data), b"\xff"),
+                                               "avr.bin", "avr", model=model),
+                                parse_firmware(b"".join(w.to_bytes(4, "big") for w in sender).ljust(size, b"\xff"),
+                                               image + ".bin", image, model=model)]
+                    with self.subTest(model=model, image=image, operation=operation, later=later), Session(EXECUTABLE, firmware, modem_image=image) as session:
+                        session.control("step", 128)
+                        self.assertEqual(session.modem_link.state()["pending"], [0, 0 if later else 1])
+                        if operation == "call_resume":
+                            first = session.engines["bc5"].request("call", entry=0x100, steps=10000, quantum=1)
+                            self.assertTrue(first["last_call"]["pending"])
+                            result = session.probe("bc5", "call_resume", {"steps": 9999})
+                        else:
+                            result = session.probe("bc5", "call", {"entry": 0x100, "steps": 10000})
+                        self.assertTrue(result["last_call"]["returned"])
+                        session.control("step", 256)
+                        self.assertEqual(session.engines["avr"].state["registers"][18], 81 if later else 0)
+                        self.assertEqual(session.spi_link.resets, 1)
+                        self.assertIsNone(session.engines["avr"].state["halt"])
+
+    def test_flash_programming_advances_while_reset_blocks_avr_execution(self):
+        for model, size, boot in (("9555", 0x4000, 0x3800), ("9575", 0x20000, 0x1E000)):
+            bc5 = images(model)[0]
+            data = bytearray(bc5.data)
+            for entry, setup in ((0x100, ((0x62, 0x8000), (0x61, 0x8000), (0x62, 0))),
+                                 (0x200, ((0x62, 0x8000),))):
+                words = []
+                for address, value in setup:
+                    words.extend(operand(0x14, value) + operand(0x25, address))
+                words.append(0x00E2)
+                data[entry:entry + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            # Yield enough board quanta to exceed the programming interval.
+            words = [0x0114] * 13000 + [0x00E2]
+            data[0x300:0x300 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            # Program 0xA55A at byte 0x100; after EXTRF park before issuing more SPM.
+            words = [0x9110, 0x54, 0xFD11, 0xCFFF, 0xE0E0, 0xE0F1,
+                     0xE50A, 0x2E00, 0xEA05, 0x2E10, 0xE001, 0x9300, 0x57, 0x95E8,
+                     0xE005, 0x9300, 0x57, 0x95E8, 0x9130, 0x57, 0xCFFD]
+            avr = bytearray(b"\xff" * size)
+            avr[boot:boot + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                        parse_firmware(bytes(avr), "avr.bin", "avr", model=model)]
+            for service in ("step", "probe"):
+                with self.subTest(model=model, service=service), Session(EXECUTABLE, firmware) as session:
+                    session.probe("avr", "fuses", {"low": 0x77, "high": 0x98, "extended": 0xFE, "lock": 0xFF})
+                    session.control("reset")
+                    session.control("step", 30)
+                    self.assertEqual(session.engines["avr"].state["registers"][19], 0x45)
+                    self.assertTrue(session.probe("bc5", "call", {"entry": 0x100, "steps": 100})["last_call"]["returned"])
+                    session.control("step", 1)
+                    self.assertTrue(session.spi_link.hold_reset)
+                    before = session.engines["avr"].state
+                    self.assertEqual(session.probe("avr", "program_read", {"address": 0x100, "count": 2})["values"], [255, 255])
+                    if service == "step":
+                        session.control("step", 100000)
+                    else:
+                        self.assertTrue(session.probe("bc5", "call", {"entry": 0x300, "steps": 100000})["last_call"]["returned"])
+                    after = session.engines["avr"].state
+                    self.assertEqual((after["steps"], after["cycles"], after["registers"]),
+                                     (before["steps"], before["cycles"], before["registers"]))
+                    self.assertTrue(session.spi_link.hold_reset)
+                    self.assertEqual(session.probe("avr", "program_read", {"address": 0x100, "count": 2})["values"], [90, 165])
+                    self.assertTrue(session.probe("bc5", "call", {"entry": 0x200, "steps": 100})["last_call"]["returned"])
+                    session.control("step", 1)  # Observe reset release before scheduling AVR again.
+                    self.assertFalse(session.spi_link.hold_reset)
+                    session.control("step", 100)
+                    self.assertGreater(session.engines["avr"].state["steps"], before["steps"])
+
     def test_reset_and_avr_replacement_baseline_old_reset_pulses(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)

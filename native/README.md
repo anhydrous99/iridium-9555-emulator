@@ -27,6 +27,7 @@ The worker emits an initial JSON state, then one response for each newline-delim
 | `{"op":"state"}` | Return state without advancing guest time. |
 | `{"op":"reset"}` | Reset CPU/RAM/devices and discard guest changes to flash/EEPROM. Reload the original input in memory. |
 | `{"op":"warm_reset"}` | BC5/AVR: reset CPU/devices while retaining programmed flash and RAM; AVR also retains EEPROM, fuses and external fixtures, and records an external reset in MCUSR. Guest startup initializes its own memory. |
+| `{"op":"reset_clock","cycles":4096}` | AVR only: advance pending flash/EEPROM programming while the board holds reset. Execute no instructions and leave other peripheral clocks stopped. Accept 1–10,000,000 cycles. |
 | `{"op":"read","address":40960,"count":16}` | Return `{address,unit_bits,values}` from raw backing memory, without side effects. BC5 units are 16-bit words; AVR/SPARC units are bytes. Device and CPU register state is not reflected in this raw-memory view. |
 | `{"op":"write","address":40960,"values":[123]}` | Debugger RAM/scratch write. Validate all values/ranges first; ROM, MMIO and CPU aliases are rejected. Return state. |
 | `{"op":"call","entry":476,"al":40960,"ah":123,"stack":[1],"steps":10000}` | BC5-only explicit debugger function probe at a byte address. Execute the original routine with AL/AH/stack arguments. Return state with `last_call`. |
@@ -62,7 +63,8 @@ serial engine, with FE95 busy until the connected processor clocks and replies.
 SPI handshake, attention and reset follow actual guest GPIO behavior.
 BC5 state and `serial` expose the lifetime `gpio.reset_count`; recreated links
 baseline it before execution. Modem traffic into a held-reset AVR is discarded.
-External AVR reset retains active flash programming. The 9555 reports
+External AVR reset retains active flash and EEPROM programming; both continue
+while board reset is held, including during function probes. The 9555 reports
 `undefined_spm_buffer` if a page write uses data invalidated by an EEPROM write;
 RWWSRE followed by reloading the temporary buffer restores defined behavior.
 

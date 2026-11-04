@@ -56,18 +56,39 @@ class ProtocolTests(unittest.TestCase):
             firmware = bytearray(b"\xff" * size)
             code = b"".join(w.to_bytes(2, "little") for w in words)
             firmware[boot:boot + len(code)] = code
-            for reset in (False, True):
+            for reset in ("none", "pulse", "held"):
                 with self.subTest(model=model, reset=reset):
                     commands = [{"op": "fuses", "low": 0x77, "high": 0x98, "extended": 0xFE, "lock": 0xFF},
                                 {"op": "reset"}, {"op": "run", "steps": 30}]
-                    if reset:
+                    if reset != "none":
                         commands.append({"op": "warm_reset"})
-                    commands.extend([{"op": "run", "steps": 12000},
-                                     {"op": "program_read", "address": 0x100, "count": 2}])
+                    commands.append({"op": "reset_clock", "cycles": 12000} if reset == "held"
+                                    else {"op": "run", "steps": 12000})
+                    commands.append({"op": "program_read", "address": 0x100, "count": 2})
                     states = exchange("avr", firmware, commands, model=model)
                     self.assertEqual(states[3]["registers"][19], 0x45)
                     self.assertIsNone(states[-2]["halt"])
                     self.assertEqual(states[-1]["values"], [0x5A, 0xA5])
+                    if reset == "held":
+                        for key in ("pc", "program_pc", "registers", "cycles", "steps", "halt"):
+                            self.assertEqual(states[-3][key], states[-2][key], key)
+
+    def test_reset_clock_validates_inputs_before_advancing_and_preserves_stops(self):
+        for model, size in (("9555", 8678), ("9575", 14296)):
+            bad = [{"op": "reset_clock", **args} for args in ({}, {"cycles": 0}, {"cycles": -1},
+                   {"cycles": 10000001}, {"cycles": True}, {"cycles": "1"})]
+            states = exchange("avr", b"\x08\x90".ljust(size, b"\xff"),
+                              [{"op": "run", "steps": 1}, *bad,
+                               {"op": "reset_clock", "cycles": 10000000}, {"op": "state"}], model=model)
+            self.assertIsNotNone(states[1]["halt"])
+            for state in states[2:2 + len(bad)]:
+                self.assertIn("error", state)
+                self.assertFalse(state["fatal"])
+            for state in states[-2:]:
+                for key in ("pc", "program_pc", "registers", "cycles", "steps", "halt"):
+                    self.assertEqual(state[key], states[1][key], key)
+        states = exchange("bc5", b"\xe0\0".ljust(0x310FBA, b"\0"), [{"op": "reset_clock", "cycles": 1}])
+        self.assertEqual(states[-1]["error"], "AvrOnly")
 
     def test_164p_invalid_flash_buffer_is_diagnostic_and_explicit_clear_recovers(self):
         for model, size, boot in (("9555", 0x4000, 0x3800), ("9575", 0x20000, 0x1E000)):

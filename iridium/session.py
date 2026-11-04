@@ -208,6 +208,7 @@ class Session:
             self.spi_link = None
 
     def _service_board(self, steps):
+        self._clock_reset(steps)
         for worker in self._active_processors():
             if worker is self.engines.get("bc5"):
                 continue
@@ -215,6 +216,10 @@ class Session:
             if result.get("halt") not in (None, "steps", "running", "ready"):
                 raise EngineError(f"Peripheral processor halted during board service: {result.get('halt')}")
         self._exchange_links()
+
+    def _clock_reset(self, cycles):
+        if self.spi_link and self.spi_link.hold_reset:
+            self._request(self.engines["avr"], "reset_clock", cycles=cycles)
 
     def _exchange_links(self):
         avr_reset = False
@@ -226,6 +231,7 @@ class Session:
             self.modem_link.exchange(avr_reset=avr_reset)
 
     def _step_processors(self, steps: int) -> None:
+        self._clock_reset(steps)
         for worker in self._active_processors():
             previous = worker.state.get("halt")
             if previous not in (None, "steps", "running", "ready"):
@@ -527,7 +533,7 @@ class Session:
                     return response
                 raise EngineError("Function probe is waiting for a connected serial peer")
             if not self.spi_link.pending:
-                self.spi_link.exchange()
+                self._exchange_links()
             quantum = self._board_quantum(min(remaining, peripheral_budget))
             if quantum <= 0:
                 raise EngineError("Peripheral wait exceeded the function-probe budget; reset before retrying")
