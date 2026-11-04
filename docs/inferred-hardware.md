@@ -23,6 +23,8 @@ with fabricated code or successful service responses.
   timestamps do not depend on instruction length. The capture noise filter waits
   four further CPU clocks after an input change, including changes published by
   comparator completion or a timer output inside the current clock.
+  Filter history changes only on clock samples; pin changes without elapsed
+  clocks leave that history intact.
 - AVR program-memory tests can load the upgrade payload or a complete flash
   image: 16 KiB for the 9555, 128 KiB for the inferred Extreme profile. The
   source file is read-only. Program reads and fuse configuration are exposed

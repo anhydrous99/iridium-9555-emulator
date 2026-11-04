@@ -384,6 +384,24 @@ class ProtocolTests(unittest.TestCase):
                         self.assertEqual(state["registers"][18] & 0x20, 0 if noise else 0x20)
                         self.assertEqual(state["registers"][19] & 0x20, 0x20)
 
+    def test_capture_filter_ignores_pin_glitches_without_elapsed_clocks(self):
+        words = (0xEC01, 0x9300, 0x81, 0, 0, 0, 0, 0xB326, 0, 0, 0xB336, 0xCFFF)
+        for model, size, bit in (("9555", 0x4000, 0x40), ("9575", 0x20000, 0x10)):
+            firmware = b"".join(w.to_bytes(2, "little") for w in words).ljust(size, b"\xff")
+            for glitch in (False, True):
+                for end in (False, True):
+                    with self.subTest(model=model, glitch=glitch, end=end):
+                        commands = [{"op": "run", "steps": 2}, {"op": "pins", "port": 3, "value": bit},
+                                    {"op": "run", "steps": 2}]
+                        if glitch:
+                            commands += [{"op": "pins", "port": 3, "value": 0},
+                                         {"op": "pins", "port": 3, "value": bit}]
+                        commands += ([{"op": "run", "steps": 2}, {"op": "pins", "port": 3, "value": 0},
+                                      {"op": "run", "steps": 4}] if end else [{"op": "run", "steps": 6}])
+                        state = exchange("avr", firmware, commands, model=model)[-1]
+                        self.assertIsNone(state["halt"])
+                        self.assertEqual([r & 0x20 for r in state["registers"][18:20]], [0x20, 0x20])
+
     def test_sparc_irq_stimulus_is_validated_and_reset_deasserts_it(self):
         firmware = bytes(0x260760)
         states = exchange("trx", firmware, [

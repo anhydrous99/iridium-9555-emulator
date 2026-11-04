@@ -118,8 +118,8 @@ function drawDisplay(state) {
   };
   if (!image) {
     describe(preview ? "No supported embedded bitmap found in this image." : state?.ui_initialized
-      ? "Waiting for firmware LCD output · experimental software initialization"
-      : "Live LCD unavailable · initialize application to capture firmware output");
+      ? "Waiting for firmware LCD output"
+      : "Live LCD unavailable · power on the handset to capture firmware output");
     return;
   }
   if (!preview && (image.error || dropped || image.live !== true)) {
@@ -144,7 +144,7 @@ function drawDisplay(state) {
   }
   if (!preview && image.display_on !== true) {
     element("lcd-placeholder-text").textContent = "DISPLAY OFF";
-    describe("Firmware LCD is off · experimental software initialization");
+    describe("Firmware LCD is off");
     return;
   }
   const palette = [[169, 184, 145], [123, 140, 102], [77, 94, 60], [33, 48, 21]];

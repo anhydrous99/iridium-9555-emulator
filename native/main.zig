@@ -89,6 +89,7 @@ const CallResult = struct {
     al: u16,
     ah: u16,
     steps: u64,
+    remaining_steps: u64,
     pc: u32,
     program_pc: u32,
     stopped: ?CallStop,
@@ -1128,6 +1129,7 @@ fn continueCall(steps: u64) void {
         .al = r.al,
         .ah = r.ah,
         .steps = total_steps - context.before_steps,
+        .remaining_steps = context.remaining,
         .pc = xap.cpu.byteAddr(r.pc),
         .program_pc = r.pc,
         .stopped = stopped,
@@ -1271,6 +1273,7 @@ test "BC5 probe yields for serial service and restores paused registers/stack on
     try std.testing.expect(!last_call.?.returned);
     try std.testing.expectEqual(@as(?[]const u8, null), halt_reason);
     try std.testing.expectEqual(@as(u64, 2), last_call.?.steps);
+    try std.testing.expectEqual(@as(u64, 8), last_call.?.remaining_steps);
     try std.testing.expectEqual(@as(u16, 0xFCC0), Bc.core.cpu.y);
     try std.testing.expectEqual(@as(u16, 0x1234), BcMem.data[0xFCC0]);
     try std.testing.expectError(error.CallPending, call(input.value.object));
@@ -1283,6 +1286,7 @@ test "BC5 probe yields for serial service and restores paused registers/stack on
     try std.testing.expect(!last_call.?.pending);
     try std.testing.expectEqual(@as(u16, 9), last_call.?.al);
     try std.testing.expectEqual(@as(u64, 4), last_call.?.steps);
+    try std.testing.expectEqual(@as(u64, 6), last_call.?.remaining_steps);
     try std.testing.expectEqual(saved, Bc.core.cpu);
     try std.testing.expectEqual(@as(u16, 0xBEEF), BcMem.data[0xFCC0]);
     try std.testing.expectEqual(@as(u16, 7), BcMem.data[0xFF91]);

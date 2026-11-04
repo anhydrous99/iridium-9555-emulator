@@ -214,6 +214,7 @@ const Timer16 = extern struct {
     external_last: u8 = 0,
     capture_last: u8 = 0,
     capture_candidate: u8 = 0,
+    capture_sample: u8 = 0,
     capture_cycles: u8 = 0,
     compare_blocked: u8 = 0,
 };
@@ -1274,6 +1275,7 @@ pub const Devices = struct {
             d.st.timer[n].external_last = d.timerClockLevel(n + 1);
             d.st.timer[n].capture_last = d.captureLevel(n);
             d.st.timer[n].capture_candidate = d.captureLevel(n);
+            d.st.timer[n].capture_sample = d.captureLevel(n);
         }
     }
 
@@ -1304,10 +1306,7 @@ pub const Devices = struct {
         if (!d.timerPowered(n)) return;
         const t = &d.st.timer[n];
         const capture = d.captureLevel(n);
-        if (capture != t.capture_candidate) {
-            t.capture_candidate = capture;
-            t.capture_cycles = 0;
-        }
+        t.capture_candidate = capture;
         if (d.st.io[timer16_bases[n] + 1] & 0x80 == 0) d.captureEdge(n, capture);
     }
 
@@ -1709,7 +1708,8 @@ pub const Devices = struct {
             for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
                 const t = &d.st.timer[n];
                 if (d.timerPowered(n) and d.st.io[base + 1] & 0x80 != 0 and t.capture_last != t.capture_candidate) {
-                    const until = @min(cycles, 4 - @min(t.capture_cycles, @as(u8, 4)));
+                    const age = if (t.capture_sample == t.capture_candidate) t.capture_cycles else 0;
+                    const until = @min(cycles, 4 - @min(age, @as(u8, 4)));
                     for (0..until) |_| d.tick(1);
                     d.tick(cycles - until);
                     return;
@@ -1719,8 +1719,8 @@ pub const Devices = struct {
         const io = &d.st.io;
         // A comparator trigger created in this clock starts aging in the next one.
         const adc_busy_before = d.st.adc_busy;
-        var capture_before: [4]struct { level: u8, cycles: u8 } = undefined;
-        for (d.st.timer, 0..) |timer, n| capture_before[n] = .{ .level = timer.capture_candidate, .cycles = timer.capture_cycles };
+        var capture_before: [4]u8 = undefined;
+        for (d.st.timer, 0..) |timer, n| capture_before[n] = timer.capture_candidate;
         d.st.cycles += cycles;
         if (d.ioRunning() and d.st.ac_delay != 0) {
             d.st.ac_delay -|= @intCast(@min(cycles, 2));
@@ -1783,13 +1783,16 @@ pub const Devices = struct {
         }
         if (d.timer2Running() and io[PRR] & PRTIM2 == 0 and io[ASSR] & 0x20 == 0) d.timer8(2, ticks(old2, d.st.pre2, div2[io[TCCR2B] & 7]));
         for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
-            if (d.ioRunning() and d.timerPowered(n) and io[base + 1] & 0x80 != 0) {
+            if (cycles != 0 and d.ioRunning() and d.timerPowered(n) and io[base + 1] & 0x80 != 0) {
                 const t = &d.st.timer[n];
                 // Sample before comparator/timer outputs publish this clock's changes.
                 const sample = capture_before[n];
-                const age = @min(4, sample.cycles +| @as(u8, @intCast(@min(cycles, 4))));
-                if (t.capture_candidate == sample.level) t.capture_cycles = age;
-                if (age >= 4) d.captureEdge(n, sample.level);
+                if (sample != t.capture_sample) {
+                    t.capture_sample = sample;
+                    t.capture_cycles = 0;
+                }
+                t.capture_cycles = @min(4, t.capture_cycles +| @as(u8, @intCast(@min(cycles, 4))));
+                if (t.capture_cycles >= 4) d.captureEdge(n, sample);
             }
         }
         for (0..d.uartCount()) |k| {
@@ -3225,6 +3228,29 @@ test "capture filtering accepts four comparator samples before a simultaneous re
         try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x20);
         try testing.expectEqual(@as(u8, 0x20), d.read(TIFR1) & 0x20);
     }
+}
+
+test "capture filters reset history only when the opposite pin level is clock sampled" {
+    for ([_]bool{ false, true }) |mega| for (0..if (mega) @as(usize, 4) else 1) |n| for ([_]bool{ false, true }) |falling| for ([_]u32{ 0, 1 }) |gap| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        const port: u4 = if (!mega) 3 else ([_]u4{ 3, 4, 10, 10 })[n];
+        const bit: u8 = if (!mega) 0x40 else ([_]u8{ 0x10, 0x80, 1, 2 })[n];
+        const active: u8 = if (falling) 0 else bit;
+        const inactive: u8 = if (falling) bit else 0;
+        d.write(timer16_bases[n] + 1, if (falling) 0x81 else 0xC1);
+        d.setPinsIn(port, inactive);
+        d.tick(4);
+        d.setPinsIn(port, active);
+        d.tick(2);
+        d.setPinsIn(port, inactive);
+        d.tick(gap); // Zero clocks must not erase either of the preceding samples.
+        d.setPinsIn(port, active);
+        d.tick(2);
+        try testing.expectEqual(@as(u8, if (gap == 0) 0x20 else 0), d.read(timer16_flags[n]) & 0x20);
+        d.tick(2);
+        try testing.expectEqual(@as(u8, 0x20), d.read(timer16_flags[n]) & 0x20);
+    };
 }
 
 test "power reduction stops both capture paths on every available 16-bit timer" {

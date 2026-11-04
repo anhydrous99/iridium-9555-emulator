@@ -544,7 +544,8 @@ class Session:
 
     def _probe_operation(self, worker, operation, arguments):
         arguments = dict(arguments)
-        budget = arguments.get("steps", 100000 if operation == "call" else 100000000)
+        default_budget = 100000 if operation == "call" else (worker.state.get("last_call") or {}).get("remaining_steps", 0)
+        budget = arguments.get("steps", default_budget)
         if self.spi_link and type(budget) is int and budget > 0:
             quantum = arguments.get("quantum", self._board_quantum(budget))
             if type(quantum) is int and 1 <= quantum <= 100000000:

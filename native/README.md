@@ -72,7 +72,7 @@ A function probe chooses an IRQ-safe Y no higher than 0xFCC0, preserving the
 35-word separation from the supervisor stack in banked mode. It saves/restores
 0xF960–0xFCDF and the paused CPU at final return/failure, retaining global memory,
 device and elapsed-time effects. Stack-local returned pointers expire.
-`last_call` reports `returned`, `pending`, AL/AH, steps and the probe PC.
+`last_call` reports `returned`, `pending`, AL/AH, steps, `remaining_steps` and the probe PC.
 Reaching the unmapped ABI return sentinel at depth zero completes a probe even
 on its final allowed instruction. Spare budget cannot cause another instruction,
 peripheral tick or interrupt after return.
@@ -83,7 +83,8 @@ instruction-sized peripheral budget. Held reset advances programming only.
 Failed probes retain stopped registers and up to 64 stack words. A serial wait
 or explicit `quantum` can yield a live probe; `call_resume` accepts the same
 per-request quantum and continues within its original cumulative budget and bus
-fuel. Ordinary run/idle/write and
+fuel. When `steps` is omitted, both native execution and Session peripheral service
+use `remaining_steps` as the request limit. Ordinary run/idle/write and
 a second call are rejected while pending. Reset discards it. Traps, nonreturning
 probes and stack-guard changes halt explicitly; this is not a snapshot transaction.
 

@@ -36,6 +36,34 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_default_continuation_uses_the_native_remaining_peripheral_budget(self):
+        for model in ("9555", "9575"):
+            for limit in (15, 1014):
+                for explicit in (False, True):
+                    with self.subTest(model=model, limit=limit, explicit=explicit), Session(EXECUTABLE, images(model)) as session:
+                        session.control("step", 16)
+                        for address, values in ((0xA002, [0x100, 0]), (0xA100, [8])):
+                            session.probe("bc5", "write", {"address": address, "values": values})
+                        first = session.engines["bc5"].request("call", entry=0x100, steps=limit)
+                        self.assertEqual(first["last_call"]["steps"], 14)
+                        self.assertTrue(first["last_call"]["pending"])
+                        before = session.engines["avr"].state["steps"]
+                        arguments = {"steps": limit - 14} if explicit else {}
+                        if limit == 15:
+                            with self.assertRaisesRegex(EngineError, "Peripheral wait exceeded"):
+                                session.probe("bc5", "call_resume", arguments)
+                            call = session.engines["bc5"].state["last_call"]
+                            self.assertTrue(call["pending"])
+                            self.assertEqual(call["steps"], 14)
+                            self.assertEqual(call["remaining_steps"], 1)
+                            self.assertEqual(session.engines["avr"].state["steps"] - before, 1)
+                        else:
+                            result = session.probe("bc5", "call_resume", arguments)
+                            self.assertTrue(result["last_call"]["returned"])
+                            self.assertEqual(result["last_call"]["steps"], 15)
+                            self.assertEqual(result["last_call"]["remaining_steps"], limit - 15)
+                            self.assertEqual(session.engines["avr"].state["steps"] - before, 129)
+
     def test_public_step_partition_preserves_spi_payload_and_instruction_totals(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)
