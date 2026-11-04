@@ -13,6 +13,8 @@ with fabricated code or successful service responses.
   PWM/force-compare pin outputs, four USARTs on the Extreme, SPI, EEPROM,
   watchdog, ADC mux/differential/conversion behavior, analog comparator and TWI.
   External samples and TWI peers are explicit test stimuli.
+  Differential ADC timing follows CKADC2 phase; free-running restarts take 14
+  ADC clocks and latch their input at 2.5 clocks.
 - AVR program-memory tests can load the upgrade payload or a complete flash
   image: 16 KiB for the 9555, 128 KiB for the inferred Extreme profile. The
   source file is read-only. Program reads and fuse configuration are exposed
@@ -47,9 +49,12 @@ is `FDBF & 0x7FFF = 0x0440`. Active-low PIO4 selects the AVR; PIO12 receives
 its per-byte handshake and PIO14 receives attention. PIO15 resets the AVR.
 The host clocks one byte, lets the AVR execute its ISR, then acknowledges the
 reply to the BC5 DMA engine. Firmware `FE95` polling sees busy until completion.
-Transfers reduce the board quantum to 128 instructions.
+Each clocked byte receives 128 AVR instructions of service before its reply is
+acknowledged and the next byte can be clocked. That interval persists across
+public step and probe requests; smaller requests retain the remaining service
+time. Transfers reduce the board quantum to that remaining interval.
 Pre-service reset/GPIO synchronization retains an outstanding SPI reply until
-AVR execution intervenes; it cannot acknowledge that reply early.
+the complete service interval elapses; it cannot acknowledge that reply early.
 
 | Signal | 9555 AVR | 9575 AVR |
 |---|---|---|

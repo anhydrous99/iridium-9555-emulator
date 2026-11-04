@@ -1100,14 +1100,13 @@ fn callResume(obj: std.json.ObjectMap) !void {
 fn continueCall(steps: u64) void {
     const context = &call_context.?;
     var executed: u64 = 0;
-    while (executed < steps and context.remaining > 0 and halt_reason == null and !serial_waiting) : (executed += 1) {
+    while (executed < steps and context.remaining > 0 and halt_reason == null and !serial_waiting and !Bc.core.atReturnSentinel()) : (executed += 1) {
         step(.bc5);
         context.remaining -= 1;
         if (executed % 1024 == 0) flushLog();
     }
     flushLog();
-    const returned = if (Bc.core.halted) |h| h == .returned else
-        halt_reason == null and BcMem.bus.stop == null and Bc.core.atReturnSentinel();
+    const returned = if (Bc.core.halted) |h| h == .returned else halt_reason == null and BcMem.bus.stop == null and Bc.core.atReturnSentinel();
     const stack_guard_changed = BcMem.data[probe_stack_base] != context.stack_before[0];
     const pending = !returned and !stack_guard_changed and halt_reason == null and context.remaining != 0;
     const r = Bc.core.cpu;
@@ -1206,9 +1205,7 @@ test "exact-budget probes return without an extra instruction or sentinel tick" 
             var arguments = std.json.Array.init(std.testing.allocator);
             defer arguments.deinit();
             try arguments.append(.{ .integer = 0x1234 });
-            var input = try std.json.ObjectMap.init(std.testing.allocator,
-                &.{ "entry", "steps", "quantum", "stack" },
-                &.{ .{ .integer = 0x100 }, .{ .integer = budget }, .{ .integer = if (split) 1 else budget }, .{ .array = arguments } });
+            var input = try std.json.ObjectMap.init(std.testing.allocator, &.{ "entry", "steps", "quantum", "stack" }, &.{ .{ .integer = 0x100 }, .{ .integer = budget }, .{ .integer = if (split) 1 else budget }, .{ .array = arguments } });
             defer input.deinit(std.testing.allocator);
             const continuation = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"steps\":1}", .{});
             defer continuation.deinit();

@@ -36,6 +36,36 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_public_step_partition_preserves_spi_payload_and_instruction_totals(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            words = []
+            for address, value in ((0x62, 0x8000), (0x61, 0x8010), (0xFE94, 1),
+                                   (0xFDBE, 1), (0xFDBF, 0x440), (0xFDC3, 0), (0xFDC1, 6)):
+                words += operand(0x14, value) + operand(0x25, address)
+            words.append(0x00E0)
+            receiver = [0xE0A0, 0xE0B2, 0xE400, 0x9300, 0x4C, 0x9110, 0x4D,
+                        0xFF17, 0xCFFC, 0x9120, 0x4E, 0x932D, 0xCFF8]
+            firmware = [parse_firmware(b"".join(w.to_bytes(2, "little") for w in words).ljust(len(bc5.data), b"\0"),
+                                       "bc5.bin", "bc5", model=model),
+                        parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(len(avr.data), b"\xff"),
+                                       "avr.bin", "avr", model=model)]
+            for partition in (1, 3, 127, 128, 4096):
+                with self.subTest(model=model, partition=partition), Session(EXECUTABLE, firmware) as session:
+                    for address, values in ((0xA002, [0x100, 0]), (0xA100, [8]),
+                                             (0xA200, [0x2211, 0x4433, 0x6655])):
+                        session.probe("bc5", "write", {"address": address, "values": values})
+                    remaining = 1024
+                    while remaining:
+                        steps = min(partition, remaining)
+                        session.control("step", steps)
+                        remaining -= steps
+                    self.assertEqual(session.probe("avr", "read", {"address": 0x200, "count": 6})["values"],
+                                     [17, 34, 51, 68, 85, 102])
+                    self.assertEqual([worker.state["steps"] for worker in session.engines.values()], [1024, 1024])
+                    self.assertEqual(session.spi_link.transferred, 6)
+                    self.assertFalse(session.spi_link.pending)
+
     def test_explicit_step_advances_live_auxiliaries_when_primary_is_already_halted(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)
@@ -119,7 +149,7 @@ class ProbeTests(unittest.TestCase):
                         worker.request("run", steps=128)
                         self.assertEqual(session.probe("avr", "read", {"address": 0x200, "count": count})["values"], list(payload))
                         self.assertEqual(len(clocks), count)
-                        self.assertTrue(all(a < b for a, b in zip(clocks, clocks[1:])), clocks)
+                        self.assertTrue(all(b - a >= 128 for a, b in zip(clocks, clocks[1:])), clocks)
                         self.assertFalse(session.spi_link.pending)
 
     def test_ordinary_steps_apply_reset_before_avr_execution_regardless_of_load_order(self):
@@ -444,6 +474,9 @@ class ProbeTests(unittest.TestCase):
                     self.assertEqual(session.spi_link.transferred, 1)
                     session.control("step", 2)
                     session.control("step", 2)
+                    self.assertEqual(session.spi_link.transferred, 1)
+                    session.control("step", 128)
+                    session.control("step", 16)  # Let the receiver consume a selected second byte.
                     self.assertEqual(session.spi_link.transferred, 2 if selected else 1)
                     self.assertEqual(session.engines["avr"].state["registers"][17], 0x22 if selected else 0x11)
                     self.assertIsNone(session.engines["avr"].state["halt"])

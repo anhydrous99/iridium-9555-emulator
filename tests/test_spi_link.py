@@ -33,6 +33,10 @@ class Avr:
         self.replies = list(replies)
         self.pins = list(pins)
         self.calls = []
+        self.state = {"steps": 0}
+
+    def advance(self, steps=128):
+        self.state["steps"] += steps
 
     def request(self, op, **arguments):
         self.calls.append((op, arguments))
@@ -45,11 +49,69 @@ class Avr:
             return {"value": response}
         if op == "warm_reset":
             self.pins = [0, 0, 0]
+            self.state["steps"] = 0
             return {}
         raise AssertionError(op)
 
 
 class SpiLinkTests(unittest.TestCase):
+    def test_partial_avr_execution_preserves_the_inter_byte_service_phase(self):
+        bc5 = Bc5(serial(0x11, sequence=1, active=True, remaining=2),
+                  *(serial(sequence=1, active=True, remaining=2) for _ in range(3)),
+                  serial(0x22, sequence=2, active=True, remaining=1), serial(sequence=3))
+        avr = Avr(0xAA, 0xBB)
+        link = SpiLink(bc5, avr, "9555")
+        link.exchange()
+        for elapsed in (1, 30, 96):
+            avr.advance(elapsed)
+            link.exchange()
+            self.assertEqual(link.transferred, 1)
+            self.assertEqual(link.quantum, 128 - avr.state["steps"])
+        avr.advance(1)
+        link.exchange()
+        self.assertEqual(link.transferred, 2)
+        self.assertEqual(link.quantum, 128)
+        avr.advance()
+        link.exchange()
+        self.assertFalse(link.pending)
+        self.assertEqual([args for op, args in bc5.calls if op == "serial"],
+                         [{}, {}, {}, {}, {"received": 0xAA, "sequence": 1},
+                          {"received": 0xBB, "sequence": 2}])
+
+    def test_cancelled_clocked_byte_keeps_its_service_time_before_replacement(self):
+        bc5 = Bc5(serial(0x11, sequence=1, active=True), serial(sequence=2),
+                  serial(0x22, sequence=2, active=True), serial(sequence=2, active=True))
+        avr = Avr(0xAA, 0xBB)
+        link = SpiLink(bc5, avr, "9575")
+        link.exchange()
+        avr.advance(40)
+        link.exchange(acknowledge=False)
+        self.assertFalse(link.pending)
+        self.assertEqual(link.quantum, 88)
+        link.exchange(acknowledge=False)
+        self.assertEqual(link.transferred, 1)
+        avr.advance(88)
+        link.exchange()
+        self.assertEqual(link.transferred, 2)
+        self.assertEqual(link.stale, 1)
+        self.assertEqual([args for op, args in bc5.calls if op == "serial"], [{}, {}, {}, {}])
+
+    def test_reset_discards_the_old_service_phase_before_released_traffic(self):
+        bc5 = Bc5(serial(0x11, sequence=1, active=True),
+                  serial(0x22, sequence=2, active=True, output=0, reset_count=1),
+                  serial(sequence=2, active=True, reset_count=1))
+        avr = Avr(0xAA, 0xBB)
+        link = SpiLink(bc5, avr, "9555")
+        link.exchange()
+        avr.advance(3)
+        link.exchange(acknowledge=False)
+        self.assertTrue(link.hold_reset)
+        self.assertEqual(link.quantum, 128)
+        link.exchange(acknowledge=False)
+        self.assertFalse(link.hold_reset)
+        self.assertEqual(link.transferred, 2)
+        self.assertEqual(avr.state["steps"], 0)
+
     def test_pre_service_sync_retains_reply_and_applies_reset_without_acknowledging(self):
         bc5 = Bc5(serial(0x11, sequence=1, active=True, remaining=2),
                   serial(sequence=1, active=True, remaining=2),
@@ -61,6 +123,7 @@ class SpiLinkTests(unittest.TestCase):
         link.exchange(acknowledge=False)
         self.assertEqual(link.transferred, 1)
         self.assertEqual([args for op, args in bc5.calls if op == "serial"], [{}, {}])
+        avr.advance()
         link.exchange()  # The scheduler has now executed the AVR.
         link.exchange(acknowledge=False)
         self.assertTrue(link.hold_reset)
@@ -79,7 +142,9 @@ class SpiLinkTests(unittest.TestCase):
         link.exchange(acknowledge=False)
         self.assertEqual(link.transferred, 1)
         self.assertEqual(link.stale, 1)
+        avr.advance()
         link.exchange()  # Consume the old byte before clocking its replacement.
+        avr.advance()
         link.exchange()
         self.assertEqual(link.transferred, 2)
         self.assertFalse(link.pending)
@@ -116,7 +181,9 @@ class SpiLinkTests(unittest.TestCase):
         self.assertEqual(link.quantum, 128)
         # The scheduler executes the AVR ISR between these exchanges.
         avr.pins[1] = 1
+        avr.advance()
         link.exchange()
+        avr.advance()
         link.exchange()
         self.assertEqual([args for op, args in bc5.calls if op == "serial"],
                          [{}, {"received": 0, "sequence": 10}, {"received": 0x80, "sequence": 11}])
@@ -156,6 +223,7 @@ class SpiLinkTests(unittest.TestCase):
         link.exchange()
         self.assertFalse(link.hold_reset)
         self.assertEqual([args for op, args in avr.calls if op == "spi"], [{"value": 0x80}])
+        avr.advance()
         link.exchange()
         self.assertEqual(link.state()["reset_count"], 1)
         self.assertEqual(link.state()["resets"], 1)
@@ -191,6 +259,7 @@ class SpiLinkTests(unittest.TestCase):
                     self.assertTrue(link.pending)
                     link.exchange()  # Selecting it again permits exactly one transfer.
                     self.assertEqual(link.transferred, 1)
+                    avr.advance()
                     link.exchange()
                     self.assertFalse(link.pending)
                     self.assertEqual(bc5.calls[-2], ("serial", {"received": 0x55, "sequence": 4}))
@@ -205,6 +274,7 @@ class SpiLinkTests(unittest.TestCase):
         self.assertEqual(link.state()["transferred"], 0)
         link.exchange()
         self.assertEqual([args for op, args in bc5.calls if op == "serial"], [{}, {}])
+        avr.advance()
         link.exchange()
         self.assertEqual([args for op, args in bc5.calls if op == "serial"][-1],
                          {"received": 0xFF, "sequence": 2})
@@ -237,6 +307,7 @@ class SpiLinkTests(unittest.TestCase):
         avr = Avr(8)
         link = SpiLink(bc5, avr, "9555")
         link.exchange()
+        avr.advance()
         link.exchange()
         self.assertEqual([args for op, args in bc5.calls if op == "serial"][-1],
                          {"received": 8, "sequence": 4})

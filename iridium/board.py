@@ -55,7 +55,7 @@ class ModemLink:
 
 
 class SpiLink:
-    """BC5 serial DMA ↔ AVR slave; replies wait for the next instruction quantum."""
+    """BC5 serial DMA ↔ AVR slave; each reply waits for 128 AVR instructions."""
 
     def __init__(self, bc5, avr, model, *, reset_count=0):
         if model not in ("9555", "9575"):
@@ -69,9 +69,14 @@ class SpiLink:
         self.reset_count = reset_count
         self.error = None
         self._byte = self._reply = None
+        self._clocked_at = None
 
     @property
     def quantum(self):
+        if self._clocked_at is not None:
+            remaining = 128 - (self.avr.state["steps"] - self._clocked_at)
+            if remaining > 0:
+                return remaining
         return 128 if self.pending else 4096
 
     @staticmethod
@@ -82,9 +87,9 @@ class SpiLink:
         if self.error:
             raise EngineError(self.error)
         try:
-            # A replaced DMA must still let the AVR consume its previous clocked byte.
-            unserviced = not acknowledge and self._reply is not None
-            acknowledgement = acknowledge and self._reply is not None
+            # Request boundaries cannot shorten an already-clocked byte's service interval.
+            unserviced = self._clocked_at is not None and self.avr.state["steps"] - self._clocked_at < 128
+            acknowledgement = acknowledge and not unserviced and self._reply is not None
             arguments = ({"received": self._reply, "sequence": self._byte[1]}
                          if acknowledgement else {})
             response = self.bc5.request("serial", **arguments)
@@ -108,6 +113,8 @@ class SpiLink:
             if reset:
                 self.avr.request("warm_reset")
                 self.resets += 1
+                self._clocked_at = None
+                unserviced = False
             self.reset_count, self.hold_reset = gpio["reset_count"], held
 
             if self._byte is not None:
@@ -143,9 +150,12 @@ class SpiLink:
                 elif self._number(reply, 255):
                     self._reply = reply
                     self.transferred += 1
+                    self._clocked_at = self.avr.state["steps"]
                 else:
                     raise EngineError("Invalid AVR response on BC5/AVR SPI link")
             self.pending = active or self._byte is not None
+            if not self.pending and not unserviced:
+                self._clocked_at = None
         except EngineError as error:
             self.error = str(error)
             raise

@@ -470,6 +470,39 @@ class ProtocolTests(unittest.TestCase):
             self.assertIsNone(states[2]["halt"])
             self.assertEqual(states[3]["error"], "NoPendingCall")
 
+    def test_bc5_return_stops_before_a_due_timer_ticks_or_interrupts(self):
+        def operand(op, value):
+            return [(((value + 128) >> 8) & 255) << 8, ((value & 255) << 8) | op]
+
+        for model, size in (("9555", 0x310FBA), ("9575", 0x36BB22)):
+            for interrupts in (False, True):
+                firmware = bytearray(size)
+                firmware[:2] = b"\x04\0"
+                firmware[4:6] = b"\x04\0"  # Trap if a post-return interrupt executes.
+                settings = (((0x44, 2), (0xFF94, 4), (0x64, 1), (0xFF95, 2)) if interrupts
+                            else ((0x4C, 3), (0xFF94, 8)))
+                code = []
+                for address, value in settings:
+                    code += operand(0x14, value) + operand(0x25, address)
+                code += ([0x0006, 0x0107, 0x0205] + [0x0014] * 4 if interrupts else [0x0714] * 19)
+                code.append(0x00E2)
+                payload = b"".join(word.to_bytes(2, "little") for word in code)
+                firmware[0x100:0x100 + len(payload)] = payload
+                count = 16 if interrupts else 24
+                for budget in (count, count + 1, 100):
+                    for quantum in (1, 7, budget):
+                        with self.subTest(model=model, interrupts=interrupts, budget=budget, quantum=quantum):
+                            commands = [{"op": "call", "entry": 0x100, "steps": budget, "quantum": quantum,
+                                         "stack": [0xFFFE, 0xFCC0, 0x10]}]
+                            commands += [{"op": "call_resume", "steps": quantum}] * ((count - 1) // quantum)
+                            states = exchange("bc5", firmware, commands, model=model)
+                            result = states[-1]
+                            self.assertTrue(result["last_call"]["returned"])
+                            self.assertEqual(result["last_call"]["steps"], count)
+                            self.assertIsNone(result["halt"])
+                            self.assertEqual(result["gpio"]["irq_pending"], 0)
+                            self.assertEqual(result["registers"], states[0]["registers"])
+
     def test_bc5_modifier_chain_probe_returns_and_reset_still_executes(self):
         firmware = bytearray(0x310FBA)
         firmware[0:2] = (0x0004).to_bytes(2, "little")

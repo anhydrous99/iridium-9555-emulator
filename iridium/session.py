@@ -246,12 +246,14 @@ class Session:
             if not halted:
                 steps = primary.state["steps"] - before
             self._exchange_links(acknowledge_spi=False)
-        if steps:
-            self._clock_reset(steps)
+        while steps:
+            quantum = self._board_quantum(steps)
+            self._clock_reset(quantum)
             for worker in self._active_processors():
                 if worker is not primary:
-                    self._step_processor(worker, steps)
+                    self._step_processor(worker, quantum)
             self._exchange_links()
+            steps -= quantum
 
     def _step_processor(self, worker, steps):
         previous = worker.state.get("halt")

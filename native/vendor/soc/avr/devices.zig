@@ -275,6 +275,7 @@ pub const State = extern struct {
     wdt_window: u8 = 0,
     clk_window: u8 = 0,
     adc_first: u8 = 1,
+    adc_prescaler: u8 = 0,
     reset_request: u8 = 0,
     _pad: [5]u8 = @splat(0),
     usart: [4]Usart = .{ .{}, .{}, .{}, .{} },
@@ -1063,7 +1064,8 @@ pub const Devices = struct {
                     io[a] &= ~@as(u8, 0x40);
                     d.st.adc_busy = 0;
                     d.st.adc_first = 1;
-                } else if (v & 0x40 != 0 and d.st.adc_busy == 0) d.adcStart(false) else if (d.st.adc_busy != 0) io[a] |= 0x40; // ADSC: writing 0 has no effect
+                    d.st.adc_prescaler = 0;
+                } else if (v & 0x40 != 0 and d.st.adc_busy == 0) d.adcStart(.software) else if (d.st.adc_busy != 0) io[a] |= 0x40; // ADSC: writing 0 has no effect
                 d.comparatorRefresh();
             },
             ADCL, ADCH => {},
@@ -1427,17 +1429,23 @@ pub const Devices = struct {
 
     fn adcTrigger(d: *Devices, source: u3) void {
         const io = &d.st.io;
-        if (d.adcRunning() and io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == source and d.st.adc_busy == 0 and io[PRR] & PRADC == 0) d.adcStart(true);
+        if (d.adcRunning() and io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == source and d.st.adc_busy == 0 and io[PRR] & PRADC == 0) d.adcStart(.trigger);
     }
 
     // Conversion and sample-and-hold points follow the datasheet ADC Conversion Time table.
-    fn adcStart(d: *Devices, auto: bool) void {
+    fn adcStart(d: *Devices, source: enum { software, trigger, free_running }) void {
         const io = &d.st.io;
         const ps = [8]u32{ 2, 2, 4, 8, 16, 32, 64, 128 };
-        // in half ADC clocks: conversion time, sample-and-hold point
-        const conv: u32, const sh: u32 = if (d.st.adc_first != 0) .{ 50, 27 } else if (auto) .{ 27, 4 } else .{ 26, 3 };
-        const half = ps[io[ADCSRA] & 7] / 2;
+        const divisor = ps[io[ADCSRA] & 7];
+        if (source == .trigger) d.st.adc_prescaler = 0;
         d.st.adc_mux = (io[ADMUX] & 0x1F) | (if (d.mega) (io[ADCSRB] & 8) << 2 else @as(u8, 0));
+        const mux = d.st.adc_mux & 0x1F;
+        // CKADC2 synchronizes differential samples; every free-running restart takes 14 clocks.
+        const delayed = mux >= 8 and mux < 30 and
+            (source == .free_running or d.st.adc_prescaler / divisor & 1 != 0);
+        // in half ADC clocks: conversion time, sample-and-hold point
+        const conv: u32, const sh: u32 = if (d.st.adc_first != 0) .{ 50, 27 } else if (source == .trigger) .{ 27, 4 } else if (delayed) .{ 28, 5 } else .{ 26, 3 };
+        const half = divisor / 2;
         d.st.adc_first = 0;
         d.st.adc_busy = conv * half;
         d.st.adc_hold = (conv - sh) * half;
@@ -1454,7 +1462,7 @@ pub const Devices = struct {
             io[ADCH] = @truncate(res >> 8);
         }
         io[ADCSRA] = (io[ADCSRA] & ~@as(u8, 0x40)) | 0x10;
-        if (io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == 0) d.adcStart(false);
+        if (io[ADCSRA] & 0xA0 == 0xA0 and io[ADCSRB] & 7 == 0) d.adcStart(.free_running);
     }
 
     fn adcInput(d: *const Devices) u16 {
@@ -1710,6 +1718,8 @@ pub const Devices = struct {
         if (d.st.wdt_window > 0) d.st.wdt_window -|= @intCast(@min(cycles, 255));
         if (d.st.clk_window > 0) d.st.clk_window -|= @intCast(@min(cycles, 255));
         // before the timers: a conversion they trigger in this tick counts from the next one
+        if (d.adcRunning() and io[ADCSRA] & 0x80 != 0 and io[PRR] & PRADC == 0)
+            d.st.adc_prescaler +%= @truncate(cycles);
         if (d.adcRunning() and d.st.adc_busy > 0 and io[PRR] & PRADC == 0) {
             d.st.adc_busy -|= cycles;
             if (d.st.adc_sampled == 0 and d.st.adc_busy <= d.st.adc_hold) {
@@ -2241,7 +2251,7 @@ pub const Devices = struct {
             return;
         }
         d.st.sleep_mode = (d.st.io[SMCR] >> 1) & 7;
-        if (d.st.sleep_mode <= 1 and d.st.io[ADCSRA] & 0x80 != 0 and d.st.adc_busy == 0 and d.st.io[PRR] & PRADC == 0) d.adcStart(false);
+        if (d.st.sleep_mode <= 1 and d.st.io[ADCSRA] & 0x80 != 0 and d.st.adc_busy == 0 and d.st.io[PRR] & PRADC == 0) d.adcStart(.software);
     }
 
     fn sysWakeCycles(ctx: *anyopaque) u32 {
@@ -3237,11 +3247,80 @@ test "ADC extended mux is latched, differential conversion signed, and ADCL lock
     d.setAnalog(1, 600);
     d.write(ADMUX, 16); // ADC0 - ADC1, gain1, signed result = (400-600)/2
     d.write(ADCSRA, 0xC0);
-    d.tick(26);
+    d.tick(28); // CKADC2 is high: the differential conversion takes 14 clocks.
     const negative: u16 = @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8;
     try testing.expectEqual(@as(u16, 0x39C), negative);
     var small = fresh();
     try testing.expectEqual(@as(usize, 8), small.analogCount());
+}
+
+test "differential ADC free-running restarts take fourteen clocks and sample at two and a half" {
+    for ([_]bool{ false, true }) |mega| for ([_]u8{ 0, 2, 4, 7 }) |prescale| {
+        const divisor = ([8]u32{ 2, 2, 4, 8, 16, 32, 64, 128 })[prescale];
+        for ([_]u32{ 0, divisor }) |delay| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            d.setAnalog(0, 400);
+            d.setAnalog(1, 600);
+            d.write(ADMUX, 16);
+            d.write(ADCSRA, 0x80 | prescale);
+            d.tick(delay);
+            d.write(ADCSRA, 0xE0 | prescale);
+            d.tick(27 * divisor / 2 - 1);
+            try testing.expectEqual(@as(u8, 0), d.st.adc_sampled);
+            d.tick(1);
+            try testing.expectEqual(@as(u8, 1), d.st.adc_sampled);
+            d.tick(25 * divisor - 27 * divisor / 2 - 1);
+            try testing.expectEqual(@as(u8, 0), d.read(ADCSRA) & 0x10);
+            d.tick(1);
+            try testing.expectEqual(@as(u16, 0x39C), @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8);
+            for (0..3) |_| {
+                d.write(ADCSRA, 0xF0 | prescale);
+                d.tick(3 * divisor / 2);
+                d.setAnalog(0, 800); // after single-ended S&H, before differential S&H
+                d.tick(divisor);
+                d.setAnalog(0, 400); // a change after the differential sample must be ignored
+                d.tick(13 * divisor - 5 * divisor / 2);
+                try testing.expectEqual(@as(u8, 0), d.read(ADCSRA) & 0x10);
+                d.tick(divisor);
+                try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x10);
+                try testing.expectEqual(@as(u16, 100), @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8);
+            }
+        }
+    };
+}
+
+test "ADC user conversions select latched mux timing from the running CKADC2 phase" {
+    for ([_]bool{ false, true }) |mega| for ([_]u32{ 0, 15, 16, 17 }) |delay| for ([_]u8{ 0, 16, 30, 31 }) |mux| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.setAnalog(0, 400);
+        d.setAnalog(1, 600);
+        d.write(ADCSRA, 0xC4);
+        d.tick(400); // first extended conversion completes with CKADC2 high
+        d.tick(delay);
+        d.write(ADMUX, mux);
+        d.write(ADCSRA, 0xD4);
+        d.write(ADMUX, if (mux == 16) 0 else 16); // timing and input use the latched selection
+        const delayed = delay < 16 and mux == 16;
+        const sample: u32 = if (delayed) 40 else 24;
+        d.tick(sample - 1);
+        try testing.expectEqual(@as(u8, 0), d.st.adc_sampled);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 1), d.st.adc_sampled);
+        const duration: u32 = if (delayed) 224 else 208;
+        d.tick(duration - sample - 1);
+        try testing.expectEqual(@as(u8, 0), d.read(ADCSRA) & 0x10);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x10);
+        const expected: u16 = if (mux == 16) 0x39C else if (mux == 0) 400 else 0;
+        try testing.expectEqual(expected, @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8);
+        d.write(ADCSRA, 0);
+        try testing.expectEqual(@as(u8, 0), d.st.adc_prescaler);
+        d.write(ADMUX, 16);
+        d.write(ADCSRA, 0xC4);
+        try testing.expectEqual(@as(u32, 400), d.st.adc_busy); // re-enabling restores first-conversion timing
+    };
 }
 
 test "ADC free running and timer1 overflow auto trigger preserve hardware flags" {
