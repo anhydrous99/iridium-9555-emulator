@@ -330,6 +330,7 @@ fn returnToZig(c: *const Cpu, ret_bits: u16) u64 {
 fn stopUnderZig(c: *Cpu, target: u32) noreturn {
     if (c.stop) |s| switch (s) {
         .invalid => |a| c.bus.halt(.{ .fault = invalid_fault_base | a }),
+        .undefined_spm_buffer => c.bus.halt(.{ .fault = 0x57 }),
         .hook => {},
     };
     if (c.bus.stop) |s| if (c.bus.on_stop) |f| f(s);

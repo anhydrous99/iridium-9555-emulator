@@ -122,8 +122,8 @@ def main():
                     state = boot()
                     result.setdefault("native_states", {})[item.image] = hashlib.sha256(
                         json.dumps(state, sort_keys=True).encode()).hexdigest()
-        bc5 = [item for item in images if item.image == "bc5"]
-        with Session(args.engine.resolve(), bc5) as session:
+        board = [item for item in images if item.image in ("bc5", "avr")]
+        with Session(args.engine.resolve(), board) as session:
             def initialize():
                 session.control("reset")
                 session.control("initialize_ui")

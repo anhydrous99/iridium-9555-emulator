@@ -103,16 +103,31 @@ pub const Model = struct {
 
     const ByteAddress = struct { word: u16, shift: u4 };
 
+    pub fn readBuffer(m: *Model, handle: u16, offset: u32) Error!u8 {
+        const target = try m.translateBuffer(handle, offset, false);
+        return @truncate(m.data[target.word] >> target.shift);
+    }
+
+    pub fn writeBuffer(m: *Model, handle: u16, offset: u32, value: u8) Error!void {
+        const target = try m.translateBuffer(handle, offset, true);
+        const mask = @as(u16, 0xFF) << target.shift;
+        m.data[target.word] = (m.data[target.word] & ~mask) | (@as(u16, value) << target.shift);
+    }
+
     fn translate(m: *Model, address: u16, allocate: bool) Error!ByteAddress {
         const window: u16 = if (address < 0x6000) 0x4000 else 0x6000;
         const handle = m.data[if (window == 0x4000) 0x6E else 0x6F];
+        return m.translateBuffer(handle, address - window, allocate);
+    }
+
+    fn translateBuffer(m: *Model, handle: u16, byte_offset: u32, allocate: bool) Error!ByteAddress {
         if (handle == 0 or handle > 0xFF) return error.InvalidHandle;
         const descriptor_address = ram_base + handle * 2;
         const descriptor = m.data[descriptor_address];
         if (descriptor == 0 or descriptor == 0xFFFF) return error.InvalidHandle;
         const table_words = @as(u16, 1) << @as(u4, @intCast(descriptor >> 13));
         const byte_capacity = @as(u32, table_words) * 2 * page_bytes;
-        const offset = (@as(u32, m.data[descriptor_address + 1]) + address - window) & (byte_capacity - 1);
+        const offset = (@as(u32, m.data[descriptor_address + 1]) +% byte_offset) & (byte_capacity - 1);
         const pointer_scale: u16 = if (m.system_control.* & 0x800 != 0) 2 else 1;
         const table_address = @as(u32, ram_base) + (descriptor & 0x1FFF) * pointer_scale;
         if (table_address < ram_base or table_address + table_words > 0xE000) return error.InvalidPageTable;

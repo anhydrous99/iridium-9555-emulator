@@ -1,4 +1,4 @@
-"""Coordinate the debugger, independent processors, and explicit test stimuli."""
+"""Coordinate guest processors, inferred board links and explicit test stimuli."""
 
 from collections import deque
 from pathlib import Path
@@ -8,6 +8,7 @@ import threading
 import time
 
 from .assets import AssetError, BC5Assets
+from .board import ModemLink, SpiLink
 from .engine import Engine, EngineError
 from .firmware import Firmware
 from .lcd import ST7541
@@ -17,22 +18,27 @@ from .satellite import Satellite
 
 ALL_KEYS = set(KEY_CODES) | {"power", "convenience", "sos"}
 LIMITATIONS = [
-    "Partial hardware model: this is not yet a complete handset emulator.",
-    "Processors execute independently; BC5–AVR–modem board links are not coupled.",
-    "Natural handset startup is unresolved; experimental initialization calls original firmware routines.",
-    "Keys use the original software input entry after explicit initialization; electrical wiring is unresolved.",
-    "The physical power control is recorded only; its board power circuit is not connected.",
-    "LCD output uses an inferred controller model; resource previews remain separate from live output.",
+    "Digital hardware behavior and processor clock ratios are inferred from firmware; physical timing is not calibrated.",
+    "Empty upgrade images need factory settings; original factory routines provision these before hardware startup.",
+    "Keys use the GPIO matrix and power uses AVR inputs; the 9575 SOS electrical path is unresolved and uses its known software entry.",
+    "LCD output uses inferred serial/controller models; resource previews remain separate from live output.",
     "Satellite service scenarios are offline and are not connected to the modem firmware.",
-    "Modem boot ROM, DSP/RF behavior, SIM/provisioning and hardware timing are incomplete.",
+    "Unshipped modem boot ROM/DSP code, unestablished RF behavior and SIM/provisioning are outside the modeled scope.",
 ]
 
 
 class Session:
-    def __init__(self, executable: Path, firmware: list[Firmware], engine_factory=Engine):
+    def __init__(self, executable: Path, firmware: list[Firmware], engine_factory=Engine,
+                 *, strict_hardware: bool = False, modem_image: str = "trx"):
         if not firmware or len({item.model for item in firmware}) != 1:
             raise ValueError("Load at least one image, all for the same handset model")
         self.model = firmware[0].model
+        if modem_image not in ("trx", "ptt", "none"):
+            raise ValueError("modem_image must be trx, ptt or none")
+        self.modem_image = modem_image
+        self.modem_link = None
+        self.spi_link = None
+        self.strict_hardware = strict_hardware
         self._executable = executable
         self._engine_factory = engine_factory
         self._temporary = tempfile.TemporaryDirectory(prefix="iridium-")
@@ -81,8 +87,34 @@ class Session:
                 path = Path(out.name)
             try:
                 worker = self._engine_factory(self._executable, firmware.image, path, model=firmware.model)
+                if self.strict_hardware:
+                    try:
+                        worker.request("hardware", strict=True)
+                    except BaseException:
+                        worker.close()
+                        raise
             finally:
                 path.unlink(missing_ok=True)
+            restart_board = firmware.image == "avr" and "bc5" in self.engines
+            clear_inputs = firmware.image == "bc5" or restart_board
+            if firmware.model == self.model and clear_inputs:
+                try:
+                    primary = self.engines.get("bc5")
+                    for key in self.keys:
+                        code = self.profile.key_codes.get(key)
+                        if primary and primary.state.get("bc5_hardware") and code is not None and key != "sos":
+                            if firmware.image != "bc5":
+                                self._request(primary, "key", code=code, pressed=False)
+                        elif key == "power" and self.spi_link and firmware.image != "avr":
+                            self._power_input(False)
+                    # A new AVR starts a new board boot. Reset the retained primary
+                    # so no native DMA byte remains owned by the retired SPI link.
+                    if restart_board:
+                        self._request(primary, "warm_reset")
+                        self._reset_display()
+                except BaseException:
+                    worker.close()
+                    raise
             if firmware.model != self.model:
                 # The new primary image starts a separate board experiment.
                 for old in self.engines.values():
@@ -96,9 +128,11 @@ class Session:
             self.firmware[firmware.image] = firmware
             if old:
                 old.close()
+            self._connect_modem()
             self.running = False
-            if firmware.image == "bc5":
+            if clear_inputs:
                 self._clear_keys()
+            if firmware.image == "bc5":
                 self._reset_display()
                 self.asset = None
                 try:
@@ -131,19 +165,106 @@ class Session:
                     self.log("error", str(error))
 
     def _step(self, steps: int) -> None:
-        for worker in self.engines.values():
-            previous = worker.state.get("halt")
-            if previous not in (None, "steps", "running", "ready"):
-                continue
-            result = self._request(worker, "run", steps=steps)
-            halt = result.get("halt")
-            if halt not in (None, "steps", "running", "ready") and halt != previous:
-                self.log("cpu", f"{result.get('image')}: {halt} at {result.get('pc')}")
+        remaining = steps
+        while remaining:
+            quantum = self._board_quantum(remaining)
+            amount = min(remaining, quantum)
+            halted = self._step_processors(amount)
+            if (self.spi_link or self.modem_link) and halted:
+                self.running = False
+                break
+            remaining -= amount
         # Explicit virtual scenario time; this does not assert a physical CPU clock ratio.
         self.satellite.advance(20)
         if all(worker.state.get("halt") not in (None, "steps", "running", "ready")
-               for worker in self.engines.values()):
+               for worker in self._active_processors()):
             self.running = False
+
+    def _active_processors(self):
+        return [worker for image, worker in self.engines.items()
+                if (not self.modem_link or image not in ("trx", "ptt") or image == self.modem_image)
+                and not (image == "avr" and self.spi_link and self.spi_link.hold_reset)]
+
+    def _board_quantum(self, limit):
+        return min(limit, self.spi_link.quantum if self.spi_link else limit,
+                   self.modem_link.quantum if self.modem_link else limit)
+
+    def _connect_modem(self):
+        if "avr" in self.engines and self.modem_image in self.engines:
+            endpoints = ((self.engines["avr"], 0), (self.engines[self.modem_image], 1))
+            if not self.modem_link or self.modem_link.endpoints != endpoints:
+                self.modem_link = ModemLink(self.engines["avr"], self.engines[self.modem_image], self.modem_image)
+        else:
+            self.modem_link = None
+        if "bc5" in self.engines and "avr" in self.engines:
+            bc5, avr = self.engines["bc5"], self.engines["avr"]
+            if not self.spi_link or self.spi_link.bc5 is not bc5 or self.spi_link.avr is not avr:
+                state = bc5.request("hardware", serial_peer=True)
+                self.spi_link = SpiLink(bc5, avr, self.model, reset_count=state["gpio"]["reset_count"])
+        else:
+            self.spi_link = None
+
+    def _service_board(self, steps):
+        self._clock_reset(steps)
+        for worker in self._active_processors():
+            if worker is self.engines.get("bc5"):
+                continue
+            result = self._request(worker, "run", steps=steps)
+            if result.get("halt") not in (None, "steps", "running", "ready"):
+                raise EngineError(f"Peripheral processor halted during board service: {result.get('halt')}")
+        self._exchange_links()
+
+    def _service_board_elapsed(self, steps):
+        # Apply reset before executing peripherals, including after a terminal chunk.
+        self._exchange_links(acknowledge_spi=False)
+        while steps:
+            quantum = self._board_quantum(steps)
+            self._service_board(quantum)
+            steps -= quantum
+
+    def _clock_reset(self, cycles):
+        if self.spi_link and self.spi_link.hold_reset:
+            self._request(self.engines["avr"], "reset_clock", cycles=cycles)
+
+    def _exchange_links(self, *, acknowledge_spi=True):
+        avr_reset = False
+        if self.spi_link:
+            before = self.spi_link.resets
+            self.spi_link.exchange(acknowledge=acknowledge_spi)
+            avr_reset = self.spi_link.hold_reset or self.spi_link.resets != before
+        if self.modem_link:
+            self.modem_link.exchange(avr_reset=avr_reset)
+
+    def _step_processors(self, steps: int) -> bool:
+        primary = self.engines.get("bc5") if self.spi_link else None
+        newly_halted = False
+        if primary:
+            before = primary.state["steps"]
+            halted = primary.state.get("halt") not in (None, "steps", "running", "ready")
+            newly_halted = self._step_processor(primary, steps)
+            if not halted:
+                steps = primary.state["steps"] - before
+            self._exchange_links(acknowledge_spi=False)
+        while steps:
+            quantum = self._board_quantum(steps)
+            self._clock_reset(quantum)
+            for worker in self._active_processors():
+                if worker is not primary:
+                    newly_halted = self._step_processor(worker, quantum) or newly_halted
+            self._exchange_links()
+            steps -= quantum
+        return newly_halted
+
+    def _step_processor(self, worker, steps):
+        previous = worker.state.get("halt")
+        if previous not in (None, "steps", "running", "ready"):
+            return False
+        result = self._request(worker, "run", steps=steps)
+        halt = result.get("halt")
+        if halt not in (None, "steps", "running", "ready") and halt != previous:
+            self.log("cpu", f"{result.get('image')}: {halt} at {result.get('pc')}")
+            return True
+        return False
 
     def control(self, action: str, steps: int = 10000) -> dict:
         if type(steps) is not int or not 1 <= steps <= 10000000:
@@ -162,8 +283,18 @@ class Session:
                 self._clear_keys()
                 self.satellite = Satellite()
                 self._reset_display()
+                self.modem_link = None
+                self.spi_link = None
+                reset_error = None
                 for worker in self.engines.values():
-                    worker.request("reset")
+                    try:
+                        worker.request("reset")
+                    except EngineError as error:
+                        if reset_error is None:
+                            reset_error = error
+                if reset_error is not None:
+                    raise reset_error
+                self._connect_modem()
             elif action == "initialize_ui":
                 self.running = False
                 self._initialize_ui()
@@ -223,16 +354,26 @@ class Session:
             down = pressed or bool(sources - {source})
             changed = (key in self.keys) != down
             delivered = False
+            electrical = False
             try:
                 key_code = self.profile.key_codes.get(key)
-                if changed and self.ui_initialized and key_code is not None:
+                worker = self.engines.get("bc5")
+                if changed and worker and worker.state.get("bc5_hardware") and key_code is not None and key != "sos":
+                    if self.ui_initialized and worker.request("read", address=self.profile.key_callback, count=2)["values"] == [0, 0]:
+                        self.ui_initialized = False
+                    self._request(worker, "key", code=key_code, pressed=down)
+                    delivered = electrical = True
+                elif changed and key == "power" and self.spi_link:
+                    self._power_input(down)
+                    delivered = electrical = True
+                elif changed and self.ui_initialized and key_code is not None:
                     worker = self.engines["bc5"]
                     self._idle(worker)
                     callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
                     if callback == [0, 0]:
                         self.ui_initialized = False
                         raise EngineError("Firmware key handler is absent; reset before reinitializing")
-                    self._call(worker, self.profile.key_entry, al=key_code, ah=1 if pressed else 4, steps=100000)
+                    self._call(worker, self.profile.key_entry, al=key_code, ah=1 if down else 4, steps=100000)
                     delivered = True
                 if pressed:
                     sources.add(source)
@@ -248,11 +389,15 @@ class Session:
                 elif not pressed:
                     self.key_generations[key] += 1
                 if delivered:
-                    self._idle(worker)
+                    if electrical:
+                        self._step(5200000 if key == "power" and down else 150000)
+                    else:
+                        self._idle(worker)
             except EngineError:
                 self.running = False
                 raise
             message = f"{key} {'down' if pressed else 'up'} " + (
+                "applied to the emulated electrical input" if electrical else
                 "delivered through original software key routine" if delivered else
                 "recorded; shared key state unchanged" if not changed else
                 "recorded; this control's hardware input is not connected" if key_code is None else
@@ -261,8 +406,17 @@ class Session:
             return {"ok": True, "delivered": delivered, "message": message,
                     "generation": self.key_generations[key], "key_epoch": self.key_epoch}
 
+    def _power_input(self, pressed):
+        worker = self.engines["avr"]
+        port, bit = self.profile.power_pin
+        value = worker.request("pin_state")["inputs"][port]
+        value = value & ~(1 << bit) if pressed else value | (1 << bit)
+        self._request(worker, "pins", port=port, value=value)
+
     def probe(self, image: str, operation: str, arguments: dict) -> dict:
-        if operation not in ("read", "write", "call", "state", "pins", "uart_rx", "uart_tx", "spi"):
+        if operation not in ("read", "write", "call", "state", "pins", "uart_rx", "uart_tx", "spi",
+                             "adc", "irq", "trace", "uart_io", "comparator", "async_clock", "twi",
+                             "program_read", "fuses", "pin_state", "serial", "call_resume", "key"):
             raise ValueError("Unsupported debugger operation")
         with self._lock:
             self._ensure_open()
@@ -270,7 +424,11 @@ class Session:
                 raise ValueError("Pause execution before a debugger probe")
             if image not in self.engines:
                 raise ValueError("Processor image is not loaded")
-            response = self._request(self.engines[image], operation, **arguments)
+            worker = self.engines[image]
+            if image == "bc5" and operation in ("call", "call_resume"):
+                response = self._probe_operation(worker, operation, arguments)
+            else:
+                response = self._request(worker, operation, **arguments)
             self.log("probe", f"{image}: {operation}")
             return response
 
@@ -315,7 +473,10 @@ class Session:
                     "key_epoch": self.key_epoch,
                     "satellite": self.satellite.state(), "events": list(self.events),
                     "asset": self.asset, "lcd": lcd, "ui_initialized": self.ui_initialized,
-                    "fidelity": {"complete": False, "limitations": limitations}}
+                    "processor_link": self.modem_link.state() if self.modem_link else {"connected": False},
+                    "spi_link": self.spi_link.state() if self.spi_link else {"connected": False},
+                    "fidelity": {"complete": False, "scope": "firmware-derived",
+                                 "board_coupled": bool(self.spi_link and self.modem_link), "limitations": limitations}}
 
     def _reset_display(self) -> None:
         self.ui_initialized = False
@@ -342,9 +503,27 @@ class Session:
                     self.log("lcd", f"Display interpretation stopped: {error}")
             # Captured bytes have been consumed; retain the decoded display instead.
             response["lcd_bytes"] = []
+            if self.ui_initialized and response.get("power_state") in (2, 8):
+                self.ui_initialized = False
+                self.ui_attempted = False
+                self.log("firmware", "Original firmware powered off")
         return response
 
     def _idle(self, worker) -> None:
+        if self.spi_link:
+            remaining = 30000000
+            while remaining > 0:
+                quantum = self._board_quantum(remaining)
+                before = worker.state["steps"]
+                response = self._request(worker, "idle", steps=quantum)
+                remaining -= quantum
+                elapsed = response["steps"] - before
+                self._service_board_elapsed(elapsed)
+                if response.get("halt"):
+                    break
+                if response.get("at_idle"):
+                    return
+            raise EngineError(f"Cannot reach a safe scheduler boundary: {response.get('halt') or 'instruction budget exhausted'}")
         # A configured warm boot also runs the application's device initialization.
         for _ in range(3):
             response = self._request(worker, "idle", steps=10000000)
@@ -355,10 +534,51 @@ class Session:
         raise EngineError(f"Cannot reach a safe scheduler boundary: {response.get('halt') or 'instruction budget exhausted'}")
 
     def _call(self, worker, entry: int, **arguments) -> dict:
-        response = self._request(worker, "call", entry=entry, **arguments)
+        response = self._probe_call(worker, entry, **arguments)
         if response.get("halt") or not (response.get("last_call") or {}).get("returned"):
             raise EngineError(f"Original function 0x{entry:X} did not return: {response.get('halt')}")
         return response
+
+    def _probe_call(self, worker, entry, **arguments):
+        return self._probe_operation(worker, "call", {"entry": entry, **arguments})
+
+    def _probe_operation(self, worker, operation, arguments):
+        arguments = dict(arguments)
+        default_budget = 100000 if operation == "call" else (worker.state.get("last_call") or {}).get("remaining_steps", 0)
+        budget = arguments.get("steps", default_budget)
+        if self.spi_link and type(budget) is int and budget > 0:
+            quantum = arguments.get("quantum", self._board_quantum(budget))
+            if type(quantum) is int and 1 <= quantum <= 100000000:
+                arguments["quantum"] = min(quantum, self._board_quantum(budget))
+        before = (worker.state.get("last_call") or {}).get("steps", 0) if operation == "call_resume" else 0
+        # Native validation must run before any peripheral processor advances.
+        response = self._request(worker, operation, **arguments)
+        peripheral_budget = budget
+        previous = before
+        while True:
+            call = response.get("last_call") or {}
+            elapsed = call.get("steps", previous) - previous
+            previous += elapsed
+            if self.spi_link:
+                self._service_board_elapsed(elapsed)
+                peripheral_budget -= elapsed
+            if not call.get("pending"):
+                return response
+            remaining = budget - (previous - before)
+            if remaining <= 0:
+                return response
+            if not self.spi_link:
+                if not response.get("serial_waiting"):
+                    return response
+                raise EngineError("Function probe is waiting for a connected serial peer")
+            if not elapsed and self.spi_link.pending and peripheral_budget > 0:
+                quantum = self._board_quantum(min(remaining, peripheral_budget))
+                self._service_board(quantum)
+                peripheral_budget -= quantum
+            if peripheral_budget <= 0:
+                raise EngineError("Peripheral wait exceeded the function-probe budget; reset before retrying")
+            quantum = self._board_quantum(min(remaining, peripheral_budget))
+            response = self._request(worker, "call_resume", steps=quantum)
 
     def _initialize_ui(self) -> None:
         if self.ui_initialized:
@@ -367,23 +587,37 @@ class Session:
             raise EngineError("Application initialization was incomplete; reset before retrying")
         if "bc5" not in self.engines:
             raise ValueError("Load BC5 firmware before initializing the handset application")
+        if not self.spi_link:
+            raise ValueError("Load AVR firmware with BC5 firmware before powering on the handset")
+        if "power" in self.keys:
+            raise ValueError("Release the power button before powering on the handset")
         self.ui_attempted = True
         worker = self.engines["bc5"]
+        self._request(worker, "warm_reset")
         self._idle(worker)
         if worker.request("read", address=self.profile.graphics_pointer, count=1)["values"] == [0]:
             self._call(worker, self.profile.graphics_init, steps=10000000)
-        setup = self._request(worker, "call", entry=self.profile.application_setup, steps=10000000)
-        if setup.get("halt") == "firmware-reset-requested":
-            # Blank settings make the original factory routine program defaults and reboot.
+        setup = self._probe_call(worker, self.profile.application_setup, steps=10000000)
+        if setup.get("halt") != "firmware-reset-requested" and (
+                setup.get("halt") or not (setup.get("last_call") or {}).get("returned")):
+            raise EngineError(f"Original application setup did not return: {setup.get('halt')}")
+        # Startup samples the released, active-low power button before polling changes.
+        self._power_input(False)
+        try:
             self._request(worker, "warm_reset")
             self._idle(worker)
-            self.log("firmware", "Original factory defaults retained across the requested warm reset")
-            self._call(worker, self.profile.application_setup, steps=10000000)
-        elif setup.get("halt") or not (setup.get("last_call") or {}).get("returned"):
-            raise EngineError(f"Original application setup did not return: {setup.get('halt')}")
-        # Follow the original power-on branch; bypassing it lets the charging UI cover the animation.
-        self._call(worker, self.profile.power_on, al=0, steps=10000000)
-        self._call(worker, 0x6A092, al=3, steps=10000000)
+            self.log("firmware", "Original factory defaults retained across the warm reset")
+            for _ in range(200):
+                self._step(200000)
+                if worker.state.get("halt"):
+                    raise EngineError(f"Handset startup halted: {worker.state['halt']}")
+                callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
+                if callback != [0, 0]:
+                    break
+            else:
+                raise EngineError("Original firmware did not power on within the startup budget")
+        finally:
+            self._power_input(False)
         self._idle(worker)
         callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
         if callback == [0, 0]:
@@ -391,7 +625,7 @@ class Session:
         if self.lcd_capture_error:
             raise EngineError(f"Application display initialization failed: {self.lcd_capture_error}")
         self.ui_initialized = True
-        self.log("firmware", "Experimental application initialization completed via original routines; natural hardware boot remains incomplete")
+        self.log("firmware", "Factory settings initialized by original code; firmware powered on through AVR inputs")
 
     def close(self) -> None:
         self._stop.set()
@@ -406,6 +640,8 @@ class Session:
                 worker.close()
             self.engines.clear()
             self._temporary.cleanup()
+            self.modem_link = None
+            self.spi_link = None
         if self._thread:
             self._thread.join(timeout=2)
 

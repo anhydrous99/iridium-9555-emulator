@@ -3,11 +3,18 @@
 Runs original HT25003 (9555) and HL25003 (9575 Extreme) firmware instructions on XAP2, AVR, and SPARC interpreters,
 with a local handset/debugging interface and offline satellite scenarios.
 
-**This is a partial hardware emulator.** Experimental initialization runs the
-original application through its animation to the home screen, renders its LCD
-traffic and delivers software key events. The original Menu opens from the home
-screen. Natural hardware boot and a firmware-connected satellite link remain incomplete.
-The interface makes those boundaries visible.
+The firmware-derived board model includes XAP2 register banks and interrupts,
+MMU and flash, AVR peripherals, BC5–AVR SPI, AVR–modem UART transport, GPIO
+keypad scanning and physical power inputs. The original firmware initializes
+the display, advances its animation, opens menus and handles the controls.
+Strict MMIO checks and bounded bus traces support modified-firmware testing.
+See [implemented hardware and evidence](docs/inferred-hardware.md).
+
+The scope is behavior recoverable from the supplied firmware and component
+specifications. Unshipped boot-ROM/DSP code and unestablished RF/service behavior
+are excluded. The 9575 SOS electrical wiring remains unknown; that control uses
+its established original software input entry. Offline satellite scenarios are
+separate from the executing modem's transport.
 
 ## Run
 
@@ -49,20 +56,22 @@ Use `--host 127.0.0.1` for local-only access. Press Ctrl+C to stop the server an
 CPU workers. Use
 `--no-browser` to print the URL without opening it, or `--port 0` to choose a free port.
 
-`--initialize-ui` runs original application-initialization routines at scheduler
-boundaries. On a fresh image, the original firmware writes factory defaults and
-requests a reset; the scenario performs a warm reset that preserves them, then
-completes application initialization and resumes execution. After the boot
+`--initialize-ui` provisions empty settings through the original factory code,
+then warm resets with the AVR power input released. Actual ADC completion,
+board identification, power polling and processor links drive startup. Both BC5
+and AVR images are required. After the boot
 animation, the original home screen appears automatically with **Searching for
 Iridium**, **Acquiring time**, **Menu** and **Help**. Press the left soft key to
 open the original main menu. Initialization and animation take time to finish.
-This remains an experimental startup scenario; natural hardware boot is
-incomplete. Without the flag, the interface starts paused; **Initialize
-application** invokes the same scenario.
+The virtual board-ID fixture selects the firmware's GRev bin with AIO0=640;
+it is not a measured identification of a physical handset. Without the flag,
+the interface starts paused; **Power on handset** invokes the same scenario.
 
 Supply a directory to load BC5, AVR, telephony and PTT images. Telephony and PTT
-are alternative modem images, executed in **independent** workers for inspection;
-they are not two simultaneously active processors in a real handset.
+are alternative modem images, not two simultaneously active processors in a
+handset. Telephony is connected by default;
+`--modem-image ptt` selects PTT and leaves telephony inactive.
+`--modem-image none` runs modem workers independently for inspection.
 The source panel lists the filename and SHA-256 of every loaded processor image.
 
 ```sh
@@ -85,6 +94,8 @@ Relinked images
 with moved memory layouts require a new board profile. Installer EXEs and Intel
 HEX are not accepted; use the extracted binaries in the supplied project.
 
+AVR inputs may also be complete 16 KiB (9555) or 128 KiB (9575 profile) flash
+images, including synthetic boot sections for self-programming tests.
 The source firmware is read-only. Validated payloads are staged temporarily for
 the workers; firmware bytes are not included in this repository. Reset reloads
 the supplied image and discards the experiment's RAM and flash changes.
@@ -98,14 +109,15 @@ the supplied image and discards the experiment's RAM and flash changes.
   and bounded BC5 function probes support firmware experiments. Invalid guest
   instructions, firmware panic entry, and memory faults are reported explicitly.
 - All physical handset controls have press/release events and keyboard bindings.
-  After experimental initialization, mapped controls call the original software
-  input routine at a scheduler boundary. The left soft key opens the original
+  Matrix controls change electrical contacts; the original GPIO scanner,
+  interrupt/debounce path and key mapper produce firmware events. The left soft key opens the original
   main menu after the animation reaches the home screen. The convenience key
   opens the 9575's original **Enable GPS? / Current Location** screens. Its SOS
   key starts the original cancellable emergency countdown. GPS positions remain
   unavailable without a connected receiver; the emulator makes no emergency
-  call or transmission. Electrical matrix scanning and the physical power
-  circuit remain unresolved; power events are recorded without firmware delivery.
+  call or transmission. Power drives the active-low AVR input and executes the
+  original long-hold shutdown path. The SOS control retains the software input
+  boundary because its electrical wiring is not established.
   See [control evidence](docs/9575-controls.md).
 - The ST7541 model decodes the executing firmware's LCD command/data stream.
   Unknown pixels and capture errors are explicit. The handset profile places
@@ -118,11 +130,11 @@ the supplied image and discards the experiment's RAM and flash changes.
   These scenarios are **not connected to the executing modem** and perform no
   radio transmission, audio transport, network authentication, or real calls.
 
-The processors' interconnect, GPS receiver, remaining BlueCore peripherals, electrical keypad/LCD
-transport, modem boot ROM, DSPs, RF timing, SIM/provisioning and network protocol
-remain incomplete. The missing modem boot block is not present in the upgrade
-package. See [hardware evidence](docs/hardware-evidence.md) for exact boundaries,
-observed startup failures, and what needs to be established next.
+The GPS receiver, unshipped modem boot block/DSP code, unestablished BlueCore
+peripherals, RF behavior and SIM/provisioning remain outside the implemented
+contracts. Unknown MMIO remains visible and fails in strict mode. Current
+coverage is described in [inferred hardware](docs/inferred-hardware.md);
+[hardware evidence](docs/hardware-evidence.md) preserves the earlier investigation.
 
 ## Test
 

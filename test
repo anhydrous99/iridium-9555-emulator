@@ -6,4 +6,5 @@ zig build -j2
 node --check ui/app.js
 node --test ui/app.test.js
 python3 native/test_protocol.py
+python3 native/test_trx_hardware.py
 python3 -m unittest discover -s tests -v

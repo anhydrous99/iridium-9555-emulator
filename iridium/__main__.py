@@ -30,15 +30,19 @@ def build_engine() -> Path:
 
 
 def arguments(argv=None):
-    parser = argparse.ArgumentParser(description="Execute original Iridium 9555 / 9575 Extreme firmware with partial hardware models")
+    parser = argparse.ArgumentParser(description="Test Iridium 9555 / 9575 Extreme firmware on firmware-derived hardware models")
     parser.add_argument("firmware", nargs="?", type=Path,
                         help="main.dfu, raw firmware, or extracted firmware directory")
     parser.add_argument("--image", choices=("bc5", "avr", "trx", "ptt"), help="Processor for a raw binary")
     parser.add_argument("--model", choices=("9555", "9575"),
                         help="Handset profile; auto-detected from BC5 layout when omitted")
     parser.add_argument("--headless", action="store_true", help="Run bounded instructions and print JSON evidence")
+    parser.add_argument("--strict-hardware", action="store_true",
+                        help="Stop at unimplemented MMIO instead of using latch/open-bus fallbacks")
+    parser.add_argument("--modem-image", choices=("trx", "ptt", "none"), default="trx",
+                        help="AVR-linked modem image when both are loaded; none runs independent workers")
     parser.add_argument("--initialize-ui", action="store_true",
-                        help="Experimental: invoke original application initialization after kernel idle")
+                        help="Provision factory settings and power on through AVR inputs (requires BC5 and AVR)")
     parser.add_argument("--steps", type=int, default=7000000, help="Instructions per loaded processor in headless mode")
     parser.add_argument("--inspect", action="store_true", help="Validate and identify images without compiling or executing")
     parser.add_argument("--allow-invalid-crc", action="store_true", help="Permit deliberately patched DFU checksums; record mismatches")
@@ -64,7 +68,8 @@ def main(argv=None) -> int:
             print(json.dumps([item.describe() for item in firmware], indent=2))
             return 0
         executable = build_engine()
-        with Session(executable, firmware) as session:
+        with Session(executable, firmware, strict_hardware=args.strict_hardware,
+                     modem_image=args.modem_image) as session:
             if args.initialize_ui:
                 session.control("initialize_ui")
             if args.headless:
@@ -86,7 +91,7 @@ def main(argv=None) -> int:
                 url = f"http://{server.authority}/"
                 print(f"{session.profile.name} firmware lab: {url}", flush=True)
                 print(f"Listening on {args.host}:{server.server_port}", flush=True)
-                print("Partial hardware model. Press Ctrl+C to stop.", flush=True)
+                print("Firmware-derived hardware model. Press Ctrl+C to stop.", flush=True)
                 if not args.no_browser:
                     webbrowser.open(url)
                 server.serve_forever()

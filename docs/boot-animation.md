@@ -1,5 +1,8 @@
 # Original boot animation
 
+This preserves the earlier software-probe investigation. Current startup uses
+the coupled AVR power input and GPIO matrix; see [inferred hardware](inferred-hardware.md).
+
 The application bootstrap must enter the original power-on path before running
 the scheduler. Calling the UI-start callback directly left the power/charging
 state machines in their inactive states. About 2.6 million instructions later,

@@ -17,4 +17,16 @@ The UART status-register adapter preserves transmit-complete flags when software
 
 The HL25003 profile adds model-selected BC5 code/constant limits and an inferred ATmega640/1280-family AVR configuration. The AVR core retains the 164P default program-address mask while supporting larger program/data backing arrays and a per-instance PC mask. Its device model adds extended GPIO, four independent USARTs, PRR1 gating, family interrupt-vector translation and larger EEPROM addressing, while preserving the 9555's exposed address/port limits. The layout derives from original startup instructions, the upgrade tool's supported-device table and [Microchip's family datasheet](https://ww1.microchip.com/downloads/en/DeviceDoc/ATmega640-1280-1281-2560-2561-Datasheet-DS40002211A.pdf); the exact handset MCU is not measured. [9575 native evidence](../docs/9575-native.md) lists the remaining limits. `vendor/SOURCE.tsv` continues to record the original upstream hashes, not the modified versions.
 
-These are instruction interpreters with partially inferred device models. BC5 IRQs, keypad wiring, LCD transfers, SPARC ASIC/interrupts and radio DSP behavior are incomplete. Reaching scheduler milestones does not establish full handset functionality. AVR device timing is deterministic but includes the documented upstream assumptions. Original `shortcut:` comments and model qualifications are retained.
+Later local implementations add firmware-derived BC5 IRQ/register banks and
+scratch windows, ADC completion, GPIO keypad contacts, MMU-backed serial LCD/SPI
+transfers and processor wiring. AVR models now include extended timers, external
+interrupts/capture, PWM, ADC/comparator, asynchronous Timer2, TWI, SPM/fuses and
+sleep domains. SPARC includes tagged/atomic operations, interrupt delivery and
+sleep; its ASIC model includes UARTs, timer/watchdog and TDMA compare interrupts.
+The original guest drivers and application instructions still execute.
+
+These digital models contain explicit inferences. Unshipped ROM/DSP code and
+unestablished RF behavior are excluded, and scheduler milestones alone do not
+certify a functioning handset. [Current hardware evidence](../docs/inferred-hardware.md)
+records supported contracts and tests. `vendor/SOURCE.tsv` retains the upstream
+hashes; it does not describe the modified local files.

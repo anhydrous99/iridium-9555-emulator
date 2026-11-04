@@ -40,6 +40,14 @@ class HandsetProfile:
         return self.code_bytes + self.data_bytes
 
     @property
+    def avr_flash_bytes(self) -> int:
+        return 0x20000 if self.model == "9575" else 0x4000
+
+    @property
+    def power_pin(self) -> tuple[int, int]:
+        return (8, 3) if self.model == "9575" else (2, 0)
+
+    @property
     def image_sizes(self) -> dict[str, int]:
         return {"bc5": self.payload_bytes, "avr": self.avr_bytes,
                 "trx": self.trx_bytes, "ptt": self.ptt_bytes}

@@ -118,8 +118,8 @@ function drawDisplay(state) {
   };
   if (!image) {
     describe(preview ? "No supported embedded bitmap found in this image." : state?.ui_initialized
-      ? "Waiting for firmware LCD output · experimental software initialization"
-      : "Live LCD unavailable · initialize application to capture firmware output");
+      ? "Waiting for firmware LCD output"
+      : "Live LCD unavailable · power on the handset to capture firmware output");
     return;
   }
   if (!preview && (image.error || dropped || image.live !== true)) {
@@ -144,7 +144,7 @@ function drawDisplay(state) {
   }
   if (!preview && image.display_on !== true) {
     element("lcd-placeholder-text").textContent = "DISPLAY OFF";
-    describe("Firmware LCD is off · experimental software initialization");
+    describe("Firmware LCD is off");
     return;
   }
   const palette = [[169, 184, 145], [123, 140, 102], [77, 94, 60], [33, 48, 21]];
@@ -172,22 +172,22 @@ function drawDisplay(state) {
       ? `${state?.handset?.model === "9575" ? "9575" : "9555"} panel mapping · SEG127 left, COM0 top`
       : `Controller mapping · ${displayText(image.coordinates || "unspecified")}`;
   }
-  describe(preview ? "Firmware asset preview — not live LCD" : "Live original firmware LCD · experimental software initialization");
+  describe(preview ? "Firmware asset preview — not live LCD" : "Live original firmware LCD · emulated serial controller");
 }
 
 function renderApplicationStatus(state) {
   const button = element("initialize-button");
   const initialized = state?.ui_initialized === true;
   const busy = pendingActions.has(button);
-  const loaded = state?.processors?.some((processor) => processor.image === "bc5");
+  const loaded = ["bc5", "avr"].every((image) => state?.processors?.some((processor) => processor.image === image));
   button.disabled = busy || initialized || !loaded;
-  button.textContent = busy ? "Initializing…" : initialized ? "Application initialized" : "Initialize application";
+  button.textContent = busy ? "Powering on…" : initialized ? "Handset powered on" : "Power on handset";
   const status = element("application-status");
-  status.textContent = busy ? "INITIALIZING" : initialized ? "EXPERIMENTAL INITIALIZATION" : "NOT INITIALIZED";
+  status.textContent = busy ? "POWERING ON" : initialized ? "POWERED ON" : "NOT POWERED ON";
   status.classList.toggle("initialized", initialized);
   element("key-mode").textContent = initialized
-    ? "Original handler · experimental software key injection"
-    : "Bench input only · application is not initialized";
+    ? "GPIO keypad matrix · AVR power input"
+    : loaded ? "Electrical controls active · handset is off" : "Load BC5 and AVR firmware to power on";
 }
 
 function renderSatellite(satellite) {
@@ -252,7 +252,7 @@ function renderHandset(handset) {
   element("extreme-key-help").hidden = !extreme;
   element("firmware-profile").textContent = `${name}${handset?.firmware_version ? ` · ${handset.firmware_version}` : ""}. Handset model is identified from the firmware image.`;
   element("firmware-input").setAttribute("aria-label", `Load original ${name} firmware image`);
-  element("fidelity-description").textContent = `This is a partial ${name} hardware model. Application initialization and software key injection are explicit experimental scenarios.`;
+  element("fidelity-description").textContent = `Firmware-derived ${name} hardware emulation for testing original and modified firmware.`;
   keyButtons.get("convenience").setAttribute("aria-label", extreme ? "Location convenience key" : "Side convenience key");
   keyButtons.get("convenience").title = extreme ? "Location convenience key (G)" : "Side convenience key (G)";
   const keys = new Set(handset?.keys || [...keyButtons.keys()].filter((key) => extreme || key !== "sos"));

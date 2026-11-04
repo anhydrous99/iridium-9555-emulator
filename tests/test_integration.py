@@ -22,6 +22,9 @@ EXECUTABLE = Path(__file__).resolve().parent.parent / "zig-out/bin/iridium-core"
 
 
 class OriginalFirmwareChecks:
+    def handset_firmware(self):
+        return [item for item in load_firmware(Path(self.firmware_directory)) if item.image in ("bc5", "avr")]
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -41,7 +44,10 @@ class OriginalFirmwareChecks:
 
     def test_original_bc5_boot_and_real_function_memory_effects(self):
         engine = self.worker("bc5")
-        state = engine.request("run", steps=7000000)
+        for _ in range(3):
+            state = engine.request("idle")
+            if state["at_idle"] or state["halt"]:
+                break
         self.assertIsNone(state["halt"])
         self.assertTrue(state["milestones"]["scheduler"])
         self.assertTrue(state["milestones"]["idle"])
@@ -84,7 +90,7 @@ class OriginalFirmwareChecks:
         self.assertEqual(engine.request("state")["steps"], 0)
 
     def test_experimental_original_ui_initialization_and_software_key_delivery(self):
-        firmware = load_firmware(Path(self.firmware_directory), "bc5")
+        firmware = self.handset_firmware()
         with Session(EXECUTABLE, firmware) as session:
             session.control("initialize_ui")
             self.assertTrue(session.ui_initialized)
@@ -92,16 +98,14 @@ class OriginalFirmwareChecks:
             response = session.key("soft_left", True, client_id="browser-a", sequence=1, epoch=epoch)
             self.assertTrue(response["delivered"])
             self.assertEqual(session.engines["bc5"].request(
-                "read", address=self.profile.key_callback + 0x48, count=1)["values"], [0x96])
+                "read", address=self.profile.key_callback + 9, count=1)["values"], [0x96])
             self.assertFalse(session.key("soft_left", True, client_id="browser-b", sequence=1, epoch=epoch)["delivered"])
-            bc5 = session.engines["bc5"]
-            session.load(load_firmware(Path(self.firmware_directory), "avr")[0])
-            self.assertIs(session.engines["bc5"], bc5)
-            self.assertEqual(session.state()["key_epoch"], epoch)
             self.assertFalse(session.key("soft_left", False, client_id="browser-a", sequence=2, epoch=epoch)["delivered"])
             self.assertEqual(session.keys, {"soft_left"})
+            self.assertNotEqual(session.engines["bc5"].request("state")["gpio"]["key_contacts"], 0)
             self.assertTrue(session.key("soft_left", False, client_id="browser-b", sequence=2, epoch=epoch)["delivered"])
             self.assertEqual(session.keys, set())
+            self.assertEqual(session.engines["bc5"].request("state")["gpio"]["key_contacts"], 0)
             for _ in range(40):
                 session.control("step", 50000)
             state = session.state()
@@ -110,18 +114,45 @@ class OriginalFirmwareChecks:
             self.assertIsNone(state["lcd"]["error"])
             self.assertEqual(state["lcd"]["known_pixels"], 128 * 128)
             self.assertFalse(state["satellite"]["firmware_connected"])
-            # A firmware patch/debugger write can remove the callback. Do not
-            # keep claiming delivery merely because initialization once passed.
+            # Electrical delivery remains valid when a firmware patch removes its handler.
             session.probe("bc5", "write", {"address": self.profile.key_callback, "values": [0, 0]})
-            with self.assertRaisesRegex(EngineError, "handler is absent"):
-                session.key("1", True)
+            self.assertTrue(session.key("1", True)["delivered"])
             self.assertFalse(session.ui_initialized)
+            # Replacing the SPI peer restarts the board and invalidates old browser input.
+            bc5 = session.engines["bc5"]
+            session.load(load_firmware(Path(self.firmware_directory), "avr")[0])
+            self.assertIs(session.engines["bc5"], bc5)
+            self.assertGreater(session.state()["key_epoch"], epoch)
+            self.assertEqual(session.keys, set())
+            self.assertEqual(bc5.request("state")["gpio"]["key_contacts"], 0)
+            self.assertFalse(session.key("soft_left", True, client_id="browser-a", sequence=3, epoch=epoch)["delivered"])
             session.control("reset")
             self.assertFalse(session.ui_initialized)
             self.assertIsNone(session.state()["lcd"])
 
+    def test_power_on_preserves_a_browser_held_power_input(self):
+        with Session(EXECUTABLE, self.handset_firmware()) as session:
+            session.control("initialize_ui")
+            epoch = session.key_epoch
+            session.key("power", True, client_id="tab-a", sequence=1, epoch=epoch)
+            self.assertFalse(session.ui_initialized)
+            port, bit = session.profile.power_pin
+            before = [worker.state["steps"] for worker in session.engines.values()]
+            with self.assertRaisesRegex(ValueError, "Release the power button"):
+                session.control("initialize_ui")
+            self.assertEqual([worker.state["steps"] for worker in session.engines.values()], before)
+            self.assertFalse(session.ui_attempted)
+            self.assertEqual(session.key_epoch, epoch)
+            self.assertEqual(session.keys, {"power"})
+            self.assertEqual(session.engines["avr"].request("pin_state")["inputs"][port] & (1 << bit), 0)
+            self.assertFalse(session.key("power", True, client_id="tab-b", sequence=1, epoch=epoch)["delivered"])
+            self.assertFalse(session.key("power", False, client_id="tab-a", sequence=2, epoch=epoch)["delivered"])
+            self.assertTrue(session.key("power", False, client_id="tab-b", sequence=2, epoch=epoch)["delivered"])
+            self.assertNotEqual(session.engines["avr"].request("pin_state")["inputs"][port] & (1 << bit), 0)
+            self.assertEqual(session.keys, set())
+
     def test_original_animation_reaches_readable_home_and_navigable_menu(self):
-        firmware = load_firmware(Path(self.firmware_directory), "bc5")
+        firmware = self.handset_firmware()
         with Session(EXECUTABLE, firmware) as session:
             session.control("initialize_ui")
             assets = BC5Assets(firmware[0].data, self.profile)
@@ -182,7 +213,7 @@ class OriginalFirmwareChecks:
         entry = self.profile.application_setup
         data[entry:entry + 2] = b"\x04\x00"  # BRK in application setup.
         firmware = parse_firmware(bytes(data), "patched-bc5.bin", "bc5")
-        with Session(EXECUTABLE, [firmware]) as session:
+        with Session(EXECUTABLE, [firmware, *load_firmware(Path(self.firmware_directory), "avr")]) as session:
             with self.assertRaisesRegex(EngineError, "brk"):
                 session.control("initialize_ui")
             self.assertFalse(session.ui_initialized)
@@ -203,17 +234,13 @@ class ExtremeFirmwareTests(OriginalFirmwareChecks, unittest.TestCase):
     firmware_directory = EXTREME_DIRECTORY
 
     def test_original_location_and_cancellable_sos_controls(self):
-        firmware = load_firmware(Path(self.firmware_directory), "bc5")
+        firmware = self.handset_firmware()
         with Session(EXECUTABLE, firmware) as session:
             session.control("initialize_ui")
             for _ in range(600):
                 session.control("step", 200000)
             self.assertEqual(session.state()["handset"]["model"], "9575")
             self.assertEqual(session.state()["asset"]["source"], "firmware resource 21")
-            # Power is a separate hardware path, never the convenience key.
-            self.assertFalse(session.key("power", True)["delivered"])
-            self.assertFalse(session.key("power", False)["delivered"])
-
             def press(key):
                 self.assertTrue(session.key(key, True)["delivered"])
                 self.assertTrue(session.key(key, False)["delivered"])
@@ -242,6 +269,10 @@ class ExtremeFirmwareTests(OriginalFirmwareChecks, unittest.TestCase):
             assert_screen("bb6ba11a55781edb3b9b98732e303f6c226f6664e2711b611f3e7739b8dcdb83")
             press("soft_right")
             self.assertEqual(bytes(session.state()["lcd"]["pixels"])[16 * 128:], home[16 * 128:])
+            # Power uses PJ3 through the AVR; it does not produce a matrix contact.
+            self.assertTrue(session.key("power", True)["delivered"])
+            self.assertTrue(session.key("power", False)["delivered"])
+            self.assertEqual(session.engines["bc5"].state["gpio"]["key_contacts"], 0)
 
 
 if __name__ == "__main__":

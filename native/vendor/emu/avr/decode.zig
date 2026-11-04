@@ -2,7 +2,8 @@
 //! second word of lds/sts/jmp/call). The opcode map follows the AVR Instruction Set Manual; the only
 //! encodings llvm-objdump decodes that this decoder rejects are `1001 000d dddd 1000` (llvm: `ld Rd, Y`)
 //! and `1001 001r rrrr 1000` (llvm: `st Y, Rr`), which the manual does not list (QEMU rejects them too).
-//! ELPM/EIJMP/EICALL/SPM Z+/DES/XCH/LAS/LAC/LAT are not avr5 and decode as `invalid`.
+//! ELPM encodings are decoded for the 1280 profile; the CPU rejects them on164P.
+//! EIJMP/EICALL/SPM Z+/DES/XCH/LAS/LAC/LAT are absent on these parts and decode as `invalid`.
 const std = @import("std");
 
 pub const Op = enum(u8) {
@@ -60,6 +61,9 @@ pub const Op = enum(u8) {
     lpm_r0, // lpm (r0 <- (Z))
     lpm, // lpm Rd, Z
     lpm_inc, // lpm Rd, Z+
+    elpm_r0,
+    elpm,
+    elpm_inc,
     pop,
     push, // r
     com,
@@ -198,6 +202,8 @@ fn decode9(w: u16, next: u16, d5: u8, r5: u8) Insn {
                 0x2 => .ld_z_dec,
                 0x4 => .lpm,
                 0x5 => .lpm_inc,
+                0x6 => .elpm,
+                0x7 => .elpm_inc,
                 0x9 => .ld_y_inc,
                 0xA => .ld_y_dec,
                 0xC => .ld_x,
@@ -242,6 +248,7 @@ fn decode9(w: u16, next: u16, d5: u8, r5: u8) Insn {
                     0x9 => .{ .op = .@"break" },
                     0xA => .{ .op = .wdr },
                     0xC => .{ .op = .lpm_r0 },
+                    0xD => .{ .op = .elpm_r0 },
                     0xE => .{ .op = .spm },
                     else => invalid,
                 };
@@ -291,7 +298,7 @@ test "decode spot checks (encodings from re/tools/avr-map/code.dis)" {
     try testing.expectEqual(Insn{ .op = .cpse, .d = 25, .r = 1 }, decode(0x1191, 0));
     try testing.expectEqual(Insn{ .op = .fmulsu, .d = 16, .r = 16 }, decode(0x0388, 0));
     try testing.expectEqual(Op.invalid, decode(0x9008, 0).op); // llvm: ld r0, Y (not in the manual)
-    try testing.expectEqual(Op.invalid, decode(0x95d8, 0).op); // elpm: not avr5
+    try testing.expectEqual(Op.elpm_r0, decode(0x95d8, 0).op); // availability checked by CPU profile
     try testing.expectEqual(Op.invalid, decode(0xf808, 0).op); // bld with bit 3 set
     try testing.expect(isTwoWord(0x940e) and isTwoWord(0x91e0) and isTwoWord(0x9200) and !isTwoWord(0x9409));
     for (0..0x10000) |w| {

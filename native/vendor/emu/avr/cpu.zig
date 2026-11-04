@@ -55,6 +55,14 @@ pub const Sys = struct {
     ack: *const fn (ctx: *anyopaque, vector: u8) void,
     sleep_enabled: *const fn (ctx: *anyopaque) bool,
     wdr: *const fn (ctx: *anyopaque) void,
+    spm: ?*const fn (ctx: *anyopaque, c: *Cpu, address: u32, word: u16) void = null,
+    program_read: ?*const fn (ctx: *anyopaque, address: u32, pc: u16) ?u8 = null,
+    blocked: ?*const fn (ctx: *anyopaque, pc: u16) bool = null,
+    interrupts_enabled: ?*const fn (ctx: *anyopaque, pc: u16) bool = null,
+    interrupt_base: ?*const fn (ctx: *anyopaque) u16 = null,
+    sleeping: ?*const fn (ctx: *anyopaque, asleep: bool) void = null,
+    wake_cycles: ?*const fn (ctx: *anyopaque) u32 = null,
+    bit_write_value: ?*const fn (ctx: *anyopaque, address: u16, bit: u3, set: bool) ?u8 = null,
 };
 
 pub const Hooks = struct {
@@ -73,12 +81,14 @@ pub const Stop = union(enum) {
     invalid: u32,
     /// Set by a hook (e.g. a noreturn call): the code is the hook's.
     hook: u32,
+    /// EEPROM programming invalidated a temporary flash page on the ATmega164P.
+    undefined_spm_buffer,
 };
 
 pub const Cpu = struct {
     st: State = .{},
     data: *Data,
-    prog: *const Prog,
+    prog: *Prog,
     bus: *Bus,
     hooks: Hooks = .{},
     sys: ?Sys = null,
@@ -186,16 +196,35 @@ pub const Cpu = struct {
         const hold = c.st.irq_hold;
         c.st.irq_hold = 0;
         if (c.sys) |s| {
-            if (c.st.ie != 0 and hold == 0) if (s.pending(s.ctx)) |vec| return c.interrupt(s, vec);
+            if (s.blocked) |blocked| if (blocked(s.ctx, c.st.pc)) {
+                c.st.cycles += 1;
+                s.tick(s.ctx, 1);
+                return;
+            };
+            const irq_allowed = if (s.interrupts_enabled) |allowed| allowed(s.ctx, c.st.pc) else true;
+            const pending = if (c.st.sleeping != 0 or (c.st.ie != 0 and hold == 0 and irq_allowed)) s.pending(s.ctx) else null;
             if (c.st.sleeping != 0) {
+                if (pending) |vec| {
+                    const wake = if (s.wake_cycles) |cycles| cycles(s.ctx) else 4;
+                    c.st.sleeping = 0;
+                    if (s.sleeping) |sleep_state| sleep_state(s.ctx, false);
+                    c.st.cycles += wake;
+                    s.tick(s.ctx, wake);
+                    if (c.st.ie != 0 and hold == 0 and irq_allowed) c.interrupt(s, vec);
+                    return;
+                }
                 c.st.cycles += 1;
                 s.tick(s.ctx, 1);
                 return;
             }
+            if (c.st.ie != 0 and hold == 0 and irq_allowed) if (pending) |vec| return c.interrupt(s, vec);
         }
         const cyc = c.exec();
         c.st.cycles += cyc;
-        if (c.sys) |s| s.tick(s.ctx, cyc);
+        if (c.sys) |s| {
+            s.tick(s.ctx, cyc);
+            if (c.st.sleeping != 0) if (s.sleeping) |sleep_state| sleep_state(s.ctx, true);
+        }
     }
 
     // shortcut: interrupt response is 4 cycles (AVRe, 16-bit PC per the instruction set manual); the
@@ -204,7 +233,8 @@ pub const Cpu = struct {
 
     fn interrupt(c: *Cpu, s: Sys, vec: u8) void {
         const ret = c.st.pc;
-        const target: u32 = @as(u32, vec) * 4;
+        const base = if (s.interrupt_base) |get_base| get_base(s.ctx) else 0;
+        const target: u32 = @as(u32, (base +% (@as(u16, vec) * 2)) & c.program_mask) * 2;
         if (c.hooks.on_call) |f| switch (f(c, target, ret, .irq)) {
             .enter => {},
             .skip => return,
@@ -239,9 +269,13 @@ pub const Cpu = struct {
                 return 0;
             },
             .nop => {},
-            // shortcut: BREAK is a NOP (OCDEN unprogrammed and lock bits set, avr-full §2); SPM is a NOP
-            // (executed from the application section it has no effect); WDR only notifies the system.
-            .@"break", .spm => {},
+            // BREAK has no effect with the handset's disabled on-chip debug session.
+            .@"break" => {},
+            .spm => {
+                const upper: u32 = if (c.program_mask > 0x7FFF) @as(u32, c.read(0x5B) & 1) << 16 else 0;
+                if (c.sys) |s| if (s.spm) |execute| execute(s.ctx, c, upper | c.reg16(30), c.reg16(0));
+                cyc = 4;
+            },
             .wdr => if (c.sys) |s| s.wdr(s.ctx),
             .sleep => if (c.sys) |s| {
                 if (s.sleep_enabled(s.ctx)) c.st.sleeping = 1;
@@ -381,11 +415,26 @@ pub const Cpu = struct {
                 if (i.op != .st_x) c.setReg16(p, a.new);
                 cyc = 2;
             },
-            .lpm_r0, .lpm, .lpm_inc => {
+            .lpm_r0, .lpm, .lpm_inc, .elpm_r0, .elpm, .elpm_inc => {
+                const extended = i.op == .elpm_r0 or i.op == .elpm or i.op == .elpm_inc;
+                if (extended and c.program_mask <= 0x7FFF) {
+                    c.stop = .{ .invalid = @as(u32, pc) * 2 };
+                    return 0;
+                }
                 const z = c.reg16(30);
-                const v = c.prog[@as(u32, z) & (@as(u32, c.program_mask) * 2 + 1)];
-                if (i.op == .lpm_r0) c.setReg(0, v) else c.setReg(d, v);
-                if (i.op == .lpm_inc) c.setReg16(30, z +% 1);
+                const upper: u32 = if (extended) @as(u32, c.read(0x5B) & 1) << 16 else 0;
+                const address = (upper | z) & (@as(u32, c.program_mask) * 2 + 1);
+                var value: ?u8 = null;
+                if (c.sys) |s| if (s.program_read) |read_program| {
+                    value = read_program(s.ctx, address, pc);
+                };
+                const byte = value orelse c.prog[address];
+                if (i.op == .lpm_r0 or i.op == .elpm_r0) c.setReg(0, byte) else c.setReg(d, byte);
+                if (i.op == .lpm_inc or i.op == .elpm_inc) {
+                    const after = (upper | @as(u32, z)) + 1;
+                    c.setReg16(30, @truncate(after));
+                    if (extended) c.write(0x5B, @truncate(after >> 16));
+                }
                 cyc = 3;
             },
             .push => {
@@ -401,10 +450,15 @@ pub const Cpu = struct {
             .sbi, .cbi => {
                 const a = @as(u16, i.d) + 0x20;
                 const m = @as(u8, 1) << @as(u3, @truncate(r));
-                // shortcut: devices see the read-modify-write; bit-precise SBI/CBI on W1C flag
-                // registers is not modelled (the image never uses SBI/CBI on TIFRn/PCIFR/EIFR).
-                const v = c.read(a);
-                c.write(a, if (i.op == .sbi) v | m else v & ~m);
+                var device_value: ?u8 = null;
+                if (c.sys) |s| if (s.bit_write_value) |write_bit| {
+                    device_value = write_bit(s.ctx, a, @truncate(r), i.op == .sbi);
+                };
+                const value = device_value orelse blk: {
+                    const before = c.read(a);
+                    break :blk if (i.op == .sbi) before | m else before & ~m;
+                };
+                c.write(a, value);
                 cyc = 2;
             },
             .cpse, .sbrc, .sbrs, .sbic, .sbis => {
@@ -566,8 +620,8 @@ pub fn baseCycles(op: dec.Op) u32 {
         .ld_x, .ld_x_inc, .ld_x_dec, .ld_y_inc, .ld_y_dec, .ld_z_inc, .ld_z_dec => 2,
         .st_x, .st_x_inc, .st_x_dec, .st_y_inc, .st_y_dec, .st_z_inc, .st_z_dec => 2,
         .push, .pop, .sbi, .cbi, .rjmp, .ijmp => 2,
-        .lpm_r0, .lpm, .lpm_inc, .jmp, .rcall, .icall => 3,
-        .call, .ret, .reti => 4,
+        .lpm_r0, .lpm, .lpm_inc, .elpm_r0, .elpm, .elpm_inc, .jmp, .rcall, .icall => 3,
+        .call, .ret, .reti, .spm => 4,
         else => 1,
     };
 }

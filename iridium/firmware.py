@@ -119,7 +119,8 @@ def parse_firmware(data: bytes, name: str, image: str | None = None,
                       if model is None or p.model == model
                       for processor, size in p.image_sizes.items()
                       if (image is None or processor == image) and size > 0
-                      and len(data) in ((size, size + 4) if processor == "bc5" else (size,))]
+                      and len(data) in ((size, size + 4) if processor == "bc5" else
+                                        (size, p.avr_flash_bytes) if processor == "avr" else (size,))]
         if not candidates:
             raise FirmwareError("Unknown image or wrong length for the selected handset/processor profile")
         # Shared auxiliary images retain the original 9555 default; a directory's

@@ -1,5 +1,11 @@
 # Hardware evidence and emulation limits
 
+This is the historical investigation baseline. BC5 interrupts/banked registers,
+ADC completion, electrical keypad scanning, serial LCD transfers and processor
+links have since been implemented. See [current inferred hardware](inferred-hardware.md)
+for the model, evidence and original-firmware regressions that supersede the
+earlier missing-device observations below.
+
 The source artifact for these observations is HT25003 `bc5_main.bin`, SHA-256
 `8ff911b30bb57d77e0eb9c46054a2d8b26f4889feb00b94a64963effba28705d`.
 Addresses of BC5 functions are image **byte offsets**; data addresses are

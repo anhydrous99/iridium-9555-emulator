@@ -6,9 +6,9 @@
 //! each instruction costs one bus fuel unit, like the toy emulator. Instruction fetch reads the
 //! backing arrays directly (not logged).
 //!
-//! Not implemented, because neither Trx image contains them (trx-coverage §5.1): FPU and coprocessor
-//! (fp_disabled / cp_disabled traps, EF=EC=0), tagged arithmetic, `ldstub`, `swap` (illegal_instruction).
-//! Interrupts are not delivered (function tests need none; system runs come with M7).
+//! No FPU or coprocessor is fitted to this profile (fp_disabled / cp_disabled traps, EF=EC=0).
+//! Integer operations and external interrupt levels follow the SPARC V8 manual, revision
+//! SAV080SI9308, sections 7.4, B.7-B.8 and B.14-B.16 (https://research.swtch.com/sparcv8.pdf).
 //! shortcut: no predecode cache; decoding is a table lookup per instruction. Add one if a profile shows it.
 const std = @import("std");
 const common = @import("common");
@@ -30,6 +30,7 @@ pub const tt = struct {
     pub const window_underflow: u8 = 0x06;
     pub const mem_address_not_aligned: u8 = 0x07;
     pub const data_access_exception: u8 = 0x09;
+    pub const tag_overflow: u8 = 0x0A;
     pub const cp_disabled: u8 = 0x24;
     pub const division_by_zero: u8 = 0x2A;
     pub const trap_instruction: u8 = 0x80;
@@ -109,6 +110,10 @@ pub const Cpu = struct {
     /// ASI 1 (forced cache miss) accesses go here when set (the Trx flash command interface);
     /// otherwise they are plain memory accesses on the bus.
     asi1: ?bus_mod.Device = null,
+    /// Externally asserted interrupt request level; 0 deasserts it. The source owns acknowledgement.
+    irl: u4 = 0,
+    /// LEON ASR19 idle; external clocks still run while the instruction pipeline waits for an IRQ.
+    sleeping: bool = false,
 
     /// An active call: where it returns to (%o7+8 at arrival) and the caller's %sp then. A frame
     /// ends when the pc reaches `ret` (or `ret+4`) with that %sp again, i.e. back in the caller's
@@ -248,6 +253,13 @@ pub const Cpu = struct {
         };
         if (b.fuel == 0) return c.halt(.fuel_exhausted);
         b.fuel -= 1;
+        if (c.irl != 0 and c.r.psr & psr_bits.et != 0 and
+            (c.irl == 15 or c.irl > (c.r.psr & psr_bits.pil) >> 8))
+        {
+            c.sleeping = false;
+            return c.trap(0x10 + @as(u8, c.irl));
+        }
+        if (c.sleeping) return null;
         const pc = c.r.pc;
         if (pc & 3 != 0) return c.trap(tt.mem_address_not_aligned);
         const raw = c.fetch(pc) orelse return c.halt(.{ .fault = pc });
@@ -317,7 +329,7 @@ pub const Cpu = struct {
                 return null;
             },
             .sethi => c.set(i.rd(), @as(u32, i.imm22()) << 10),
-            .unimp, .illegal, .taddcc, .tsubcc, .taddcctv, .tsubcctv, .ldstub, .swap, .ldstuba, .swapa => return c.trap(tt.illegal_instruction),
+            .unimp, .illegal => return c.trap(tt.illegal_instruction),
             .fbfcc, .fpop1, .fpop2, .ldf, .ldfsr, .lddf, .stf, .stfsr, .stdfq, .stdf => return c.trap(tt.fp_disabled),
             .cbccc, .cpop1, .cpop2, .ldc, .ldcsr, .lddc, .stc, .stcsr, .stdcq, .stdc => return c.trap(tt.cp_disabled),
 
@@ -343,6 +355,16 @@ pub const Cpu = struct {
                 const cin = c.carryIn();
                 const r = a -% bv -% cin;
                 if (i.op == .subxcc) c.icc(r >> 31 != 0, r == 0, ((a ^ bv) & (a ^ r)) >> 31 != 0, @as(u64, a) < @as(u64, bv) + cin);
+                c.set(i.rd(), r);
+            },
+            .taddcc, .taddcctv, .tsubcc, .tsubcctv => {
+                const sub = i.op == .tsubcc or i.op == .tsubcctv;
+                const r = if (sub) a -% bv else a +% bv;
+                const overflow = (if (sub) ((a ^ bv) & (a ^ r)) else ((a ^ ~bv) & (a ^ r))) >> 31 != 0 or
+                    (a | bv) & 3 != 0;
+                if (overflow and (i.op == .taddcctv or i.op == .tsubcctv)) return c.trap(tt.tag_overflow);
+                const carry = if (sub) a < bv else ((a & bv) | ((a | bv) & ~r)) >> 31 != 0;
+                c.icc(r >> 31 != 0, r == 0, overflow, carry);
                 c.set(i.rd(), r);
             },
             .@"and", .andcc, .@"or", .orcc, .xor, .xorcc, .andn, .andncc, .orn, .orncc, .xnor, .xnorcc => {
@@ -416,7 +438,11 @@ pub const Cpu = struct {
             },
             .wrasr => switch (i.rd()) {
                 0 => c.r.y = a ^ bv,
-                19 => {}, // LEON power-down: no interrupts are delivered here, so it continues at once
+                19 => {
+                    if (!priv) return c.trap(tt.privileged_instruction);
+                    // Firmware's idle routine writes ASR19; LEON power-down resumes on an unmasked IRQ.
+                    c.sleeping = true;
+                },
                 else => return c.trap(tt.illegal_instruction),
             },
             .wrpsr, .wrwim, .wrtbr => {
@@ -489,10 +515,10 @@ pub const Cpu = struct {
                 c.set(i.rd(), a +% bv);
             },
 
-            .ld, .ldub, .lduh, .ldsb, .ldsh, .ldd, .st, .stb, .sth, .std => return c.mem(i, a +% bv, null),
-            .lda, .lduba, .lduha, .ldsba, .ldsha, .ldda, .sta, .stba, .stha, .stda => {
-                if (i.imm()) return c.trap(tt.illegal_instruction);
+            .ld, .ldub, .lduh, .ldsb, .ldsh, .ldd, .st, .stb, .sth, .std, .ldstub, .swap => return c.mem(i, a +% bv, null),
+            .lda, .lduba, .lduha, .ldsba, .ldsha, .ldda, .sta, .stba, .stha, .stda, .ldstuba, .swapa => {
                 if (!priv) return c.trap(tt.privileged_instruction);
+                if (i.imm()) return c.trap(tt.illegal_instruction);
                 return c.mem(i, a +% bv, i.asi());
             },
         }
@@ -502,13 +528,15 @@ pub const Cpu = struct {
 
     /// Loads and stores. `asi` null = the default data space (supervisor/user data).
     fn mem(c: *Cpu, i: Insn, addr: u32, asi: ?u8) ?Exit {
-        const kind: struct { bits: u8, load: bool, signed: bool = false, double: bool = false } = switch (i.op) {
+        const kind: struct { bits: u8, load: bool, signed: bool = false, double: bool = false, atomic: bool = false } = switch (i.op) {
             .ld, .lda => .{ .bits = 32, .load = true },
             .ldub, .lduba => .{ .bits = 8, .load = true },
             .lduh, .lduha => .{ .bits = 16, .load = true },
             .ldsb, .ldsba => .{ .bits = 8, .load = true, .signed = true },
             .ldsh, .ldsha => .{ .bits = 16, .load = true, .signed = true },
             .ldd, .ldda => .{ .bits = 64, .load = true, .double = true },
+            .ldstub, .ldstuba => .{ .bits = 8, .load = true, .atomic = true },
+            .swap, .swapa => .{ .bits = 32, .load = true, .atomic = true },
             .st, .sta => .{ .bits = 32, .load = false },
             .stb, .stba => .{ .bits = 8, .load = false },
             .sth, .stha => .{ .bits = 16, .load = false },
@@ -517,6 +545,9 @@ pub const Cpu = struct {
         if (kind.double and i.rd() & 1 != 0) return c.trap(tt.illegal_instruction);
         if (addr & (kind.bits / 8 - 1) != 0) return c.trap(tt.mem_address_not_aligned);
         const space: Space = if (asi) |x| spaceOf(x) orelse return c.trap(tt.data_access_exception) else .memory;
+        // Reserve both bus accesses before a side-effecting atomic read; fuel is a host limit.
+        if (kind.atomic and (space == .memory or space == .miss) and c.bus.fuel < 2)
+            return c.halt(.fuel_exhausted);
         if (kind.load) {
             const v: u64 = switch (space) {
                 .memory => c.bus.read(addr, kind.bits),
@@ -525,6 +556,18 @@ pub const Cpu = struct {
                 .cache, .flush => 0,
             };
             if (c.bus.stop != null) return null;
+            if (kind.atomic) {
+                const replacement: u32 = if (kind.bits == 8) 0xFF else c.get(i.rd());
+                switch (space) {
+                    .memory => c.bus.write(addr, kind.bits, replacement),
+                    .miss => if (c.asi1) |d| d.write(d.ctx, addr, kind.bits, replacement) else c.bus.write(addr, kind.bits, replacement),
+                    .ccr => if (addr == 0) {
+                        c.r.ccr = replacement;
+                    },
+                    .cache, .flush => {},
+                }
+                if (c.bus.stop != null) return null;
+            }
             if (kind.double) {
                 c.set(i.rd(), @truncate(v >> 32));
                 c.set(i.rd() + 1, @truncate(v));
@@ -542,6 +585,7 @@ pub const Cpu = struct {
                 },
                 .cache, .flush => {},
             }
+            if (c.bus.stop != null) return null;
         }
         c.advance();
         return null;
@@ -621,6 +665,256 @@ fn runN(c: *Cpu, n: usize) !void {
         std.debug.print("unexpected exit {any} at pc 0x{x}\n", .{ e, c.r.pc });
         return error.TestUnexpectedResult;
     };
+}
+
+fn testFormat3(op: u2, op3: u6, rd: u5, rs1: u5, operand: u13, immediate: bool) u32 {
+    return @as(u32, op) << 30 | @as(u32, rd) << 25 | @as(u32, op3) << 19 |
+        @as(u32, rs1) << 14 | @as(u32, @intFromBool(immediate)) << 13 | operand;
+}
+
+test "tagged arithmetic: tags, carry, signed overflow and precise trap-on-overflow" {
+    const P = psr_bits;
+    const Case = struct { op3: u6, a: u32, b: u32, result: u32, cc: u32, traps: bool = false };
+    const cases = [_]Case{
+        .{ .op3 = 0x20, .a = 4, .b = 8, .result = 12, .cc = 0 },
+        .{ .op3 = 0x20, .a = 4, .b = 1, .result = 5, .cc = P.v },
+        .{ .op3 = 0x20, .a = 0xFFFF_FFFC, .b = 4, .result = 0, .cc = P.z | P.c },
+        .{ .op3 = 0x20, .a = 0x7FFF_FFFC, .b = 4, .result = 0x8000_0000, .cc = P.n | P.v },
+        .{ .op3 = 0x21, .a = 4, .b = 8, .result = 0xFFFF_FFFC, .cc = P.n | P.c },
+        .{ .op3 = 0x21, .a = 4, .b = 1, .result = 3, .cc = P.v },
+        .{ .op3 = 0x21, .a = 0x8000_0000, .b = 4, .result = 0x7FFF_FFFC, .cc = P.v },
+        .{ .op3 = 0x22, .a = 4, .b = 8, .result = 12, .cc = 0 },
+        .{ .op3 = 0x23, .a = 8, .b = 8, .result = 0, .cc = P.z },
+        .{ .op3 = 0x22, .a = 4, .b = 1, .result = 0xCAFE, .cc = P.z | P.c, .traps = true },
+        .{ .op3 = 0x22, .a = 0x7FFF_FFFC, .b = 4, .result = 0xCAFE, .cc = P.z | P.c, .traps = true },
+        .{ .op3 = 0x23, .a = 0x8000_0000, .b = 4, .result = 0xCAFE, .cc = P.z | P.c, .traps = true },
+    };
+    for (cases) |tc| {
+        var b: Bus = undefined;
+        var s = try setup(&b, &.{testFormat3(2, tc.op3, 3, 1, 2, false)});
+        defer b.deinit();
+        s.cpu.set(1, tc.a);
+        s.cpu.set(2, tc.b);
+        s.cpu.set(3, 0xCAFE);
+        TS.regs.psr |= P.z | P.c;
+        try runN(&s.cpu, 1);
+        try testing.expectEqual(tc.result, s.cpu.get(3));
+        try testing.expectEqual(tc.cc, TS.regs.psr & P.icc);
+        try testing.expectEqual(@as(u32, if (tc.traps) 0x4000_00A0 else 0x4000_0004), TS.regs.pc);
+        if (tc.traps) {
+            try testing.expectEqual(@as(u32, 0x4000_0000), s.cpu.get(17));
+            try testing.expectEqual(@as(u32, 0x4000_0004), s.cpu.get(18));
+        }
+    }
+}
+
+test "atomic byte and word operations use original operands and preserve adjacent big-endian lanes" {
+    for ([_]u6{ 0x0D, 0x0F, 0x1D, 0x1F }) |op3| {
+        const byte = op3 & 2 == 0;
+        const alternate = op3 & 0x10 != 0;
+        const operand: u13 = if (alternate) 0xB << 5 else 1;
+        var b: Bus = undefined;
+        var s = try setup(&b, &.{testFormat3(3, op3, 2, 1, operand, !alternate)});
+        defer b.deinit();
+        const address: u32 = if (byte) 0x4000_0801 else 0x4000_0800;
+        s.cpu.set(1, address - @intFromBool(!alternate));
+        s.cpu.set(2, 0x5566_7788);
+        std.mem.writeInt(u32, TS.ram[0x800..0x804], 0x1122_3344, .big);
+        try runN(&s.cpu, 1);
+        try testing.expectEqual(@as(u32, if (byte) 0x22 else 0x1122_3344), s.cpu.get(2));
+        try testing.expectEqual(@as(u32, if (byte) 0x11FF_3344 else 0x5566_7788), std.mem.readInt(u32, TS.ram[0x800..0x804], .big));
+        try testing.expectEqual(@as(u32, 0x4000_0004), TS.regs.pc);
+    }
+    // rd may alias the effective-address register: the write uses its pre-load value.
+    var b: Bus = undefined;
+    var s = try setup(&b, &.{testFormat3(3, 0x0F, 1, 1, 0, true)});
+    defer b.deinit();
+    s.cpu.set(1, 0x4000_0800);
+    std.mem.writeInt(u32, TS.ram[0x800..0x804], 42, .big);
+    try runN(&s.cpu, 1);
+    try testing.expectEqual(@as(u32, 42), s.cpu.get(1));
+    try testing.expectEqual(@as(u32, 0x4000_0800), std.mem.readInt(u32, TS.ram[0x800..0x804], .big));
+}
+
+test "atomic access rejects misalignment, user ASI, immediate ASI and unknown ASI before mutation" {
+    const Case = struct { op3: u6, operand: u13, immediate: bool, address: u32 = 0x4000_0800, supervisor: bool = true, trap: u8 };
+    const cases = [_]Case{
+        .{ .op3 = 0x0F, .operand = 0, .immediate = true, .address = 0x4000_0801, .trap = tt.mem_address_not_aligned },
+        .{ .op3 = 0x1F, .operand = 0xB << 5, .immediate = false, .supervisor = false, .trap = tt.privileged_instruction },
+        .{ .op3 = 0x1D, .operand = 0, .immediate = true, .trap = tt.illegal_instruction },
+        .{ .op3 = 0x1F, .operand = 0x13 << 5, .immediate = false, .trap = tt.data_access_exception },
+    };
+    for (cases) |tc| {
+        var b: Bus = undefined;
+        var s = try setup(&b, &.{testFormat3(3, tc.op3, 2, 1, tc.operand, tc.immediate)});
+        defer b.deinit();
+        if (!tc.supervisor) TS.regs.psr &= ~psr_bits.s;
+        s.cpu.set(1, tc.address);
+        s.cpu.set(2, 99);
+        std.mem.writeInt(u32, TS.ram[0x800..0x804], 42, .big);
+        try runN(&s.cpu, 1);
+        try testing.expectEqual(@as(u32, 0x4000_0000) + @as(u32, tc.trap) * 16, TS.regs.pc);
+        try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
+        try testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, TS.ram[0x800..0x804], .big));
+        try testing.expectEqual(@as(usize, 0), b.log.items.len);
+    }
+}
+
+test "alternate accesses check privilege before immediate encoding without touching memory" {
+    for ([_]u6{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19, 0x1A, 0x1D, 0x1F }) |op3| {
+        for ([_]bool{ false, true }) |supervisor| {
+            for ([_]bool{ false, true }) |immediate| {
+                var b: Bus = undefined;
+                var s = try setup(&b, &.{testFormat3(3, op3, 2, 1, if (immediate) 0 else 0xB << 5, immediate)});
+                defer b.deinit();
+                if (!supervisor) TS.regs.psr &= ~psr_bits.s;
+                s.cpu.set(1, 0x4000_0800);
+                s.cpu.set(2, 99);
+                s.cpu.set(3, 77);
+                const original = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+                TS.ram[0x800..0x808].* = original;
+                try runN(&s.cpu, 1);
+                const trap: ?u8 = if (!supervisor) tt.privileged_instruction else if (immediate) tt.illegal_instruction else null;
+                const pc: u32 = if (trap) |kind| 0x4000_0000 + @as(u32, kind) * 16 else 0x4000_0004;
+                try testing.expectEqual(pc, TS.regs.pc);
+                if (trap != null) {
+                    try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
+                    try testing.expectEqual(@as(u32, 77), s.cpu.get(3));
+                    try testing.expectEqualSlices(u8, &original, TS.ram[0x800..0x808]);
+                    try testing.expectEqual(@as(usize, 0), b.log.items.len);
+                }
+            }
+        }
+    }
+}
+
+test "atomic fuel exhaustion and failed stores preserve the faulting pc and destination" {
+    var b: Bus = undefined;
+    var s = try setup(&b, &.{ testFormat3(3, 0x0F, 2, 1, 0, true), testFormat3(3, 0x04, 2, 1, 0, true) });
+    defer b.deinit();
+    s.cpu.set(1, 0x4000_0800);
+    s.cpu.set(2, 99);
+    std.mem.writeInt(u32, TS.ram[0x800..0x804], 42, .big);
+    b.fuel = 2; // one instruction plus two bus accesses cannot fit
+    try testing.expectEqual(Exit{ .stop = .fuel_exhausted }, s.cpu.step().?);
+    try testing.expectEqual(@as(u32, 0x4000_0000), TS.regs.pc);
+    try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
+    try testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, TS.ram[0x800..0x804], .big));
+    b.resetRun(100);
+    TS.regs.pc = 0x4000_0004;
+    TS.regs.npc = 0x4000_0008;
+    const rom_map = [_]bus_mod.Range{.{ .lo = 0x4000_0000, .hi = 0x4000_0FFF, .kind = .rom }};
+    b.map = &rom_map;
+    try testing.expectEqual(Exit{ .stop = .{ .fault = 0x4000_0800 } }, s.cpu.step().?);
+    try testing.expectEqual(@as(u32, 0x4000_0004), TS.regs.pc);
+}
+
+test "ASI1 forwarded atomics reserve reads and writes before consuming device input" {
+    const Forward = struct {
+        fn read(ctx: *anyopaque, address: u32, bits: u8) u64 {
+            const bus: *Bus = @ptrCast(@alignCast(ctx));
+            return bus.read(address, bits);
+        }
+        fn write(ctx: *anyopaque, address: u32, bits: u8, value: u64) void {
+            const bus: *Bus = @ptrCast(@alignCast(ctx));
+            bus.write(address, bits, value);
+        }
+    };
+    const Input = struct {
+        reads: usize = 0,
+        writes: usize = 0,
+        fn read(ctx: *anyopaque, _: u32, _: u8) u64 {
+            const input: *@This() = @ptrCast(@alignCast(ctx));
+            input.reads += 1;
+            return 0x41;
+        }
+        fn write(ctx: *anyopaque, _: u32, _: u8, _: u64) void {
+            const input: *@This() = @ptrCast(@alignCast(ctx));
+            input.writes += 1;
+        }
+    };
+    for ([_]u6{ 0x1D, 0x1F }) |op3| {
+        var b: Bus = undefined;
+        var s = try setup(&b, &.{testFormat3(3, op3, 2, 1, 1 << 5, false)});
+        defer b.deinit();
+        const map = TS.map ++ [_]bus_mod.Range{.{ .lo = 0x80000200, .hi = 0x80000203, .kind = .mmio }};
+        b.map = &map;
+        var input: Input = .{};
+        b.dev = .{ .ctx = &input, .read = Input.read, .write = Input.write };
+        s.cpu.asi1 = .{ .ctx = &b, .read = Forward.read, .write = Forward.write };
+        s.cpu.set(1, if (op3 == 0x1D) 0x80000203 else 0x80000200);
+        s.cpu.set(2, 99);
+        b.fuel = 2;
+        try testing.expectEqual(Exit{ .stop = .fuel_exhausted }, s.cpu.step().?);
+        try testing.expectEqual(@as(usize, 0), input.reads);
+        try testing.expectEqual(@as(usize, 0), input.writes);
+        try testing.expectEqual(@as(u32, 0x40000000), TS.regs.pc);
+        try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
+        b.resetRun(3);
+        try testing.expectEqual(@as(?Exit, null), s.cpu.step());
+        try testing.expectEqual(@as(usize, 1), input.reads);
+        try testing.expectEqual(@as(usize, 1), input.writes);
+        try testing.expectEqual(@as(u32, 0x41), s.cpu.get(2));
+        try testing.expectEqual(@as(u32, 0x40000004), TS.regs.pc);
+    }
+}
+
+test "external interrupts respect ET and PIL; level 15 bypasses PIL and preserves delayed pc" {
+    const Case = struct { irl: u4, pil: u4, et: bool = true, taken: bool };
+    const cases = [_]Case{
+        .{ .irl = 0, .pil = 0, .taken = false },
+        .{ .irl = 5, .pil = 5, .taken = false },
+        .{ .irl = 4, .pil = 5, .taken = false },
+        .{ .irl = 6, .pil = 5, .taken = true },
+        .{ .irl = 15, .pil = 15, .taken = true },
+        .{ .irl = 15, .pil = 0, .et = false, .taken = false },
+    };
+    for (cases) |tc| {
+        var b: Bus = undefined;
+        var s = try setup(&b, &.{0x8210202A}); // mov 42,%g1
+        defer b.deinit();
+        TS.regs.psr |= @as(u32, tc.pil) << 8;
+        if (!tc.et) TS.regs.psr &= ~psr_bits.et;
+        TS.regs.npc = 0x4000_0300; // current instruction may be a branch delay slot
+        s.cpu.irl = tc.irl;
+        try runN(&s.cpu, 1);
+        try testing.expectEqual(@as(u32, if (tc.taken) 0 else 42), s.cpu.get(1));
+        if (tc.taken) {
+            try testing.expectEqual(@as(u32, 0x4000_0100) + @as(u32, tc.irl) * 16, TS.regs.pc);
+            try testing.expectEqual(@as(u32, 0x4000_0000), s.cpu.get(17));
+            try testing.expectEqual(@as(u32, 0x4000_0300), s.cpu.get(18));
+            try testing.expectEqual(@as(u32, tc.pil) << 8, TS.regs.psr & psr_bits.pil);
+            try testing.expect(TS.regs.psr & psr_bits.et == 0);
+            try testing.expectEqual(tc.irl, s.cpu.irl); // the source must acknowledge/deassert
+        } else try testing.expectEqual(@as(u32, 0x4000_0300), TS.regs.pc);
+    }
+}
+
+test "LEON power-down holds the next instruction until an unmasked interrupt and is privileged" {
+    var b: Bus = undefined;
+    var s = try setup(&b, &.{ testFormat3(2, 0x30, 19, 0, 0, false), 0x8210202A });
+    defer b.deinit();
+    try runN(&s.cpu, 1);
+    try testing.expect(s.cpu.sleeping);
+    try testing.expectEqual(@as(u32, 0x4000_0004), TS.regs.pc);
+    TS.regs.psr |= 4 << 8;
+    s.cpu.irl = 4;
+    try runN(&s.cpu, 3);
+    try testing.expect(s.cpu.sleeping);
+    try testing.expectEqual(@as(u32, 0), s.cpu.get(1));
+    try testing.expectEqual(@as(u32, 0x4000_0004), TS.regs.pc);
+    s.cpu.irl = 5;
+    try runN(&s.cpu, 1);
+    try testing.expect(!s.cpu.sleeping);
+    try testing.expectEqual(@as(u32, 0x4000_0150), TS.regs.pc);
+    try testing.expectEqual(@as(u32, 0x4000_0004), s.cpu.get(17));
+    try testing.expectEqual(@as(u32, 0x4000_0008), s.cpu.get(18));
+
+    s.cpu.irl = 0;
+    TS.regs = .{ .pc = 0x4000_0000, .npc = 0x4000_0004, .psr = psr_bits.et, .tbr = 0x4000_0000 };
+    try runN(&s.cpu, 1);
+    try testing.expect(!s.cpu.sleeping);
+    try testing.expectEqual(@as(u32, 0x4000_0030), TS.regs.pc);
 }
 
 test "add/sub flags, addx/subx carry chains, conditions" {

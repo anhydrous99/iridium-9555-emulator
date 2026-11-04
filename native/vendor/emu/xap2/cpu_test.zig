@@ -30,6 +30,88 @@ const T = struct {
     }
 };
 
+test "opt-in FLAGS bank selection applies to offset and zero-offset instruction forms" {
+    var t: T = .{};
+    const code = [_]u16{ 0xFF05, 0xFE05, 0x0005, 0x0005 };
+    const c = try t.init(&code, true);
+    defer t.m.deinit();
+    c.banked_interrupts = true;
+    c.cpu.x = 0x1111;
+    c.cpu.y = 0xC000;
+    c.cpu.ux = 0x2222;
+    c.cpu.uy = 0xD000;
+    t.m.data[0xBFFF] = 0x10;
+    t.m.data[0xCFFE] = 0;
+    t.m.data[0xC000] = 0x10;
+    t.m.data[0xD000] = 0x10;
+    c.step();
+    try testing.expectEqual(@as(u16, 0x2222), c.cpu.x);
+    try testing.expectEqual(@as(u16, 0xD000), c.cpu.y);
+    c.step();
+    try testing.expectEqual(@as(u16, 0x1111), c.cpu.x);
+    try testing.expectEqual(@as(u16, 0xC000), c.cpu.y);
+    c.step();
+    c.step();
+    try testing.expectEqual(@as(u16, 0x2222), c.cpu.x);
+    try testing.expectEqual(@as(u16, 0x1111), c.cpu.ux);
+    try testing.expectEqual(@as(u16, 0xD000), c.cpu.y);
+    try testing.expectEqual(@as(u16, 0xC000), c.cpu.uy);
+}
+
+test "banked interrupt saves its frame on the inactive stack and RTI restores the user bank" {
+    var t: T = .{};
+    const code = [_]u16{ 0, 0, 0xDF0D };
+    const c = try t.init(&code, true);
+    defer t.m.deinit();
+    c.banked_interrupts = true;
+    c.cpu.pc = base + 0x20;
+    c.cpu.x = 0x1111;
+    c.cpu.y = 0xC000;
+    c.cpu.ux = 0x2222;
+    c.cpu.uy = 0xD000;
+    c.cpu.flags = 0x10;
+    const original = c.cpu;
+    try testing.expect(c.interrupt(base));
+    try testing.expectEqual(@as(u16, 0x2222), c.cpu.x);
+    try testing.expectEqual(@as(u16, 0xD000), c.cpu.y);
+    try testing.expectEqual(@as(u16, 0x10), t.m.data[0xCFDF]);
+    try testing.expectEqual(@as(u16, 0), t.m.data[0xCFE0]);
+    try testing.expectEqual(@as(u16, 0x802C), t.m.data[0xCFE1]);
+    try testing.expect(!c.interrupt(base));
+    c.step();
+    try testing.expectEqualDeep(original, c.cpu);
+}
+
+test "banked scratch registers follow the supervisor stack and preserve an outer context" {
+    var t: T = .{};
+    const code = [_]u16{0x0004};
+    const c = try t.init(&code, true);
+    defer t.m.deinit();
+    c.banked_interrupts = true;
+    c.cpu.flags = 0x10;
+    c.cpu.y = 0xC000;
+    c.cpu.uy = 0xD000;
+    t.m.data[0xFFF8] = 0xDEAD;
+    t.m.data[0xCFF8] = 0xABCD;
+    try testing.expectEqual(@as(u16, 0xABCD), c.read(0xFFF8));
+    c.write(0xFFF8, 0x1234);
+    try testing.expectEqual(@as(u16, 0x1234), t.m.data[0xCFF8]);
+    try testing.expectEqual(@as(u16, 0xDEAD), t.m.data[0xFFF8]);
+    c.unpackFlags(0);
+    try testing.expectEqual(@as(u16, 0x1234), c.read(0xFFF8));
+    c.cpu.y = 0xCF00;
+    c.cpu.uy = 0xCE00;
+    c.write(0xFFFD, 0xCF00);
+    c.unpackFlags(0x10);
+    try testing.expectEqual(@as(u16, 0xCF00), c.read(0xFFFD));
+    c.write(0xFFF8, 0x5678);
+    try testing.expectEqual(@as(u16, 0x5678), t.m.data[0xCEF8]);
+    c.cpu.uy = 0xD000;
+    try testing.expectEqual(@as(u16, 0x1234), c.read(0xFFF8));
+    c.write(0xFFE1, 0xBEEF);
+    try testing.expectEqual(@as(u16, 0xBEEF), c.cpu.al);
+}
+
 test "bsr leaves the return address in X/XH, rts returns to XH:X; brk halts" {
     var t: T = .{};
     const code = [_]u16{

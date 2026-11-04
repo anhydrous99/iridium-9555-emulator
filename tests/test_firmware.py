@@ -95,6 +95,17 @@ class FirmwareTests(unittest.TestCase):
             self.assertEqual(load_firmware(Path(directory))[0].format, "CSR-dfu2")
             self.assertEqual(path.read_bytes(), self.dfu)
 
+    def test_complete_avr_flash_images_preserve_boot_sections_and_model_bounds(self):
+        for model, size in (("9555", 0x4000), ("9575", 0x20000)):
+            with self.subTest(model=model):
+                data = b"\xff" * (size - 2) + b"\x12\x34"
+                firmware = parse_firmware(data, "complete.bin", "avr")
+                self.assertEqual(firmware.model, model)
+                self.assertEqual(firmware.data, data)
+                self.assertEqual(parse_firmware(data, "complete.bin").image, "avr")
+                with self.assertRaises(FirmwareError):
+                    parse_firmware(data, "complete.bin", "avr", model="9555" if model == "9575" else "9575")
+
     def test_extreme_container_selects_its_own_layout_and_checks_device(self):
         dfu = make_dfu("9575")
         image = parse_firmware(dfu, "renamed.dfu")
