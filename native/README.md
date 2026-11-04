@@ -73,6 +73,10 @@ A function probe chooses an IRQ-safe Y no higher than 0xFCC0, preserving the
 0xF960–0xFCDF and the paused CPU at final return/failure, retaining global memory,
 device and elapsed-time effects. Stack-local returned pointers expire.
 `last_call` reports `returned`, `pending`, AL/AH, steps and the probe PC.
+Coupled Session probes and idle waits synchronize links after every chunk,
+including the final response, before servicing peripherals. Board service accounts for the actual
+executed instructions; service and extra serial waiting share the request's
+instruction-sized peripheral budget. Held reset advances programming only.
 Failed probes retain stopped registers and up to 64 stack words. A serial wait
 or explicit `quantum` can yield a live probe; `call_resume` accepts the same
 per-request quantum and continues within its original cumulative budget and bus

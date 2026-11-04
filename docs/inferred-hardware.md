@@ -21,6 +21,8 @@ with fabricated code or successful service responses.
   External reset preserves active flash and EEPROM programming, including the
   pending data and remaining time. Programming continues while the board holds
   reset, without executing AVR instructions or clocking its other peripherals.
+  EEPROM mode bits survive reset while programming is busy and ignore mode
+  changes until the transaction completes.
   Reset clears the temporary page buffer. On the 9555, EEPROM programming
   invalidates loaded page-buffer data; a page write then stops with
   `undefined_spm_buffer` rather than inventing unspecified bytes. Clear the
@@ -156,6 +158,8 @@ The TWI `twi` operation has actions `reply`, `address`, `receive`, `transmit`,
 `stop` and `events`. Replies are `ack`, `nack`, `arbitration_lost` or `bus_error`.
 An absent peer NACKs an address; no imaginary peripheral supplies data. The
 events response reports bounded capture loss.
+Guest status reads return `0xF8` with the configured prescaler bits while TWINT
+is clear; the pending transfer retains its internal state.
 
 ## Reproducible checks
 

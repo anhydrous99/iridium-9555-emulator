@@ -517,8 +517,8 @@ pub const Cpu = struct {
 
             .ld, .ldub, .lduh, .ldsb, .ldsh, .ldd, .st, .stb, .sth, .std, .ldstub, .swap => return c.mem(i, a +% bv, null),
             .lda, .lduba, .lduha, .ldsba, .ldsha, .ldda, .sta, .stba, .stha, .stda, .ldstuba, .swapa => {
-                if (i.imm()) return c.trap(tt.illegal_instruction);
                 if (!priv) return c.trap(tt.privileged_instruction);
+                if (i.imm()) return c.trap(tt.illegal_instruction);
                 return c.mem(i, a +% bv, i.asi());
             },
         }
@@ -757,6 +757,34 @@ test "atomic access rejects misalignment, user ASI, immediate ASI and unknown AS
         try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
         try testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, TS.ram[0x800..0x804], .big));
         try testing.expectEqual(@as(usize, 0), b.log.items.len);
+    }
+}
+
+test "alternate accesses check privilege before immediate encoding without touching memory" {
+    for ([_]u6{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x19, 0x1A, 0x1D, 0x1F }) |op3| {
+        for ([_]bool{ false, true }) |supervisor| {
+            for ([_]bool{ false, true }) |immediate| {
+                var b: Bus = undefined;
+                var s = try setup(&b, &.{testFormat3(3, op3, 2, 1, if (immediate) 0 else 0xB << 5, immediate)});
+                defer b.deinit();
+                if (!supervisor) TS.regs.psr &= ~psr_bits.s;
+                s.cpu.set(1, 0x4000_0800);
+                s.cpu.set(2, 99);
+                s.cpu.set(3, 77);
+                const original = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+                TS.ram[0x800..0x808].* = original;
+                try runN(&s.cpu, 1);
+                const trap: ?u8 = if (!supervisor) tt.privileged_instruction else if (immediate) tt.illegal_instruction else null;
+                const pc: u32 = if (trap) |kind| 0x4000_0000 + @as(u32, kind) * 16 else 0x4000_0004;
+                try testing.expectEqual(pc, TS.regs.pc);
+                if (trap != null) {
+                    try testing.expectEqual(@as(u32, 99), s.cpu.get(2));
+                    try testing.expectEqual(@as(u32, 77), s.cpu.get(3));
+                    try testing.expectEqualSlices(u8, &original, TS.ram[0x800..0x808]);
+                    try testing.expectEqual(@as(usize, 0), b.log.items.len);
+                }
+            }
+        }
     }
 }
 

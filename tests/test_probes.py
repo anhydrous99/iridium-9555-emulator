@@ -2,6 +2,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from iridium.engine import Engine, EngineError
 from iridium.firmware import parse_firmware
@@ -35,6 +36,104 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_idle_applies_reset_from_its_final_short_chunk(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            start, idle = 0xB750, 0xB774
+            data[:4] = b"".join(w.to_bytes(2, "little") for w in operand(0xE0, start // 2 - 1))
+            words = []
+            for address, value in ((0x62, 0x8000), (0x61, 0x8000), (0x62, 0)):
+                words.extend(operand(0x14, value) + operand(0x25, address))
+            words += [0x0114] * ((idle - start) // 2 - len(words))
+            data[start:idle] = b"".join(w.to_bytes(2, "little") for w in words)
+            data[idle:idle + 2] = b"\xe0\0"
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model), avr]
+            with self.subTest(model=model), Session(EXECUTABLE, firmware) as session:
+                session._idle(session.engines["bc5"])
+                self.assertTrue(session.engines["bc5"].state["at_idle"])
+                self.assertTrue(session.spi_link.hold_reset)
+                self.assertEqual(session.engines["avr"].state["steps"], 0)
+
+    def test_one_step_continuations_clock_only_their_executed_instructions(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            data[0x100:0x106] = b"\x14\x01\x14\x02\xe2\0"
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model), avr]
+            with self.subTest(model=model), Session(EXECUTABLE, firmware) as session:
+                primary = session.engines["bc5"]
+                first = primary.request("call", entry=0x100, steps=100, quantum=1)
+                self.assertTrue(first["last_call"]["pending"])
+                for pending, elapsed in ((True, 1), (True, 1), (False, 0)):
+                    before = session.engines["avr"].state["steps"]
+                    result = session.probe("bc5", "call_resume", {"steps": 1})
+                    self.assertEqual(result["last_call"]["pending"], pending)
+                    self.assertEqual(session.engines["avr"].state["steps"] - before, elapsed)
+                self.assertTrue(result["last_call"]["returned"])
+                self.assertEqual(result["last_call"]["steps"], 3)
+
+    def test_serial_wait_exhausts_peripheral_budget_before_executing_more_probe_code(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model, receive=False)
+            silent = parse_firmware(b"\xff\xcf".ljust(len(avr.data), b"\xff"), "avr.bin", "avr", model=model)
+            with self.subTest(model=model), Session(EXECUTABLE, [bc5, silent]) as session:
+                for address, values in ((0xA002, [0x100, 0]), (0xA100, [8]), (0xA200, [65])):
+                    session.probe("bc5", "write", {"address": address, "values": values})
+                worker = session.engines["avr"]
+                with patch.object(worker, "request", wraps=worker.request) as requests:
+                    with self.assertRaisesRegex(EngineError, "Peripheral wait exceeded"):
+                        session.probe("bc5", "call", {"entry": 0x100, "steps": 20})
+                    amounts = [call.kwargs["steps"] for call in requests.call_args_list
+                               if call.args[0] == "run"]
+                self.assertEqual(sum(amounts), 20)
+                state = session.engines["bc5"].request("state")
+                self.assertTrue(state["last_call"]["pending"])
+                self.assertTrue(state["serial_waiting"])
+                self.assertLess(state["last_call"]["steps"], 20)
+                self.assertIsNone(state["halt"])
+
+    def test_terminal_probes_apply_reset_before_peripheral_execution(self):
+        # Before EXTRF, AVR writes EEPROM; after EXTRF, it only reads it into r18.
+        receiver = [0x9100, 0x54, 0xFD01, 0xC006, 0xE50A, 0x9300, 0x40,
+                    0x9AFA, 0x9AF9, 0xCFFF, 0x9AF8, 0x9120, 0x40, 0xCFFF]
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            for entry, setup in ((0x100, ((0x62, 0x8000), (0x61, 0x8000), (0x62, 0))),
+                                 (0x200, ((0x62, 0x8000),))):
+                words = []
+                for address, value in setup:
+                    words.extend(operand(0x14, value) + operand(0x25, address))
+                words.append(0x00E2)
+                data[entry:entry + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                        parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(len(avr.data), b"\xff"),
+                                       "avr.bin", "avr", model=model)]
+            for modem in ("none", "trx", "ptt"):
+                loaded = list(firmware)
+                if modem != "none":
+                    size = 0x260760 if modem == "trx" else 0xA7BF8
+                    loaded.append(parse_firmware(b"\x10\x80\0\0\x01\0\0\0".ljust(size, b"\xff"),
+                                                 modem + ".bin", modem, model=model))
+                for operation in ("call", "call_resume"):
+                    with self.subTest(model=model, modem=modem, operation=operation), Session(EXECUTABLE, loaded, modem_image=modem) as session:
+                        if operation == "call_resume":
+                            first = session.engines["bc5"].request("call", entry=0x100, steps=100, quantum=1)
+                            self.assertTrue(first["last_call"]["pending"])
+                            result = session.probe("bc5", operation, {"steps": 99})
+                        else:
+                            result = session.probe("bc5", operation, {"entry": 0x100, "steps": 100})
+                        self.assertTrue(result["last_call"]["returned"])
+                        self.assertTrue(session.spi_link.hold_reset)
+                        self.assertEqual(session.engines["avr"].state["steps"], 0)
+                        session.control("step", 30100)
+                        self.assertEqual(session.engines["avr"].state["steps"], 0)
+                        session.probe("bc5", "call", {"entry": 0x200, "steps": 100})
+                        self.assertFalse(session.spi_link.hold_reset)
+                        session.control("step", 100)
+                        self.assertEqual(session.engines["avr"].state["registers"][18], 0xFF)
+
     def test_yielding_reset_probes_discard_modem_backlog_and_keep_later_traffic(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)
@@ -86,6 +185,8 @@ class ProbeTests(unittest.TestCase):
             # Yield enough board quanta to exceed the programming interval.
             words = [0x0114] * 13000 + [0x00E2]
             data[0x300:0x300 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            words = [0x0114] * 4000 + [0x00E2]
+            data[0x20000:0x20000 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
             # Program 0xA55A at byte 0x100; after EXTRF park before issuing more SPM.
             words = [0x9110, 0x54, 0xFD11, 0xCFFF, 0xE0E0, 0xE0F1,
                      0xE50A, 0x2E00, 0xEA05, 0x2E10, 0xE001, 0x9300, 0x57, 0x95E8,
@@ -94,7 +195,7 @@ class ProbeTests(unittest.TestCase):
             avr[boot:boot + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
             firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
                         parse_firmware(bytes(avr), "avr.bin", "avr", model=model)]
-            for service in ("step", "probe"):
+            for service in ("step", "probe", "short-probes", "short-resumes"):
                 with self.subTest(model=model, service=service), Session(EXECUTABLE, firmware) as session:
                     session.probe("avr", "fuses", {"low": 0x77, "high": 0x98, "extended": 0xFE, "lock": 0xFF})
                     session.control("reset")
@@ -105,10 +206,31 @@ class ProbeTests(unittest.TestCase):
                     self.assertTrue(session.spi_link.hold_reset)
                     before = session.engines["avr"].state
                     self.assertEqual(session.probe("avr", "program_read", {"address": 0x100, "count": 2})["values"], [255, 255])
-                    if service == "step":
-                        session.control("step", 100000)
-                    else:
-                        self.assertTrue(session.probe("bc5", "call", {"entry": 0x300, "steps": 100000})["last_call"]["returned"])
+                    worker = session.engines["avr"]
+                    with patch.object(worker, "request", wraps=worker.request) as requests:
+                        if service == "step":
+                            session.control("step", 100000)
+                            clocked = 100000
+                        elif service == "probe":
+                            result = session.probe("bc5", "call", {"entry": 0x300, "steps": 100000, "quantum": 100000000})
+                            self.assertTrue(result["last_call"]["returned"])
+                            clocked = result["last_call"]["steps"]
+                        else:
+                            clocked = 0
+                            for _ in range(4):
+                                arguments = {"entry": 0x20000, "steps": 10000}
+                                if service == "short-resumes":
+                                    first = session.engines["bc5"].request("call", **arguments, quantum=1)
+                                    result = session.probe("bc5", "call_resume", {"steps": 10000})
+                                    clocked += result["last_call"]["steps"] - first["last_call"]["steps"]
+                                else:
+                                    result = session.probe("bc5", "call", arguments)
+                                    clocked += result["last_call"]["steps"]
+                                self.assertTrue(result["last_call"]["returned"])
+                        amounts = [call.kwargs["cycles"] for call in requests.call_args_list
+                                   if call.args[0] == "reset_clock"]
+                        self.assertEqual(sum(amounts), clocked)
+                        self.assertTrue(all(0 < amount <= 4096 for amount in amounts))
                     after = session.engines["avr"].state
                     self.assertEqual((after["steps"], after["cycles"], after["registers"]),
                                      (before["steps"], before["cycles"], before["registers"]))
@@ -170,7 +292,8 @@ class ProbeTests(unittest.TestCase):
                 self.assertFalse(first["serial_waiting"])
                 before = [worker.state["steps"] for worker in session.engines.values()]
                 for arguments in ({"steps": 100000001}, {"steps": 0}, {"steps": True},
-                                  {"steps": "bad"}, {"steps": 9999, "quantum": 0}):
+                                  {"steps": "bad"}, {"steps": 9999, "quantum": 0},
+                                  {"steps": 9999, "quantum": 100000001}):
                     with self.assertRaises(EngineError):
                         session.probe("bc5", "call_resume", arguments)
                     self.assertEqual([worker.state["steps"] for worker in session.engines.values()], before)
@@ -262,7 +385,8 @@ class ProbeTests(unittest.TestCase):
                 for arguments in ({}, {"entry": 0x100, "steps": "bad"},
                                   {"entry": 0x100, "steps": True},
                                   {"entry": 0x100, "steps": -1},
-                                  {"entry": 0x100, "quantum": 0}):
+                                  {"entry": 0x100, "quantum": 0},
+                                  {"entry": 0x100, "quantum": 100000001}):
                     with self.assertRaises(EngineError):
                         session.probe("bc5", "call", arguments)
                     self.assertEqual([worker.state["steps"] for worker in session.engines.values()], before)

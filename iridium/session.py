@@ -217,6 +217,14 @@ class Session:
                 raise EngineError(f"Peripheral processor halted during board service: {result.get('halt')}")
         self._exchange_links()
 
+    def _service_board_elapsed(self, steps):
+        # Apply reset before executing peripherals, including after a terminal chunk.
+        self._exchange_links()
+        while steps:
+            quantum = self._board_quantum(steps)
+            self._service_board(quantum)
+            steps -= quantum
+
     def _clock_reset(self, cycles):
         if self.spi_link and self.spi_link.hold_reset:
             self._request(self.engines["avr"], "reset_clock", cycles=cycles)
@@ -489,13 +497,15 @@ class Session:
             remaining = 30000000
             while remaining > 0:
                 quantum = self._board_quantum(remaining)
+                before = worker.state["steps"]
                 response = self._request(worker, "idle", steps=quantum)
                 remaining -= quantum
+                elapsed = response["steps"] - before
+                self._service_board_elapsed(elapsed)
                 if response.get("halt"):
                     break
                 if response.get("at_idle"):
                     return
-                self._service_board(quantum)
             raise EngineError(f"Cannot reach a safe scheduler boundary: {response.get('halt') or 'instruction budget exhausted'}")
         # A configured warm boot also runs the application's device initialization.
         for _ in range(3):
@@ -519,28 +529,38 @@ class Session:
         arguments = dict(arguments)
         budget = arguments.get("steps", 100000 if operation == "call" else 100000000)
         if self.spi_link and type(budget) is int and budget > 0:
-            arguments.setdefault("quantum", self._board_quantum(budget))
+            quantum = arguments.get("quantum", self._board_quantum(budget))
+            if type(quantum) is int and 1 <= quantum <= 100000000:
+                arguments["quantum"] = min(quantum, self._board_quantum(budget))
         before = (worker.state.get("last_call") or {}).get("steps", 0) if operation == "call_resume" else 0
         # Native validation must run before any peripheral processor advances.
         response = self._request(worker, operation, **arguments)
         peripheral_budget = budget
-        while (response.get("last_call") or {}).get("pending"):
-            remaining = budget - (response["last_call"]["steps"] - before)
+        previous = before
+        while True:
+            call = response.get("last_call") or {}
+            elapsed = call.get("steps", previous) - previous
+            previous += elapsed
+            if self.spi_link:
+                self._service_board_elapsed(elapsed)
+                peripheral_budget -= elapsed
+            if not call.get("pending"):
+                return response
+            remaining = budget - (previous - before)
             if remaining <= 0:
                 return response
             if not self.spi_link:
                 if not response.get("serial_waiting"):
                     return response
                 raise EngineError("Function probe is waiting for a connected serial peer")
-            if not self.spi_link.pending:
-                self._exchange_links()
-            quantum = self._board_quantum(min(remaining, peripheral_budget))
-            if quantum <= 0:
+            if not elapsed and peripheral_budget > 0:
+                quantum = self._board_quantum(min(remaining, peripheral_budget))
+                self._service_board(quantum)
+                peripheral_budget -= quantum
+            if peripheral_budget <= 0:
                 raise EngineError("Peripheral wait exceeded the function-probe budget; reset before retrying")
-            self._service_board(quantum)
-            peripheral_budget -= quantum
+            quantum = self._board_quantum(min(remaining, peripheral_budget))
             response = self._request(worker, "call_resume", steps=quantum)
-        return response
 
     def _initialize_ui(self) -> None:
         if self.ui_initialized:
