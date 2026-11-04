@@ -17,13 +17,16 @@ class ModemLink:
         self.delivered = [0, 0]
         self.error = None
 
-    def exchange(self):
+    def exchange(self, *, avr_reset=False):
         if self.error:
             raise EngineError(self.error)
         try:
             for direction, (source, port) in enumerate(self.endpoints):
                 response = source.request("uart_io", port=port)
-                self.pending[direction].extend(response["values"])
+                if direction == 1 and avr_reset:
+                    self.pending[direction].clear()
+                else:
+                    self.pending[direction].extend(response["values"])
                 if response["dropped"]:
                     raise EngineError("UART capture overflow on the processor link; reset before continuing")
                 if len(self.pending[direction]) > 4096:
@@ -54,14 +57,16 @@ class ModemLink:
 class SpiLink:
     """BC5 serial DMA ↔ AVR slave; replies wait for the next instruction quantum."""
 
-    def __init__(self, bc5, avr, model):
+    def __init__(self, bc5, avr, model, *, reset_count=0):
         if model not in ("9555", "9575"):
             raise ValueError("Unknown handset model for BC5/AVR SPI link")
+        if type(reset_count) is not int or reset_count < 0:
+            raise EngineError("Invalid BC5 reset counter")
         self.bc5, self.avr, self.model = bc5, avr, model
         self.hold_reset = False
         self.pending = False
         self.transferred = self.resets = self.stale = self.undriven = 0
-        self.reset_count = 0
+        self.reset_count = reset_count
         self.error = None
         self._byte = self._reply = None
 

@@ -35,6 +35,38 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_reset_and_avr_replacement_baseline_old_reset_pulses(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            words = []
+            for address, value in ((0x61, 0x8000), (0x62, 0x8000)):
+                words.extend(operand(0x14, value) + operand(0x25, address))
+            words.append(0x00E2)
+            data[0x100:0x100 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                        parse_firmware(b"\x00\x91\x54\0\xfd\xcf".ljust(len(avr.data), b"\xff"), "avr.bin", "avr", model=model)]
+            for operation in ("reset", "replace"):
+                with self.subTest(model=model, operation=operation), Session(EXECUTABLE, firmware) as session:
+                    session.control("step", 1)
+                    self.assertTrue(session.probe("bc5", "call", {"entry": 0x100, "steps": 100})["last_call"]["returned"])
+                    session.control("step", 2)
+                    self.assertEqual(session.spi_link.resets, 1)
+                    if operation == "reset":
+                        session.control("reset")
+                    else:
+                        session.load(firmware[1])
+                    session.control("step", 10000)
+                    state = session.engines["avr"].state
+                    self.assertEqual(state["registers"][16], 1)
+                    self.assertEqual(state["steps"], 10000)
+                    self.assertEqual(session.spi_link.resets, 0)
+                    self.assertTrue(session.probe("bc5", "call", {"entry": 0x100, "steps": 100})["last_call"]["returned"])
+                    session.control("step", 2)
+                    self.assertEqual(session.spi_link.resets, 1)
+                    session.control("step", 1)
+                    self.assertEqual(session.engines["avr"].state["registers"][16], 3)
+
     def test_continuation_services_gpio_readiness_within_original_budget(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)

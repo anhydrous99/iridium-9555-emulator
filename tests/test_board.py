@@ -1,4 +1,5 @@
 from pathlib import Path
+from itertools import product
 import unittest
 
 from iridium.board import ModemLink
@@ -26,6 +27,22 @@ class Endpoint:
 
 
 class ModemLinkTests(unittest.TestCase):
+    def test_held_avr_reset_discards_new_input_and_the_existing_receive_backlog(self):
+        avr, modem = Endpoint(capacity=0), Endpoint([81])
+        link = ModemLink(avr, modem, "trx")
+        link.exchange()
+        self.assertEqual(link.state()["pending"], [0, 1])
+        modem.transmit = [82]
+        link.exchange(avr_reset=True)
+        self.assertEqual(link.state()["pending"], [0, 0])
+        avr.capacity = 255
+        link.exchange()
+        self.assertEqual(avr.receive, [])
+        modem.transmit = [83]
+        link.exchange()
+        self.assertEqual(avr.receive, [83])
+        self.assertEqual(link.state()["modem_to_avr"], 1)
+
     def test_bidirectional_bytes_survive_partial_acceptance_in_order(self):
         avr, modem = Endpoint([1, 2, 3], capacity=1), Endpoint([4, 5], capacity=2)
         link = ModemLink(avr, modem, "trx")
@@ -90,6 +107,45 @@ class ModemLinkTests(unittest.TestCase):
 
 
 class ExecutingModemLinkTests(unittest.TestCase):
+    def test_modem_traffic_during_reset_is_lost_but_later_bytes_arrive(self):
+        executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
+        if not executable.is_file():
+            self.skipTest("Build the native executor first")
+
+        def operand(op, value):
+            return [(((value + 0x80) >> 8) & 255) << 8, ((value & 255) << 8) | op]
+
+        # BC5 either holds PIO15 across quanta or pulses it within a single quantum.
+        primary = operand(0x14, 0x8000) + operand(0x25, 0x61)
+        primary += operand(0x14, 0) + operand(0x25, 0x62)
+        release = operand(0x14, 0x8000) + operand(0x25, 0x62) + [0x00E0]
+        # AVR enables USART0, polls RXC and reads a received byte into r18.
+        receiver = [0xE100, 0x9300, 0xC1, 0x9110, 0xC0, 0xFF17, 0xCFFC, 0x9120, 0xC6, 0xCFFF]
+        # SPARC writes Q to UART1 and loops.
+        sender = [0x03200000, 0x82106200, 0x84102051, 0xC4206000, 0x10800000, 0x01000000]
+        for model, bsz, asz in (("9555", 0x310FBA, 8678), ("9575", 0x36BB22, 14296)):
+            for image, size in (("trx", 0x260760), ("ptt", 0xA7BF8)):
+                for timing, held in product(("during", "after", "silent"), (False, True)):
+                    program = primary + [0] * (600 if held else 0) + release
+                    modem = sender if timing == "during" else [0x01000000] * 1200 + sender if timing == "after" else sender[-2:]
+                    firmware = [parse_firmware(b"".join(w.to_bytes(2, "little") for w in program).ljust(bsz, b"\0"),
+                                               "bc5.bin", "bc5", model=model),
+                                parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(asz, b"\xff"),
+                                               "avr.bin", "avr", model=model),
+                                parse_firmware(b"".join(w.to_bytes(4, "big") for w in modem).ljust(size, b"\xff"),
+                                               image + ".bin", image, model=model)]
+                    with self.subTest(model=model, image=image, timing=timing, held=held), Session(executable, firmware, modem_image=image) as session:
+                        session.control("step", 128)
+                        self.assertEqual(session.spi_link.hold_reset, held)
+                        self.assertEqual(session.engines["avr"].state["steps"], 0)
+                        for _ in range(5):
+                            session.control("step", 128)
+                        session.control("step", 2048)
+                        session.control("step", 128)
+                        self.assertFalse(session.spi_link.hold_reset)
+                        self.assertEqual(session.engines["avr"].state["registers"][18], 81 if timing == "after" else 0)
+                        self.assertIsNone(session.engines["avr"].state["halt"])
+
     def test_guest_machine_code_exchanges_bytes_across_native_processors(self):
         executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
         if not executable.is_file():

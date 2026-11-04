@@ -170,10 +170,7 @@ class Session:
             quantum = self._board_quantum(remaining)
             amount = min(remaining, quantum)
             self._step_processors(amount)
-            if self.spi_link:
-                self.spi_link.exchange()
-            if self.modem_link:
-                self.modem_link.exchange()
+            self._exchange_links()
             if (self.spi_link or self.modem_link) and any(
                     worker.state.get("halt") not in (None, "steps", "running", "ready")
                     for worker in self._active_processors()):
@@ -205,8 +202,8 @@ class Session:
         if "bc5" in self.engines and "avr" in self.engines:
             bc5, avr = self.engines["bc5"], self.engines["avr"]
             if not self.spi_link or self.spi_link.bc5 is not bc5 or self.spi_link.avr is not avr:
-                bc5.request("hardware", serial_peer=True)
-                self.spi_link = SpiLink(bc5, avr, self.model)
+                state = bc5.request("hardware", serial_peer=True)
+                self.spi_link = SpiLink(bc5, avr, self.model, reset_count=state["gpio"]["reset_count"])
         else:
             self.spi_link = None
 
@@ -217,10 +214,16 @@ class Session:
             result = self._request(worker, "run", steps=steps)
             if result.get("halt") not in (None, "steps", "running", "ready"):
                 raise EngineError(f"Peripheral processor halted during board service: {result.get('halt')}")
+        self._exchange_links()
+
+    def _exchange_links(self):
+        avr_reset = False
         if self.spi_link:
+            before = self.spi_link.resets
             self.spi_link.exchange()
+            avr_reset = self.spi_link.hold_reset or self.spi_link.resets != before
         if self.modem_link:
-            self.modem_link.exchange()
+            self.modem_link.exchange(avr_reset=avr_reset)
 
     def _step_processors(self, steps: int) -> None:
         for worker in self._active_processors():

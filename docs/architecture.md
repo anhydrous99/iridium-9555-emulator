@@ -89,6 +89,8 @@ AVR `warm_reset` retains program/EEPROM, fuses, SRAM and external digital/analog
 fixtures, reseeds edge detectors and records EXTRF while retaining sticky reset
 flags. Its original reset code executes from the configured reset vector. A cold
 AVR reset restores the supplied program and clears the experiment's device state.
+An active flash programming operation continues across external reset with its
+remaining time and captured page data; the temporary page buffer is reset.
 
 The Python transport applies one 30-second deadline to sending a request and
 receiving its reply. Timeouts, disconnects, malformed replies and oversized replies

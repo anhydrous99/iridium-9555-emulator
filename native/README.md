@@ -60,6 +60,11 @@ configuration. The sender PC is not intercepted. The 65536-byte capture drains
 through state responses; `lcd_dropped` reports loss. AVR transfers use the same
 serial engine, with FE95 busy until the connected processor clocks and replies.
 SPI handshake, attention and reset follow actual guest GPIO behavior.
+BC5 state and `serial` expose the lifetime `gpio.reset_count`; recreated links
+baseline it before execution. Modem traffic into a held-reset AVR is discarded.
+External AVR reset retains active flash programming. The 9555 reports
+`undefined_spm_buffer` if a page write uses data invalidated by an EEPROM write;
+RWWSRE followed by reloading the temporary buffer restores defined behavior.
 
 A function probe chooses an IRQ-safe Y no higher than 0xFCC0, preserving the
 35-word separation from the supervisor stack in banked mode. It saves/restores

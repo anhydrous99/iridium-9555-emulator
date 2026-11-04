@@ -13,6 +13,8 @@ class FakeEngine:
     def __init__(self, executable, image, firmware, *, model="9555"):
         self.data = firmware.read_bytes()
         self.state = {"image": image, "handset": model, "pc": 0, "steps": 0, "halt": "ready", "registers": []}
+        if image == "bc5":
+            self.state["gpio"] = {"reset_count": 0}
         self.closed = False
         self.calls = []
 
@@ -38,7 +40,7 @@ class SessionTests(unittest.TestCase):
     def initialize_key_handler(self):
         self.session.load(replace(self.firmware, image="bc5", name="bc5_main.bin"))
         worker = self.session.engines["bc5"]
-        worker.request = Mock(return_value={"values": [1, 2]})
+        worker.request = Mock(return_value={"values": [1, 2], "gpio": {"reset_count": 0}})
         self.session._idle = Mock()
         self.session._call = Mock(return_value={})
         self.session.ui_initialized = True

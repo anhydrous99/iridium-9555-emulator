@@ -18,6 +18,12 @@ with fabricated code or successful service responses.
   source file is read-only. Program reads and fuse configuration are exposed
   through the native protocol; reset restores the supplied program bytes and
   retains the configured fuse fixture.
+  External reset preserves an active flash erase/write and its remaining time,
+  while clearing the temporary page buffer. On the 9555, EEPROM programming
+  invalidates loaded page-buffer data; a page write then stops with
+  `undefined_spm_buffer` rather than inventing unspecified bytes. Clear the
+  buffer with RWWSRE and reload it before retrying. The Extreme retains its
+  page-buffer data across EEPROM programming.
 - SPARC tagged integer arithmetic, atomic byte/word operations, interrupt levels
   and power-down are executed by the interpreter. Failed stores retain the
   faulting PC. There is no FPU or coprocessor in the selected CPU profile.
@@ -48,9 +54,14 @@ Transfers reduce the board quantum to 128 instructions.
 Original BC5 initialization `0xB165E`/`0xC707E` programs the GPIO direction,
 pulses reset and waits for handshake. The original AVR SPI command parser
 generates every reply. Reset retains external levels, flash, EEPROM and fuses.
+New SPI links baseline the BC5's lifetime reset counter before guest execution,
+so earlier pulses are not replayed after Session reset or AVR replacement.
 
 When AVR and a modem image are loaded, the host connects AVR USART0 to modem
-logical UART1. Telephony initializes DPL port1 at `0xE2B8C..0xE2B90`; its table
+logical UART1. Traffic awaiting delivery when AVR resets, or completed while it
+is held in reset, is discarded with the receive backlog. It is not replayed when
+the receiver starts again.
+Telephony initializes DPL port1 at `0xE2B8C..0xE2B90`; its table
 at `0x10A2F8` resolves that to physical `0x80000200`, IRQ5. PTT has an additional
 logical-port remap; its DPL port1 resolves to the same physical peripheral.
 The AVR's channel-routing instructions identify USART0 as the modem endpoint.

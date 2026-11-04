@@ -554,6 +554,7 @@ fn state(out: *std.Io.Writer) !void {
             .inputs = gpio_inputs,
             .output = Bc.dev.low[0x62],
             .direction = Bc.dev.low[0x61],
+            .reset_count = gpio_reset_count,
             .rising_mask = Bc.dev.low[0xA7],
             .falling_mask = Bc.dev.low[0xA8],
             .irq_mask = Bc.dev.low[0x64],

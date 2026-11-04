@@ -50,6 +50,23 @@ class Avr:
 
 
 class SpiLinkTests(unittest.TestCase):
+    def test_reset_baseline_ignores_history_but_detects_held_lines_and_later_pulses(self):
+        bc5 = Bc5(serial(reset_count=7), serial(reset_count=7, output=0),
+                  serial(reset_count=7, output=0), serial(reset_count=7), serial(reset_count=8))
+        avr = Avr()
+        link = SpiLink(bc5, avr, "9555", reset_count=7)
+        link.exchange()
+        self.assertEqual(link.resets, 0)
+        link.exchange()
+        self.assertTrue(link.hold_reset)
+        self.assertEqual(link.resets, 1)
+        link.exchange()
+        self.assertEqual(link.resets, 1)
+        link.exchange()
+        self.assertFalse(link.hold_reset)
+        link.exchange()
+        self.assertEqual(link.resets, 2)
+
     def test_bytes_and_replies_are_pipelined_across_separate_exchanges(self):
         bc5 = Bc5(serial(0x81, sequence=10, active=True, remaining=2),
                   serial(0x0B, sequence=11, active=True, remaining=1),

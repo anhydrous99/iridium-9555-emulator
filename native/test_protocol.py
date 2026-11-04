@@ -46,6 +46,69 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_flash_page_programming_completes_across_external_reset(self):
+        # On EXTRF, boot code parks before it can issue another SPM operation.
+        words = (0x9110, 0x54, 0xFD11, 0xCFFF, 0xE0E0, 0xE0F1,
+                 0xE50A, 0x2E00, 0xEA05, 0x2E10,
+                 0xE001, 0x9300, 0x57, 0x95E8,
+                 0xE005, 0x9300, 0x57, 0x95E8, 0x9130, 0x57, 0xCFFD)
+        for model, size, boot in (("9555", 0x4000, 0x3800), ("9575", 0x20000, 0x1E000)):
+            firmware = bytearray(b"\xff" * size)
+            code = b"".join(w.to_bytes(2, "little") for w in words)
+            firmware[boot:boot + len(code)] = code
+            for reset in (False, True):
+                with self.subTest(model=model, reset=reset):
+                    commands = [{"op": "fuses", "low": 0x77, "high": 0x98, "extended": 0xFE, "lock": 0xFF},
+                                {"op": "reset"}, {"op": "run", "steps": 30}]
+                    if reset:
+                        commands.append({"op": "warm_reset"})
+                    commands.extend([{"op": "run", "steps": 12000},
+                                     {"op": "program_read", "address": 0x100, "count": 2}])
+                    states = exchange("avr", firmware, commands, model=model)
+                    self.assertEqual(states[3]["registers"][19], 0x45)
+                    self.assertIsNone(states[-2]["halt"])
+                    self.assertEqual(states[-1]["values"], [0x5A, 0xA5])
+
+    def test_164p_invalid_flash_buffer_is_diagnostic_and_explicit_clear_recovers(self):
+        for model, size, boot in (("9555", 0x4000, 0x3800), ("9575", 0x20000, 0x1E000)):
+            for clear_buffer in (False, True):
+                with self.subTest(model=model, clear_buffer=clear_buffer):
+                    words = [0xE0E0, 0xE0F1, 0xE50A, 0x2E00, 0xEA05, 0x2E10]
+
+                    def put(address, value):
+                        words.extend([0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, address])
+
+                    def spm(command):
+                        put(0x57, command)
+                        words.append(0x95E8)
+
+                    spm(1)
+                    for address, value in ((0x40, 0x77), (0x3F, 4), (0x3F, 2)):
+                        put(address, value)
+                    words.extend([0x9120, 0x3F, 0xFD21, 0xCFFC])  # Wait for EEPE to clear.
+                    put(0x3F, 1)
+                    words.extend([0x9150, 0x40])  # EEPROM readback into r21.
+                    if clear_buffer:
+                        spm(0x11)
+                        spm(1)
+                    spm(5)
+                    words.append(0xCFFF)
+                    firmware = bytearray(b"\xff" * size)
+                    code = b"".join(w.to_bytes(2, "little") for w in words)
+                    firmware[boot:boot + len(code)] = code
+                    states = exchange("avr", firmware, [
+                        {"op": "fuses", "low": 0x77, "high": 0x98, "extended": 0xFE, "lock": 0xFF},
+                        {"op": "reset"}, {"op": "run", "steps": 15000},
+                        {"op": "program_read", "address": 0x100, "count": 2},
+                    ], model=model)
+                    self.assertEqual(states[-2]["registers"][21], 0x77)
+                    if model == "9555" and not clear_buffer:
+                        self.assertIn("undefined_spm_buffer", states[-2]["halt"])
+                        self.assertEqual(states[-1]["values"], [0xFF, 0xFF])
+                    else:
+                        self.assertIsNone(states[-2]["halt"])
+                        self.assertEqual(states[-1]["values"], [0x5A, 0xA5])
+
     def test_avr_external_reset_preserves_fixtures_without_inventing_timer_edges(self):
         # Read the reset cause, clear sticky flags, enable rising-edge T0 and poll count/ACO.
         words = (0x9110, 0x54, 0xE000, 0x9300, 0x54, 0xE007, 0x9300, 0x45,

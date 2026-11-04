@@ -81,6 +81,8 @@ pub const Stop = union(enum) {
     invalid: u32,
     /// Set by a hook (e.g. a noreturn call): the code is the hook's.
     hook: u32,
+    /// EEPROM programming invalidated a temporary flash page on the ATmega164P.
+    undefined_spm_buffer,
 };
 
 pub const Cpu = struct {
