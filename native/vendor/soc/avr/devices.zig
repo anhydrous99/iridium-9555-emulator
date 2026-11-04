@@ -1694,6 +1694,13 @@ pub const Devices = struct {
             return;
         }
         if (cycles > 1 and d.ioRunning()) {
+            // The 164P's OC2B/ICP1 shared pad must publish edges before capture samples.
+            if (!d.mega and d.output8Enabled(2, 1) and d.st.io[TCCR2B] & 7 != 0 and
+                d.st.io[PRR] & PRTIM2 == 0 and d.st.io[ASSR] & 0x20 == 0)
+            {
+                for (0..cycles) |_| d.tick(1);
+                return;
+            }
             if (d.st.ac_delay != 0) {
                 d.tick(1);
                 d.tick(cycles - 1);
@@ -3127,6 +3134,36 @@ test "external compare outputs consume each clock edge once, including zero-TOP 
             }
         }
     }
+}
+
+test "timer output edges and capture filters preserve clock order across tick partitions" {
+    for ([_]bool{ false, true }) |mega| for ([_]bool{ false, true }) |noise| for ([_]u8{ 0, 1, 2, 3, 5, 7 }) |mode| for ([_]u8{ 1, 2, 3 }) |clock| {
+        var initial: Devices = .{ .mega = mega };
+        initial.reset();
+        initial.write(if (mega) 0x101 else 0x2A, 0x40);
+        initial.write(TCCR1B, if (noise) 0xC1 else 0x41);
+        initial.write(TCCR2A, (if (mode == 0 or mode == 2) @as(u8, 0x10) else 0x20) | (mode & 3));
+        initial.write(TCCR2B, ((mode & 4) << 1) | clock);
+        initial.write(OCR2A, 7);
+        initial.write(OCR2B, if (mode == 0 or mode == 2) 0 else 3);
+        var reference = initial;
+        for (0..128) |_| reference.tick(1);
+        if (mega) {
+            try testing.expectEqual(@as(u8, 0), reference.read(TIFR1) & 0x20);
+        } else if (mode == 0 or mode == 2) {
+            try testing.expect(reference.read(TIFR1) & 0x20 != 0);
+        }
+        for ([_]u32{ 2, 3, 4, 7, 16, 31, 128 }) |partition| {
+            var actual = initial;
+            var remaining: u32 = 128;
+            while (remaining != 0) {
+                const clocks = @min(remaining, partition);
+                actual.tick(clocks);
+                remaining -= clocks;
+            }
+            try testing.expectEqualDeep(reference.st, actual.st);
+        }
+    };
 }
 
 test "power reduction stops both capture paths on every available 16-bit timer" {

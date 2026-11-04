@@ -18,6 +18,9 @@ with fabricated code or successful service responses.
   Software requests wait for the next prescaled edge before latching their
   channel and starting conversion clocks. Automatic triggers include three CPU
   clocks of synchronization; free-running restarts have no software launch wait.
+  On the 9555, Timer2 output OC2B shares PD6 with Timer1 capture. Its synchronous
+  output edges and capture-filter samples advance in CPU clock order, so capture
+  timestamps do not depend on instruction length.
 - AVR program-memory tests can load the upgrade payload or a complete flash
   image: 16 KiB for the 9555, 128 KiB for the inferred Extreme profile. The
   source file is read-only. Program reads and fuse configuration are exposed

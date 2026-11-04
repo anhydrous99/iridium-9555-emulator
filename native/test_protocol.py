@@ -321,6 +321,35 @@ class ProtocolTests(unittest.TestCase):
                         value = states[6]["registers"][20] | states[6]["registers"][21] << 8
                         self.assertEqual(value, 800 if change < sample else 400)
 
+    def test_timer_output_capture_is_independent_of_instruction_length(self):
+        for model, size, direction in (("9555", 0x4000, 0x2A), ("9575", 0x20000, 0x101)):
+            for armed in (False, True):
+                for noise in (False, True):
+                    captures = []
+                    for call in (False, True):
+                        with self.subTest(model=model, armed=armed, noise=noise, call=call):
+                            words = []
+
+                            def put(address, value):
+                                words.extend([0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, address])
+
+                            if armed:
+                                put(0x7A, 0xA0)
+                            for address, value in ((direction, 0x40), (0xB0, 0x10), (0xB4, 3),
+                                                   (0x81, 0xC1 if noise else 0x41), (0xB1, 1)):
+                                put(address, value)
+                            words += [0x940E, len(words) + 2] if call else [0] * 4
+                            words += [0] * 4 + [0x9140, 0x86, 0x9150, 0x87, 0xCFFF]
+                            firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                            steps = (21 if call else 24) if armed else (19 if call else 22)
+                            state = exchange("avr", firmware, [{"op": "run", "steps": steps}], model=model)[1]
+                            self.assertIsNone(state["halt"])
+                            self.assertEqual(state["cycles"], 34 if armed else 31)
+                            captured = state["registers"][20] | state["registers"][21] << 8
+                            self.assertEqual(captured, (10 if noise else 7) if model == "9555" else 0)
+                            captures.append(captured)
+                    self.assertEqual(len(set(captures)), 1)
+
     def test_sparc_irq_stimulus_is_validated_and_reset_deasserts_it(self):
         firmware = bytes(0x260760)
         states = exchange("trx", firmware, [
