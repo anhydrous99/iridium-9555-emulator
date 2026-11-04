@@ -50,6 +50,42 @@ class Avr:
 
 
 class SpiLinkTests(unittest.TestCase):
+    def test_pre_service_sync_retains_reply_and_applies_reset_without_acknowledging(self):
+        bc5 = Bc5(serial(0x11, sequence=1, active=True, remaining=2),
+                  serial(sequence=1, active=True, remaining=2),
+                  serial(0x22, sequence=2, active=True, remaining=1),
+                  serial(sequence=3, output=0, reset_count=1))
+        avr = Avr(0xAA, 0xBB)
+        link = SpiLink(bc5, avr, "9555")
+        link.exchange()
+        link.exchange(acknowledge=False)
+        self.assertEqual(link.transferred, 1)
+        self.assertEqual([args for op, args in bc5.calls if op == "serial"], [{}, {}])
+        link.exchange()  # The scheduler has now executed the AVR.
+        link.exchange(acknowledge=False)
+        self.assertTrue(link.hold_reset)
+        self.assertEqual(link.resets, 1)
+        self.assertEqual([args for op, args in bc5.calls if op == "serial"],
+                         [{}, {}, {"received": 0xAA, "sequence": 1}, {}])
+        self.assertEqual(link.transferred, 2)
+
+    def test_pre_service_replacement_waits_until_avr_consumes_the_old_clocked_byte(self):
+        bc5 = Bc5(serial(0x11, sequence=1, active=True),
+                  serial(0x22, sequence=2, active=True),
+                  serial(sequence=2, active=True), serial(sequence=3))
+        avr = Avr(0xAA, 0xBB)
+        link = SpiLink(bc5, avr, "9575")
+        link.exchange()
+        link.exchange(acknowledge=False)
+        self.assertEqual(link.transferred, 1)
+        self.assertEqual(link.stale, 1)
+        link.exchange()  # Consume the old byte before clocking its replacement.
+        link.exchange()
+        self.assertEqual(link.transferred, 2)
+        self.assertFalse(link.pending)
+        self.assertEqual([args for op, args in bc5.calls if op == "serial"],
+                         [{}, {}, {}, {"received": 0xBB, "sequence": 2}])
+
     def test_reset_baseline_ignores_history_but_detects_held_lines_and_later_pulses(self):
         bc5 = Bc5(serial(reset_count=7), serial(reset_count=7, output=0),
                   serial(reset_count=7, output=0), serial(reset_count=7), serial(reset_count=8))

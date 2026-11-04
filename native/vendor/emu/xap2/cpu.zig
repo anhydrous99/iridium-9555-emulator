@@ -265,6 +265,11 @@ pub const Core = struct {
         return dec.decodeAt(c, word, 1 << 24, pc);
     }
 
+    /// The ABI return address is a return only at depth zero with no code mapped there.
+    pub fn atReturnSentinel(c: *Core) bool {
+        return c.cpu.pc == sentinel and c.depth == 0 and c.word(sentinel) == null;
+    }
+
     /// Runs until a halt, or `max_steps` instructions.
     pub fn run(c: *Core, max_steps: u64) Halt {
         c.halted = null;
@@ -292,8 +297,7 @@ pub const Core = struct {
     /// One instruction (or one sentinel check).
     pub fn step(c: *Core) void {
         const cpu = &c.cpu;
-        // The ABI return address, not an ISA rule: mapped code there runs.
-        if (cpu.pc == sentinel and c.depth == 0 and c.word(sentinel) == null) return c.halt(.returned);
+        if (c.atReturnSentinel()) return c.halt(.returned);
         // One fuel unit per instruction, plus each fetched codeword and data access.
         if (c.bus.fuel == 0) return c.bus.halt(.fuel_exhausted);
         c.bus.fuel -= 1;

@@ -73,6 +73,8 @@ A function probe chooses an IRQ-safe Y no higher than 0xFCC0, preserving the
 0xF960–0xFCDF and the paused CPU at final return/failure, retaining global memory,
 device and elapsed-time effects. Stack-local returned pointers expire.
 `last_call` reports `returned`, `pending`, AL/AH, steps and the probe PC.
+Reaching the unmapped ABI return sentinel at depth zero completes a probe even
+on its final allowed instruction, without another instruction or peripheral tick.
 Coupled Session probes and idle waits synchronize links after every chunk,
 including the final response, before servicing peripherals. Board service accounts for the actual
 executed instructions; service and extra serial waiting share the request's

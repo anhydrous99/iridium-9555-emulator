@@ -444,6 +444,32 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(states[1]["registers"], states[0]["registers"])
         self.assertIn("brk", states[2]["halt"])
 
+    def test_bc5_exact_budget_returns_without_a_sentinel_instruction(self):
+        for model, size in (("9555", 0x310FBA), ("9575", 0x36BB22)):
+            firmware = bytearray(size)
+            firmware[:2] = b"\x04\0"
+            firmware[0x100:0x104] = b"\x14\x07\xe2\0"  # ld AL,7; rts
+            for budget in (1, 2, 3):
+                with self.subTest(model=model, budget=budget):
+                    states = exchange("bc5", firmware, [{"op": "call", "entry": 0x100, "steps": budget}], model=model)
+                    result = states[1]
+                    self.assertEqual(result["last_call"]["returned"], budget >= 2)
+                    self.assertEqual(result["last_call"]["steps"], min(budget, 2))
+                    self.assertEqual(result["registers"], states[0]["registers"])
+                    self.assertEqual(result["pc"], states[0]["pc"])
+                    if budget >= 2:
+                        self.assertIsNone(result["halt"])
+                        self.assertEqual(result["last_call"]["al"], 7)
+                    else:
+                        self.assertEqual(result["halt"], "probe-did-not-return")
+            states = exchange("bc5", firmware, [{"op": "call", "entry": 0x100, "steps": 2, "quantum": 1},
+                              {"op": "call_resume", "steps": 1}, {"op": "call_resume", "steps": 1}], model=model)
+            self.assertTrue(states[1]["last_call"]["pending"])
+            self.assertTrue(states[2]["last_call"]["returned"])
+            self.assertEqual(states[2]["last_call"]["steps"], 2)
+            self.assertIsNone(states[2]["halt"])
+            self.assertEqual(states[3]["error"], "NoPendingCall")
+
     def test_bc5_modifier_chain_probe_returns_and_reset_still_executes(self):
         firmware = bytearray(0x310FBA)
         firmware[0:2] = (0x0004).to_bytes(2, "little")

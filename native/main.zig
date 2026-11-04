@@ -1106,7 +1106,8 @@ fn continueCall(steps: u64) void {
         if (executed % 1024 == 0) flushLog();
     }
     flushLog();
-    const returned = if (Bc.core.halted) |h| h == .returned else false;
+    const returned = if (Bc.core.halted) |h| h == .returned else
+        halt_reason == null and BcMem.bus.stop == null and Bc.core.atReturnSentinel();
     const stack_guard_changed = BcMem.data[probe_stack_base] != context.stack_before[0];
     const pending = !returned and !stack_guard_changed and halt_reason == null and context.remaining != 0;
     const r = Bc.core.cpu;
@@ -1193,6 +1194,41 @@ const CallTest = struct {
         waiting.* = true;
     }
 };
+
+test "exact-budget probes return without an extra instruction or sentinel tick" {
+    for ([_]i64{ 1, 2, 3 }) |budget| {
+        for ([_]bool{ false, true }) |split| {
+            var rig: CallTest = .{};
+            try rig.init(&.{ 0x0714, 0x00E2 }); // ld AL,7; rts
+            defer rig.deinit();
+            BcMem.data[0xFCC0] = 0xBEEF;
+            const saved = Bc.core.cpu;
+            var arguments = std.json.Array.init(std.testing.allocator);
+            defer arguments.deinit();
+            try arguments.append(.{ .integer = 0x1234 });
+            var input = try std.json.ObjectMap.init(std.testing.allocator,
+                &.{ "entry", "steps", "quantum", "stack" },
+                &.{ .{ .integer = 0x100 }, .{ .integer = budget }, .{ .integer = if (split) 1 else budget }, .{ .array = arguments } });
+            defer input.deinit(std.testing.allocator);
+            const continuation = try std.json.parseFromSlice(Value, std.testing.allocator, "{\"steps\":1}", .{});
+            defer continuation.deinit();
+            try call(input);
+            if (callPending()) try callResume(continuation.value.object);
+            try std.testing.expect(!callPending());
+            try std.testing.expectEqual(budget >= 2, last_call.?.returned);
+            try std.testing.expectEqual(@as(u64, @intCast(@min(budget, 2))), last_call.?.steps);
+            try std.testing.expectEqual(@as(u64, @intCast(@min(budget, 2))), Bc.core.steps);
+            try std.testing.expectEqual(saved, Bc.core.cpu);
+            try std.testing.expectEqual(@as(u16, 0xBEEF), BcMem.data[0xFCC0]);
+            if (budget >= 2) {
+                try std.testing.expectEqual(@as(u16, 7), last_call.?.al);
+                try std.testing.expectEqual(@as(?[]const u8, null), halt_reason);
+                try std.testing.expect(last_call.?.stopped == null);
+            } else try std.testing.expectEqualStrings("probe-did-not-return", halt_reason.?);
+            try std.testing.expectError(error.NoPendingCall, callResume(continuation.value.object));
+        }
+    }
+}
 
 test "banked probes keep all stack arguments below a pending interrupt frame" {
     for ([_]usize{ 3, 32 }) |count| {

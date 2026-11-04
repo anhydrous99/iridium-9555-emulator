@@ -48,6 +48,8 @@ its per-byte handshake and PIO14 receives attention. PIO15 resets the AVR.
 The host clocks one byte, lets the AVR execute its ISR, then acknowledges the
 reply to the BC5 DMA engine. Firmware `FE95` polling sees busy until completion.
 Transfers reduce the board quantum to 128 instructions.
+Pre-service reset/GPIO synchronization retains an outstanding SPI reply until
+AVR execution intervenes; it cannot acknowledge that reply early.
 
 | Signal | 9555 AVR | 9575 AVR |
 |---|---|---|
@@ -72,6 +74,9 @@ The AVR's channel-routing instructions identify USART0 as the modem endpoint.
 The board connection remains an inference from those two firmware contracts.
 
 The host runs in 4096-instruction quanta and transfers completed bytes in order.
+Each coupled quantum runs BC5 first and applies reset before selecting auxiliary
+processors. New traffic generated after a released reset remains valid; queued
+pre-reset traffic and traffic received during held reset are discarded.
 Backpressure retains bytes until the receiving queue can accept them. Capture
 loss or an excessive backlog stops the experiment explicitly. This clock ratio
 is a test schedule, not a measurement of the physical board.

@@ -1656,6 +1656,13 @@ pub const Devices = struct {
     }
 
     pub fn tick(d: *Devices, cycles: u32) void {
+        if (cycles > 1 and d.adcRunning() and d.st.io[PRR] & PRADC == 0 and
+            (d.st.adc_busy != 0 or d.st.io[ADCSRA] & 0xA0 == 0xA0))
+        {
+            // A timer edge can start or finish a conversion inside an instruction's clocks.
+            for (0..cycles) |_| d.tick(1);
+            return;
+        }
         if (cycles > 1 and d.ioRunning()) {
             if (d.st.ac_delay != 0) {
                 d.tick(1);
@@ -1968,7 +1975,15 @@ pub const Devices = struct {
             },
             8, 10, 12 => {
                 const c = (off - 8) / 2;
-                t.buffered[c] = @as(u16, t.temp) << 8 | value;
+                const base = timer16_bases[n];
+                const mode = ((d.st.io[base + 1] >> 1) & 0xC) | (d.st.io[base] & 3);
+                const mask: u16 = switch (mode) {
+                    1, 5 => 0xFF,
+                    2, 6 => 0x1FF,
+                    3, 7 => 0x3FF,
+                    else => 0xFFFF,
+                };
+                t.buffered[c] = (@as(u16, t.temp) << 8 | value) & mask;
                 if (!timerPwm(&d.st.io, n)) t.compare[c] = t.buffered[c];
             },
             else => {
@@ -2080,7 +2095,7 @@ pub const Devices = struct {
         }
         if (adc_noise) {
             if (io[ADCSRA] & 0x18 == 0x18) next = firstVector(next, d.vector(Vec.adc));
-            if (io[EECR] & 0x0A == 0x08) next = firstVector(next, d.vector(Vec.ee_ready));
+            if (d.eepromReady()) next = firstVector(next, d.vector(Vec.ee_ready));
             if (io[SPMCSR] & 0x81 == 0x80) next = firstVector(next, d.vector(Vec.spm_ready));
         }
         return next;
@@ -2121,6 +2136,10 @@ pub const Devices = struct {
         return null;
     }
 
+    fn eepromReady(d: *const Devices) bool {
+        return d.st.io[EECR] & 0x0A == 0x08 and (d.mega or d.st.spm_busy == 0);
+    }
+
     fn pendingBase(d: *const Devices) ?u8 {
         const io = &d.st.io;
         const pc = io[PCIFR] & io[PCICR];
@@ -2138,7 +2157,7 @@ pub const Devices = struct {
         if (d.usartPending(0)) |v| return v;
         if (io[ACSR] & 0x18 == 0x18) return Vec.comparator;
         if (io[ADCSRA] & 0x18 == 0x18) return Vec.adc;
-        if (io[EECR] & 0x0A == 0x08) return Vec.ee_ready;
+        if (d.eepromReady()) return Vec.ee_ready;
         return d.usartPending(1);
     }
 
@@ -2631,8 +2650,11 @@ test "ADC: OCF0A's rising edge starts the conversion (no interrupt needed), a fl
     d.tick(256);
     try testing.expectEqual(@as(u8, 0), d.st.io[ADCSRA] & 0x50); // no edge, no conversion
     Devices.sysAck(&d, Vec.t0_compa); // the ISR clears the flag: the next match triggers again
-    d.tick(256);
+    const next_match = @as(u16, d.st.ocr0a_buf -% d.read(TCNT0)) + 1;
+    d.tick(next_match);
     try testing.expectEqual(@as(u8, 0x40), d.st.io[ADCSRA] & 0x40);
+    d.tick(27);
+    try testing.expectEqual(@as(u8, 0x10), d.st.io[ADCSRA] & 0x50);
 }
 
 test "1-Wire: OC2B pulses on PD6 drive the bus; the slave answers reset, Skip ROM and Read Data" {
@@ -4399,6 +4421,154 @@ test "TWI reads idle status while TWINT is clear without losing transition state
             try testing.expect(d.twiReply(.ack, 0));
             d.tick(144);
             try testing.expectEqual(@as(u8, 0x18) | p, d.read(TWSR));
+        }
+    }
+}
+
+test "ADC trigger, sample and completion clocks are independent of tick grouping and gating" {
+    for ([_]bool{ false, true }) |mega| {
+        for ([_]u3{ 6, 3, 4, 5, 7, 0 }) |source| {
+            var initial: Devices = .{ .mega = mega };
+            initial.reset();
+            initial.setAnalog(0, 123);
+            initial.write(ADCSRB, source);
+            initial.write(ADCSRA, if (source == 0) 0xE0 else 0xA0);
+            switch (source) {
+                3 => {
+                    initial.write(OCR0A, 1);
+                    initial.write(TCCR0A, 2);
+                    initial.write(TCCR0B, 1);
+                },
+                4 => {
+                    initial.write(TCNT0, 0xFF);
+                    initial.write(TCCR0B, 1);
+                },
+                5 => {
+                    initial.write(OCR1BL, 1);
+                    initial.write(TCCR1B, 1);
+                },
+                6 => {
+                    initial.write(TCNT1H, 0xFF);
+                    initial.write(TCNT1L, 0xFF);
+                    initial.write(TCCR1B, 1);
+                },
+                7 => {
+                    initial.write(TCCR1B, 0x41);
+                    initial.setPinsIn(3, if (mega) 0x10 else 0x40);
+                },
+                else => {},
+            }
+            var reference = initial;
+            for (0..30) |_| reference.tick(1);
+            reference.setAnalog(0, 900);
+            for (0..50) |_| reference.tick(1);
+            try testing.expectEqual(@as(u16, if (source == 0) 900 else 123), @as(u16, reference.st.io[ADCL]) | @as(u16, reference.st.io[ADCH]) << 8);
+            for (0..31) |split| {
+                var actual = initial;
+                actual.tick(@intCast(split));
+                actual.tick(@intCast(30 - split));
+                actual.setAnalog(0, 900);
+                actual.tick(50);
+                try testing.expectEqualDeep(reference.st, actual.st);
+            }
+        }
+        for (0..3) |gate| {
+            var single: Devices = .{ .mega = mega };
+            single.reset();
+            single.setAnalog(0, 123);
+            single.write(ADCSRB, 6);
+            single.write(ADCSRA, 0xA0);
+            single.write(TCNT1H, 0xFF);
+            single.write(TCNT1L, 0xFF);
+            single.write(TCCR1B, 1);
+            single.tick(4);
+            if (gate == 0) single.write(PRR, PRADC) else {
+                single.write(SMCR, if (gate == 1) 5 else 3);
+                Devices.sysSleeping(&single, true);
+            }
+            var batched = single;
+            const remaining = single.st.adc_busy;
+            for (0..7) |_| single.tick(1);
+            batched.tick(7);
+            try testing.expectEqualDeep(single.st, batched.st);
+            if (gate != 2) try testing.expectEqual(remaining, single.st.adc_busy);
+            if (gate == 0) {
+                single.write(PRR, 0);
+                batched.write(PRR, 0);
+            } else {
+                Devices.sysSleeping(&single, false);
+                Devices.sysSleeping(&batched, false);
+            }
+            for (0..60) |_| single.tick(1);
+            batched.tick(60);
+            try testing.expectEqualDeep(single.st, batched.st);
+        }
+    }
+}
+
+test "164P EEPROM-ready interrupts and wake wait for flash programming while 1280 stays independent" {
+    for ([_]bool{ false, true }) |mega| {
+        var t: emu.cpu.TestRig = .{};
+        try t.init(&.{0x0000});
+        defer t.deinit();
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.configureFuses(0x77, 0x99, 0xFE, 0xFF);
+        t.bus.dev = d.device();
+        t.cpu.sys = d.sys();
+        t.cpu.program_mask = if (mega) 0xFFFF else emu.cpu.pc_mask;
+        const boot = @as(usize, d.bootStart()) * 2;
+        std.mem.writeInt(u16, t.prog[boot..][0..2], 0x95E8, .little);
+        d.write(EECR, 8);
+        const ready = d.vector(Vec.ee_ready);
+        try testing.expectEqual(@as(?u8, ready), d.pending());
+        try SpmTest.command(&t, &d, 3, 0x100, 0);
+        try testing.expect(d.st.spm_busy > 1);
+        try testing.expectEqual(@as(?u8, if (mega) ready else null), d.pending());
+        d.write(SMCR, 3);
+        Devices.sysSleeping(&d, true);
+        try testing.expectEqual(@as(?u8, if (mega) ready else null), Devices.sysPending(&d));
+        d.tickReset(d.st.spm_busy - 1);
+        try testing.expectEqual(@as(?u8, if (mega) ready else null), Devices.sysPending(&d));
+        d.tickReset(1);
+        try testing.expectEqual(@as(?u8, ready), Devices.sysPending(&d));
+        Devices.sysSleeping(&d, false);
+        try testing.expectEqual(@as(?u8, ready), d.pending());
+    }
+}
+
+test "fixed PWM masks each committed OCR channel to its resolution without narrowing other modes" {
+    for ([_]bool{ false, true }) |mega| {
+        const count: usize = if (mega) 4 else 1;
+        for (timer16_bases[0..count], 0..) |base, n| {
+            for ([_]u8{ 1, 2, 3, 5, 6, 7, 0, 4, 8, 9, 10, 11, 12, 13, 14, 15 }) |mode| {
+                var d: Devices = .{ .mega = mega };
+                d.reset();
+                d.write(base, mode & 3);
+                d.write(base + 1, (mode & 12) << 1);
+                const mask: u16 = switch (mode) {
+                    1, 5 => 0xFF,
+                    2, 6 => 0x1FF,
+                    3, 7 => 0x3FF,
+                    else => 0xFFFF,
+                };
+                const expected = @as(u16, 0xF302) & mask;
+                const channels: usize = if (mega) 3 else 2;
+                for (0..channels) |channel| {
+                    const address = base + 8 + @as(u16, @intCast(channel * 2));
+                    d.write(address + 1, 0xF3);
+                    d.write(address, 2);
+                    const value = @as(u16, d.read(address)) | @as(u16, d.read(address + 1)) << 8;
+                    try testing.expectEqual(expected, value);
+                    try testing.expectEqual(expected, d.st.timer[n].buffered[channel]);
+                    if (mask == 0xFFFF and !Devices.timerPwm(&d.st.io, n))
+                        try testing.expectEqual(expected, d.st.timer[n].compare[channel]);
+                }
+                if (mask != 0xFFFF) {
+                    d.timer16(n, @as(u32, mask) + 1);
+                    for (0..channels) |channel| try testing.expectEqual(expected, d.st.timer[n].compare[channel]);
+                }
+            }
         }
     }
 }

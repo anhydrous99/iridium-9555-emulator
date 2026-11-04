@@ -170,7 +170,6 @@ class Session:
             quantum = self._board_quantum(remaining)
             amount = min(remaining, quantum)
             self._step_processors(amount)
-            self._exchange_links()
             if (self.spi_link or self.modem_link) and any(
                     worker.state.get("halt") not in (None, "steps", "running", "ready")
                     for worker in self._active_processors()):
@@ -219,7 +218,7 @@ class Session:
 
     def _service_board_elapsed(self, steps):
         # Apply reset before executing peripherals, including after a terminal chunk.
-        self._exchange_links()
+        self._exchange_links(acknowledge_spi=False)
         while steps:
             quantum = self._board_quantum(steps)
             self._service_board(quantum)
@@ -229,25 +228,39 @@ class Session:
         if self.spi_link and self.spi_link.hold_reset:
             self._request(self.engines["avr"], "reset_clock", cycles=cycles)
 
-    def _exchange_links(self):
+    def _exchange_links(self, *, acknowledge_spi=True):
         avr_reset = False
         if self.spi_link:
             before = self.spi_link.resets
-            self.spi_link.exchange()
+            self.spi_link.exchange(acknowledge=acknowledge_spi)
             avr_reset = self.spi_link.hold_reset or self.spi_link.resets != before
         if self.modem_link:
             self.modem_link.exchange(avr_reset=avr_reset)
 
     def _step_processors(self, steps: int) -> None:
-        self._clock_reset(steps)
-        for worker in self._active_processors():
-            previous = worker.state.get("halt")
-            if previous not in (None, "steps", "running", "ready"):
-                continue
-            result = self._request(worker, "run", steps=steps)
-            halt = result.get("halt")
-            if halt not in (None, "steps", "running", "ready") and halt != previous:
-                self.log("cpu", f"{result.get('image')}: {halt} at {result.get('pc')}")
+        primary = self.engines.get("bc5") if self.spi_link else None
+        if primary:
+            before = primary.state["steps"]
+            halted = primary.state.get("halt") not in (None, "steps", "running", "ready")
+            self._step_processor(primary, steps)
+            if not halted:
+                steps = primary.state["steps"] - before
+            self._exchange_links(acknowledge_spi=False)
+        if steps:
+            self._clock_reset(steps)
+            for worker in self._active_processors():
+                if worker is not primary:
+                    self._step_processor(worker, steps)
+            self._exchange_links()
+
+    def _step_processor(self, worker, steps):
+        previous = worker.state.get("halt")
+        if previous not in (None, "steps", "running", "ready"):
+            return
+        result = self._request(worker, "run", steps=steps)
+        halt = result.get("halt")
+        if halt not in (None, "steps", "running", "ready") and halt != previous:
+            self.log("cpu", f"{result.get('image')}: {halt} at {result.get('pc')}")
 
     def control(self, action: str, steps: int = 10000) -> dict:
         if type(steps) is not int or not 1 <= steps <= 10000000:
@@ -553,7 +566,7 @@ class Session:
                 if not response.get("serial_waiting"):
                     return response
                 raise EngineError("Function probe is waiting for a connected serial peer")
-            if not elapsed and peripheral_budget > 0:
+            if not elapsed and self.spi_link.pending and peripheral_budget > 0:
                 quantum = self._board_quantum(min(remaining, peripheral_budget))
                 self._service_board(quantum)
                 peripheral_budget -= quantum

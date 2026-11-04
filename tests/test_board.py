@@ -137,13 +137,15 @@ class ExecutingModemLinkTests(unittest.TestCase):
                     with self.subTest(model=model, image=image, timing=timing, held=held), Session(executable, firmware, modem_image=image) as session:
                         session.control("step", 128)
                         self.assertEqual(session.spi_link.hold_reset, held)
-                        self.assertEqual(session.engines["avr"].state["steps"], 0)
+                        self.assertEqual(session.engines["avr"].state["steps"], 0 if held else 128)
                         for _ in range(5):
                             session.control("step", 128)
                         session.control("step", 2048)
                         session.control("step", 128)
                         self.assertFalse(session.spi_link.hold_reset)
-                        self.assertEqual(session.engines["avr"].state["registers"][18], 81 if timing == "after" else 0)
+                        # A pulse completed before auxiliary execution; immediate output is post-release.
+                        received = timing == "after" or (timing == "during" and not held)
+                        self.assertEqual(session.engines["avr"].state["registers"][18], 81 if received else 0)
                         self.assertIsNone(session.engines["avr"].state["halt"])
 
     def test_guest_machine_code_exchanges_bytes_across_native_processors(self):

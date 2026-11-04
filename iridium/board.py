@@ -78,11 +78,13 @@ class SpiLink:
     def _number(value, maximum):
         return type(value) is int and 0 <= value <= maximum
 
-    def exchange(self):
+    def exchange(self, *, acknowledge=True):
         if self.error:
             raise EngineError(self.error)
         try:
-            acknowledgement = self._reply is not None
+            # A replaced DMA must still let the AVR consume its previous clocked byte.
+            unserviced = not acknowledge and self._reply is not None
+            acknowledgement = acknowledge and self._reply is not None
             arguments = ({"received": self._reply, "sequence": self._byte[1]}
                          if acknowledgement else {})
             response = self.bc5.request("serial", **arguments)
@@ -131,7 +133,7 @@ class SpiLink:
                              value=(0x1000 if handshake else 0) | (0x4000 if attention else 0))
 
             selected = bool(gpio["direction"] & 0x10 and not gpio["output"] & 0x10)
-            if self._byte is not None and self._reply is None and not held and selected:
+            if self._byte is not None and self._reply is None and not held and selected and (not unserviced or reset):
                 reply = self.avr.request("spi", value=self._byte[0])
                 if not isinstance(reply, dict) or "value" not in reply:
                     raise EngineError("Invalid AVR response on BC5/AVR SPI link")

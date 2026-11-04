@@ -36,6 +36,125 @@ def images(model, *, receive=True, valid_handle=True):
 
 @unittest.skipUnless(EXECUTABLE.is_file(), "Build the native executor first")
 class ProbeTests(unittest.TestCase):
+    def test_explicit_step_advances_live_auxiliaries_when_primary_is_already_halted(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            data[0x100:0x102] = b"\xe0\0"
+            firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                        parse_firmware(b"\xff\xcf".ljust(len(avr.data), b"\xff"), "avr.bin", "avr", model=model)]
+            for image, size in (("trx", 0x260760), ("ptt", 0xA7BF8)):
+                firmware.append(parse_firmware(b"\x10\x80\0\0\x01\0\0\0".ljust(size, b"\xff"),
+                                               image + ".bin", image, model=model))
+            for modem in ("none", "trx", "ptt"):
+                with self.subTest(model=model, modem=modem), Session(EXECUTABLE, firmware, modem_image=modem) as session:
+                    primary = session.engines["bc5"]
+                    stopped = primary.request("call", entry=0x100, steps=1)
+                    self.assertEqual(stopped["halt"], "probe-did-not-return")
+                    before = {image: worker.state["steps"] for image, worker in session.engines.items()}
+                    session.control("step", 100)
+                    self.assertEqual(primary.state["steps"], before["bc5"])
+                    self.assertEqual(primary.state["halt"], stopped["halt"])
+                    self.assertEqual(session.engines["avr"].state["steps"] - before["avr"], 100)
+                    for image in ("trx", "ptt"):
+                        self.assertEqual(session.engines[image].state["steps"] - before[image],
+                                         100 if modem in ("none", image) else 0)
+
+    def test_spi_bytes_are_consumed_between_clocks_on_every_board_execution_path(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            for operation in ("call", "call_resume", "idle", "step"):
+                for count in (2, 3, 6, 35):
+                    data = bytearray(bc5.data)
+                    words = []
+                    for address, value in ((0x62, 0x8000), (0x61, 0x8010), (0xFE94, 1),
+                                           (0xFDBE, 1), (0xFDBF, 0x440), (0xFDC3, 0), (0xFDC1, count)):
+                        words.extend(operand(0x14, value) + operand(0x25, address))
+                    if operation == "idle":
+                        words += operand(0x15, 0xFE95) + [0xFEF0]  # Wait for DMA before entering idle.
+                        words += operand(0xE0, 0xB774 // 2 - len(words) - 1)
+                        data[0xB774:0xB776] = b"\xe0\0"
+                    else:
+                        words.append(0x00E0 if operation == "step" else 0x00E2)
+                    entry = 0 if operation in ("idle", "step") else 0x100
+                    data[entry:entry + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+                    # Poll SPIF, read SPDR and append each completed byte through X.
+                    receiver = [0xE0A0, 0xE0B2, 0xE400, 0x9300, 0x4C, 0x9110, 0x4D,
+                                0xFF17, 0xCFFC, 0x9120, 0x4E, 0x932D, 0xCFF8]
+                    firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                                parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(len(avr.data), b"\xff"),
+                                               "avr.bin", "avr", model=model)]
+                    with self.subTest(model=model, operation=operation, count=count), Session(EXECUTABLE, firmware) as session:
+                        payload = bytes((0x11 * (i + 1)) & 255 for i in range(count))
+                        packed = payload + bytes(count % 2)
+                        values = [int.from_bytes(packed[i:i + 2], "little") for i in range(0, len(packed), 2)]
+                        for address, value in ((0xA002, [0x100, 0]), (0xA100, [8]), (0xA200, values)):
+                            session.probe("bc5", "write", {"address": address, "values": value})
+                        if operation in ("call", "call_resume"):
+                            session.control("step", 100)
+                        worker = session.engines["avr"]
+                        clocks = []
+                        request = worker.request
+                        def record(op, **arguments):
+                            response = request(op, **arguments)
+                            if op == "spi" and response.get("value") is not None:
+                                clocks.append(worker.state["steps"])
+                            return response
+                        with patch.object(worker, "request", record):
+                            if operation == "idle":
+                                session.control("step", 32)
+                                session._idle(session.engines["bc5"])
+                                self.assertTrue(session.engines["bc5"].state["at_idle"])
+                            elif operation == "step":
+                                session.control("step", 20000)
+                            else:
+                                budget = 1000 if count <= 6 else 20000
+                                if operation == "call_resume":
+                                    first = session.engines["bc5"].request("call", entry=entry, steps=budget, quantum=1)
+                                    self.assertTrue(first["last_call"]["pending"])
+                                    result = session.probe("bc5", "call_resume", {"steps": budget - 1})
+                                else:
+                                    result = session.probe("bc5", "call", {"entry": entry, "steps": budget})
+                                self.assertTrue(result["last_call"]["returned"])
+                        worker.request("run", steps=128)
+                        self.assertEqual(session.probe("avr", "read", {"address": 0x200, "count": count})["values"], list(payload))
+                        self.assertEqual(len(clocks), count)
+                        self.assertTrue(all(a < b for a, b in zip(clocks, clocks[1:])), clocks)
+                        self.assertFalse(session.spi_link.pending)
+
+    def test_ordinary_steps_apply_reset_before_avr_execution_regardless_of_load_order(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            words = operand(0x14, 0x8000) + operand(0x25, 0x61) + [0x00E0]
+            data[:len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            words = operand(0x14, 0x8000) + operand(0x25, 0x62) + [0x00E2]
+            data[0x200:0x200 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
+            # POR starts a write; EXTRF skips it and only reads the retained EEPROM.
+            receiver = [0x9100, 0x54, 0xFD01, 0xC006, 0xE50A, 0x9300, 0x40,
+                        0x9AFA, 0x9AF9, 0xCFFF, 0x9AF8, 0x9120, 0x40, 0xCFFF]
+            primary = parse_firmware(bytes(data), "bc5.bin", "bc5", model=model)
+            auxiliary = parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(len(avr.data), b"\xff"),
+                                       "avr.bin", "avr", model=model)
+            for modem in ("none", "trx", "ptt"):
+                for avr_first in (False, True):
+                    for quantum in (1, 20):
+                        firmware = [auxiliary, primary] if avr_first else [primary, auxiliary]
+                        if modem != "none":
+                            size = 0x260760 if modem == "trx" else 0xA7BF8
+                            firmware.append(parse_firmware(b"\x10\x80\0\0\x01\0\0\0".ljust(size, b"\xff"),
+                                                           modem + ".bin", modem, model=model))
+                        with self.subTest(model=model, modem=modem, avr_first=avr_first, quantum=quantum), Session(EXECUTABLE, firmware, modem_image=modem) as session:
+                            for _ in range(20 // quantum):
+                                session.control("step", quantum)
+                            self.assertTrue(session.spi_link.hold_reset)
+                            session.control("step", 30000)
+                            self.assertEqual(session.engines["avr"].state["steps"], 0)
+                            self.assertTrue(session.probe("bc5", "call", {"entry": 0x200, "steps": 100})["last_call"]["returned"])
+                            session.control("step", 20)
+                            self.assertFalse(session.spi_link.hold_reset)
+                            self.assertEqual(session.engines["avr"].state["registers"][18], 0xFF)
+
     def test_idle_applies_reset_from_its_final_short_chunk(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)
@@ -65,7 +184,7 @@ class ProbeTests(unittest.TestCase):
                 primary = session.engines["bc5"]
                 first = primary.request("call", entry=0x100, steps=100, quantum=1)
                 self.assertTrue(first["last_call"]["pending"])
-                for pending, elapsed in ((True, 1), (True, 1), (False, 0)):
+                for pending, elapsed in ((True, 1), (False, 1)):
                     before = session.engines["avr"].state["steps"]
                     result = session.probe("bc5", "call_resume", {"steps": 1})
                     self.assertEqual(result["last_call"]["pending"], pending)
@@ -355,12 +474,9 @@ class ProbeTests(unittest.TestCase):
                 self.assertTrue(second["last_call"]["pending"])
                 self.assertEqual(second["last_call"]["steps"], 2)
                 returned = session.probe("bc5", "call_resume", {"steps": 1})
-                self.assertTrue(returned["last_call"]["pending"])
+                self.assertTrue(returned["last_call"]["returned"])
+                self.assertEqual(returned["last_call"]["al"], 2)
                 self.assertEqual(returned["last_call"]["steps"], 3)
-                done = session.probe("bc5", "call_resume", {"steps": 1})
-                self.assertTrue(done["last_call"]["returned"])
-                self.assertEqual(done["last_call"]["al"], 2)
-                self.assertEqual(done["last_call"]["steps"], 3)
 
     def test_public_call_and_continuation_service_spi_without_exceeding_instruction_budget(self):
         for model in ("9555", "9575"):
