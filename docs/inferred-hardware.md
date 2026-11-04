@@ -15,6 +15,9 @@ with fabricated code or successful service responses.
   External samples and TWI peers are explicit test stimuli.
   Differential ADC timing follows CKADC2 phase; free-running restarts take 14
   ADC clocks and latch their input at 2.5 clocks.
+  Software requests wait for the next prescaled edge before latching their
+  channel and starting conversion clocks. Automatic triggers include three CPU
+  clocks of synchronization; free-running restarts have no software launch wait.
 - AVR program-memory tests can load the upgrade payload or a complete flash
   image: 16 KiB for the 9555, 128 KiB for the inferred Extreme profile. The
   source file is read-only. Program reads and fuse configuration are exposed

@@ -248,6 +248,47 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(states[3]["registers"][17:19], [0xAB, 2])
                 self.assertIn(states[4]["error"], ("BadChannel", "IntegerOutOfRange"))
 
+    def test_adc_software_requests_share_their_next_prescaled_sample_edge(self):
+        for model, size in (("9555", 0x4000), ("9575", 0x20000)):
+            for offset in (0, 3):
+                with self.subTest(model=model, offset=offset):
+                    # ADEN starts at cycle1; normal ADSC requests at420/423 share the next /16 edge.
+                    words = [0xEC04, 0x9300, 0x7A] + [0] * (416 + offset)
+                    words += [0xED04, 0x9300, 0x7A] + [0] * (23 - offset)
+                    words += [0] * 215 + [0x9140, 0x78, 0x9150, 0x79, 0xCFFF]
+                    firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                    states = exchange("avr", firmware, [
+                        {"op": "adc", "channel": 0, "value": 400}, {"op": "run", "steps": 443},
+                        {"op": "adc", "channel": 0, "value": 800}, {"op": "run", "steps": 217},
+                    ], model=model)
+                    self.assertEqual(states[2]["cycles"], 445)
+                    self.assertEqual(states[4]["cycles"], 664)
+                    self.assertIsNone(states[4]["halt"])
+                    self.assertEqual(states[4]["registers"][20:22], [0x20, 3])
+
+    def test_adc_auto_trigger_synchronizes_before_sampling(self):
+        for model, size, bit in (("9555", 0x4000, 4), ("9575", 0x20000, 1)):
+            with self.subTest(model=model):
+                words = []
+
+                def put(address, value):
+                    words.extend([0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, address])
+
+                put(0x7A, 0xC4)
+                words += [0] * 500
+                for address, value in ((0x7A, 0x94), (0x7B, 2), (0x7A, 0xA4), (0x69, 3)):
+                    put(address, value)
+                words += [0] * 253 + [0x9140, 0x78, 0x9150, 0x79, 0xCFFF]
+                firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                states = exchange("avr", firmware, [
+                    {"op": "adc", "channel": 0, "value": 400}, {"op": "run", "steps": 510},
+                    {"op": "pins", "port": 3, "value": bit}, {"op": "run", "steps": 33},
+                    {"op": "adc", "channel": 0, "value": 800}, {"op": "run", "steps": 222},
+                ], model=model)
+                self.assertEqual(states[4]["cycles"] - states[2]["cycles"], 33)
+                self.assertIsNone(states[6]["halt"])
+                self.assertEqual(states[6]["registers"][20:22], [0x20, 3])
+
     def test_sparc_irq_stimulus_is_validated_and_reset_deasserts_it(self):
         firmware = bytes(0x260760)
         states = exchange("trx", firmware, [
