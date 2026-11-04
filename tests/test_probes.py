@@ -71,8 +71,10 @@ class ProbeTests(unittest.TestCase):
             bc5, avr = images(model)
             data = bytearray(bc5.data)
             data[0x100:0x102] = b"\xe0\0"
+            receiver = [0] * 5000 + [0xE52A, 0xCFFF]  # r18=0x5A after more than one board quantum
             firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
-                        parse_firmware(b"\xff\xcf".ljust(len(avr.data), b"\xff"), "avr.bin", "avr", model=model)]
+                        parse_firmware(b"".join(word.to_bytes(2, "little") for word in receiver).ljust(
+                            0x4000 if model == "9555" else 0x20000, b"\xff"), "avr.bin", "avr", model=model)]
             for image, size in (("trx", 0x260760), ("ptt", 0xA7BF8)):
                 firmware.append(parse_firmware(b"\x10\x80\0\0\x01\0\0\0".ljust(size, b"\xff"),
                                                image + ".bin", image, model=model))
@@ -82,13 +84,40 @@ class ProbeTests(unittest.TestCase):
                     stopped = primary.request("call", entry=0x100, steps=1)
                     self.assertEqual(stopped["halt"], "probe-did-not-return")
                     before = {image: worker.state["steps"] for image, worker in session.engines.items()}
-                    session.control("step", 100)
+                    session.control("step", 9000)
                     self.assertEqual(primary.state["steps"], before["bc5"])
                     self.assertEqual(primary.state["halt"], stopped["halt"])
-                    self.assertEqual(session.engines["avr"].state["steps"] - before["avr"], 100)
+                    self.assertEqual(session.engines["avr"].state["steps"] - before["avr"], 9000)
+                    self.assertEqual(session.engines["avr"].state["registers"][18], 0x5A)
                     for image in ("trx", "ptt"):
                         self.assertEqual(session.engines[image].state["steps"] - before[image],
-                                         100 if modem in ("none", image) else 0)
+                                         9000 if modem in ("none", image) else 0)
+
+    def test_ordinary_steps_stop_on_new_halts_even_after_an_existing_halt_or_reset(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            for scenario in ("live", "bc5_halted", "avr_reset"):
+                data = bytearray(bc5.data)
+                data[0x100:0x102] = b"\xe0\0"
+                if scenario == "avr_reset":
+                    words = []
+                    for address, value in ((0x61, 0x8000), (0x62, 0), (0x62, 0x8000)):
+                        words += operand(0x14, value) + operand(0x25, address)
+                    words.append(0x00E0)
+                    data[:len(words) * 2] = b"".join(word.to_bytes(2, "little") for word in words)
+                firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
+                            parse_firmware(b"\xff\xff".ljust(len(avr.data), b"\xff"), "avr.bin", "avr", model=model)]
+                with self.subTest(model=model, scenario=scenario), Session(EXECUTABLE, firmware) as session:
+                    primary, auxiliary = session.engines["bc5"], session.engines["avr"]
+                    if scenario == "bc5_halted":
+                        primary.request("call", entry=0x100, steps=1)
+                    elif scenario == "avr_reset":
+                        self.assertIsNotNone(auxiliary.request("run", steps=1)["halt"])
+                    before = primary.state["steps"]
+                    session.control("step", 9000)
+                    self.assertIsNotNone(auxiliary.state["halt"])
+                    self.assertEqual(primary.state["steps"] - before, 0 if scenario == "bc5_halted" else 4096)
+                    self.assertEqual(session.spi_link.resets, int(scenario == "avr_reset"))
 
     def test_spi_bytes_are_consumed_between_clocks_on_every_board_execution_path(self):
         for model in ("9555", "9575"):

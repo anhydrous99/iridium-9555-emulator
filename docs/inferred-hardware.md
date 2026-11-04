@@ -83,7 +83,9 @@ The board connection remains an inference from those two firmware contracts.
 
 The host runs in 4096-instruction quanta and transfers completed bytes in order.
 Each coupled quantum runs BC5 first and applies reset before selecting auxiliary
-processors. New traffic generated after a released reset remains valid; queued
+processors. Explicit steps keep halted cores paused and advance surviving cores
+for the requested budget; a new halt ends the coupled request.
+New traffic generated after a released reset remains valid; queued
 pre-reset traffic and traffic received during held reset are discarded.
 Backpressure retains bytes until the receiving queue can accept them. Capture
 loss or an excessive backlog stops the experiment explicitly. This clock ratio

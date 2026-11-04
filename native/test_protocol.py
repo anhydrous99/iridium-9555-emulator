@@ -289,6 +289,38 @@ class ProtocolTests(unittest.TestCase):
                 self.assertIsNone(states[6]["halt"])
                 self.assertEqual(states[6]["registers"][20:22], [0x20, 3])
 
+    def test_comparator_adc_trigger_keeps_all_synchronization_clocks(self):
+        for model, size in (("9555", 0x4000), ("9575", 0x20000)):
+            for first in (False, True):
+                for delta in (-1, 0, 1):
+                    with self.subTest(model=model, first=first, delta=delta):
+                        words = []
+
+                        def put(address, value):
+                            words.extend([0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, address])
+
+                        if not first:
+                            put(0x7A, 0xC4)
+                            words += [0] * 500
+                        for address, value in ((0x7B, 1), (0x50, 3), (0x7A, 0xB4)):
+                            put(address, value)
+                        words += [0] * 600 + [0x9140, 0x78, 0x9150, 0x79, 0xCFFF]
+                        sample = 2 + 3 + (216 if first else 32)
+                        change = sample - 1 + delta
+                        firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                        states = exchange("avr", firmware, [
+                            {"op": "adc", "channel": 0, "value": 400},
+                            {"op": "run", "steps": 6 if first else 508},
+                            {"op": "comparator", "positive": 800, "negative": 100},
+                            {"op": "run", "steps": change},
+                            {"op": "adc", "channel": 0, "value": 800},
+                            {"op": "run", "steps": 600 - change + 2},
+                        ], model=model)
+                        self.assertEqual(states[4]["cycles"] - states[2]["cycles"], change)
+                        self.assertIsNone(states[6]["halt"])
+                        value = states[6]["registers"][20] | states[6]["registers"][21] << 8
+                        self.assertEqual(value, 800 if change < sample else 400)
+
     def test_sparc_irq_stimulus_is_validated_and_reset_deasserts_it(self):
         firmware = bytes(0x260760)
         states = exchange("trx", firmware, [

@@ -1710,6 +1710,8 @@ pub const Devices = struct {
             }
         }
         const io = &d.st.io;
+        // A comparator trigger created in this clock starts aging in the next one.
+        const adc_busy_before = d.st.adc_busy;
         d.st.cycles += cycles;
         if (d.ioRunning() and d.st.ac_delay != 0) {
             d.st.ac_delay -|= @intCast(@min(cycles, 2));
@@ -1742,7 +1744,7 @@ pub const Devices = struct {
         // before the timers: a conversion they trigger in this tick counts from the next one
         if (d.adcRunning() and io[ADCSRA] & 0x80 != 0 and io[PRR] & PRADC == 0)
             d.st.adc_prescaler +%= @truncate(cycles);
-        if (d.adcRunning() and d.st.adc_busy > 0 and io[PRR] & PRADC == 0) {
+        if (d.adcRunning() and adc_busy_before > 0 and io[PRR] & PRADC == 0) {
             if (d.st.adc_launch == .software) {
                 if (cycles != 0 and d.st.adc_prescaler % d.adcDivisor() == 0) d.adcBegin(false);
             } else if (d.st.adc_launch == .trigger) {
@@ -3396,6 +3398,35 @@ test "ADC auto triggers synchronize for three CPU clocks before conversion clock
         d.tick(1);
         try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x10);
         try testing.expectEqual(@as(u16, 800), @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8);
+    };
+}
+
+test "comparator ADC triggers retain all synchronization clocks at sample and completion boundaries" {
+    for ([_]bool{ false, true }) |mega| for ([_]bool{ false, true }) |first| for ([_]u8{ 0, 2, 4, 7 }) |prescale| {
+        const divisor = ([8]u32{ 2, 2, 4, 8, 16, 32, 64, 128 })[prescale];
+        const sample = 2 + 3 + (if (first) 27 * divisor / 2 else 2 * divisor);
+        const complete = 2 + 3 + (if (first) 25 * divisor else 27 * divisor / 2);
+        for ([_]u32{ sample - 2, sample - 1, sample }) |change| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            d.setAnalog(0, 400);
+            if (!first) {
+                d.write(ADCSRA, 0xC0 | prescale);
+                d.tick(26 * divisor);
+            }
+            d.write(ADCSRB, 1);
+            d.write(ACSR, 3);
+            d.write(ADCSRA, 0xB0 | prescale);
+            d.setComparatorInputs(800, 100);
+            d.tick(change);
+            d.setAnalog(0, 800);
+            d.tick(complete - change - 1);
+            try testing.expectEqual(@as(u8, 0), d.read(ADCSRA) & 0x10);
+            d.tick(1);
+            try testing.expectEqual(@as(u8, 0x10), d.read(ADCSRA) & 0x10);
+            const value = @as(u16, d.read(ADCL)) | @as(u16, d.read(ADCH)) << 8;
+            try testing.expectEqual(@as(u16, if (change < sample) 800 else 400), value);
+        }
     };
 }
 

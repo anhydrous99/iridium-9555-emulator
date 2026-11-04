@@ -169,10 +169,8 @@ class Session:
         while remaining:
             quantum = self._board_quantum(remaining)
             amount = min(remaining, quantum)
-            self._step_processors(amount)
-            if (self.spi_link or self.modem_link) and any(
-                    worker.state.get("halt") not in (None, "steps", "running", "ready")
-                    for worker in self._active_processors()):
+            halted = self._step_processors(amount)
+            if (self.spi_link or self.modem_link) and halted:
                 self.running = False
                 break
             remaining -= amount
@@ -237,12 +235,13 @@ class Session:
         if self.modem_link:
             self.modem_link.exchange(avr_reset=avr_reset)
 
-    def _step_processors(self, steps: int) -> None:
+    def _step_processors(self, steps: int) -> bool:
         primary = self.engines.get("bc5") if self.spi_link else None
+        newly_halted = False
         if primary:
             before = primary.state["steps"]
             halted = primary.state.get("halt") not in (None, "steps", "running", "ready")
-            self._step_processor(primary, steps)
+            newly_halted = self._step_processor(primary, steps)
             if not halted:
                 steps = primary.state["steps"] - before
             self._exchange_links(acknowledge_spi=False)
@@ -251,18 +250,21 @@ class Session:
             self._clock_reset(quantum)
             for worker in self._active_processors():
                 if worker is not primary:
-                    self._step_processor(worker, quantum)
+                    newly_halted = self._step_processor(worker, quantum) or newly_halted
             self._exchange_links()
             steps -= quantum
+        return newly_halted
 
     def _step_processor(self, worker, steps):
         previous = worker.state.get("halt")
         if previous not in (None, "steps", "running", "ready"):
-            return
+            return False
         result = self._request(worker, "run", steps=steps)
         halt = result.get("halt")
         if halt not in (None, "steps", "running", "ready") and halt != previous:
             self.log("cpu", f"{result.get('image')}: {halt} at {result.get('pc')}")
+            return True
+        return False
 
     def control(self, action: str, steps: int = 10000) -> dict:
         if type(steps) is not int or not 1 <= steps <= 10000000:
