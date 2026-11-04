@@ -20,7 +20,9 @@ with fabricated code or successful service responses.
   clocks of synchronization; free-running restarts have no software launch wait.
   On the 9555, Timer2 output OC2B shares PD6 with Timer1 capture. Its synchronous
   output edges and capture-filter samples advance in CPU clock order, so capture
-  timestamps do not depend on instruction length.
+  timestamps do not depend on instruction length. The capture noise filter waits
+  four further CPU clocks after an input change, including changes published by
+  comparator completion or a timer output inside the current clock.
 - AVR program-memory tests can load the upgrade payload or a complete flash
   image: 16 KiB for the 9555, 128 KiB for the inferred Extreme profile. The
   source file is read-only. Program reads and fuse configuration are exposed

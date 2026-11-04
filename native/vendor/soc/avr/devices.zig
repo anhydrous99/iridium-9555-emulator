@@ -1719,6 +1719,8 @@ pub const Devices = struct {
         const io = &d.st.io;
         // A comparator trigger created in this clock starts aging in the next one.
         const adc_busy_before = d.st.adc_busy;
+        var capture_before: [4]struct { level: u8, cycles: u8 } = undefined;
+        for (d.st.timer, 0..) |timer, n| capture_before[n] = .{ .level = timer.capture_candidate, .cycles = timer.capture_cycles };
         d.st.cycles += cycles;
         if (d.ioRunning() and d.st.ac_delay != 0) {
             d.st.ac_delay -|= @intCast(@min(cycles, 2));
@@ -1783,8 +1785,11 @@ pub const Devices = struct {
         for (timer16_bases[0..d.timerCount()], 0..) |base, n| {
             if (d.ioRunning() and d.timerPowered(n) and io[base + 1] & 0x80 != 0) {
                 const t = &d.st.timer[n];
-                t.capture_cycles = @min(4, t.capture_cycles +| @as(u8, @intCast(@min(cycles, 4))));
-                if (t.capture_cycles >= 4) d.captureEdge(n, t.capture_candidate);
+                // Sample before comparator/timer outputs publish this clock's changes.
+                const sample = capture_before[n];
+                const age = @min(4, sample.cycles +| @as(u8, @intCast(@min(cycles, 4))));
+                if (t.capture_candidate == sample.level) t.capture_cycles = age;
+                if (age >= 4) d.captureEdge(n, sample.level);
             }
         }
         for (0..d.uartCount()) |k| {
@@ -3164,6 +3169,62 @@ test "timer output edges and capture filters preserve clock order across tick pa
             try testing.expectEqualDeep(reference.st, actual.st);
         }
     };
+}
+
+test "capture filters wait four clocks after external and internally published edges" {
+    for ([_]bool{ false, true }) |mega| for (0..3) |source| for ([_]u32{ 1, 2, 3, 4 }) |partition| {
+        if (mega and source == 2) continue; // OC2B and ICP1 share PD6 only on the 164P.
+        var raw: Devices = .{ .mega = mega };
+        raw.reset();
+        raw.write(TCCR1B, 0x41);
+        var filtered = raw;
+        filtered.write(TCCR1B, 0xC1);
+        for ([_]*Devices{ &raw, &filtered }) |d| switch (source) {
+            0 => d.setPinsIn(3, if (mega) 0x10 else 0x40),
+            1 => {
+                d.write(ACSR, 4);
+                d.setComparatorInputs(900, 100);
+                d.tick(2);
+            },
+            2 => {
+                d.write(0x2A, 0x40);
+                d.write(TCCR2A, 0x12);
+                d.write(OCR2A, 3); // The next edge coincides with the fourth filter sample.
+                d.write(OCR2B, 3);
+                d.write(TCCR2B, 1);
+                d.tick(4);
+            },
+            else => unreachable,
+        };
+        try testing.expectEqual(@as(u8, 0x20), raw.read(TIFR1) & 0x20);
+        try testing.expectEqual(@as(u8, 0), filtered.read(TIFR1) & 0x20);
+        var elapsed: u32 = 0;
+        while (elapsed < 3) {
+            const clocks = @min(3 - elapsed, partition);
+            filtered.tick(clocks);
+            elapsed += clocks;
+            try testing.expectEqual(@as(u8, 0), filtered.read(TIFR1) & 0x20);
+        }
+        filtered.tick(1);
+        try testing.expectEqual(@as(u8, 0x20), filtered.read(TIFR1) & 0x20);
+    };
+}
+
+test "capture filtering accepts four comparator samples before a simultaneous reversal" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(TCCR1B, 0xC1);
+        d.write(ACSR, 4);
+        d.setComparatorInputs(900, 100);
+        d.tick(4);
+        d.setComparatorInputs(100, 900);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 0), d.read(TIFR1) & 0x20);
+        d.tick(1);
+        try testing.expectEqual(@as(u8, 0), d.read(ACSR) & 0x20);
+        try testing.expectEqual(@as(u8, 0x20), d.read(TIFR1) & 0x20);
+    }
 }
 
 test "power reduction stops both capture paths on every available 16-bit timer" {
@@ -4625,7 +4686,9 @@ test "comparator capture timestamps and filter samples are invariant across cloc
             four.tick(4);
             try testing.expectEqual(@as(u8, if (noise) 0 else 0x20), four.read(TIFR1) & 0x20);
             four.tick(1);
-            try testing.expectEqual(@as(u16, if (noise) 15 else 11), four.st.timer[0].capture);
+            try testing.expectEqual(@as(u8, if (noise) 0 else 0x20), four.read(TIFR1) & 0x20);
+            four.tick(1);
+            try testing.expectEqual(@as(u16, if (noise) 16 else 11), four.st.timer[0].capture);
             for (0..3) |gate| {
                 var start = initial;
                 if (gate == 1) start.write(PRR, PRTIM1) else if (gate == 2) {

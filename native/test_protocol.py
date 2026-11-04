@@ -346,9 +346,43 @@ class ProtocolTests(unittest.TestCase):
                             self.assertIsNone(state["halt"])
                             self.assertEqual(state["cycles"], 34 if armed else 31)
                             captured = state["registers"][20] | state["registers"][21] << 8
-                            self.assertEqual(captured, (10 if noise else 7) if model == "9555" else 0)
+                            self.assertEqual(captured, (11 if noise else 7) if model == "9555" else 0)
                             captures.append(captured)
                     self.assertEqual(len(set(captures)), 1)
+
+    def test_capture_filter_keeps_four_clocks_after_each_edge_source(self):
+        for model, size in (("9555", 0x4000), ("9575", 0x20000)):
+            for source in ("pin", "comparator", "timer"):
+                if model == "9575" and source == "timer":
+                    continue  # OC2B and ICP1 share a pin only on the 9555.
+                for noise in (False, True):
+                    with self.subTest(model=model, source=source, noise=noise):
+                        words = []
+
+                        def put(address, value):
+                            words.extend([0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, address])
+
+                        put(0x81, 0xC1 if noise else 0x41)
+                        if source == "comparator":
+                            put(0x50, 4)
+                        elif source == "timer":
+                            for address, value in ((0x2A, 0x40), (0xB0, 0x10), (0xB4, 3), (0xB1, 1)):
+                                put(address, value)
+                        setup_steps = len(words) // 3 * 2
+                        # STS has already advanced Timer2 by two clocks; comparator output needs two.
+                        wait = 3 if source == "pin" else 5
+                        words += [0] * wait + [0xB326, 0xB336, 0xCFFF]  # IN r18/r19,TIFR1
+                        firmware = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                        commands = [{"op": "run", "steps": setup_steps}]
+                        if source == "pin":
+                            commands.append({"op": "pins", "port": 3, "value": 0x40 if model == "9555" else 0x10})
+                        elif source == "comparator":
+                            commands.append({"op": "comparator", "positive": 900, "negative": 100})
+                        commands.append({"op": "run", "steps": wait + 2})
+                        state = exchange("avr", firmware, commands, model=model)[-1]
+                        self.assertIsNone(state["halt"])
+                        self.assertEqual(state["registers"][18] & 0x20, 0 if noise else 0x20)
+                        self.assertEqual(state["registers"][19] & 0x20, 0x20)
 
     def test_sparc_irq_stimulus_is_validated_and_reset_deasserts_it(self):
         firmware = bytes(0x260760)
