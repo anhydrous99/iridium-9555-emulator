@@ -13,6 +13,8 @@ with fabricated code or successful service responses.
   PWM/force-compare pin outputs, four USARTs on the Extreme, SPI, EEPROM,
   watchdog, ADC mux/differential/conversion behavior, analog comparator and TWI.
   External samples and TWI peers are explicit test stimuli.
+  TWI slave data and STOP inputs require the module clock; address matching
+  remains asynchronous during sleep. Rejected inputs preserve the transaction.
   Differential ADC timing follows CKADC2 phase; free-running restarts take 14
   ADC clocks and latch their input at 2.5 clocks.
   Software requests wait for the next prescaled edge before latching their

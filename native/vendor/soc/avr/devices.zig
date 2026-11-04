@@ -533,7 +533,7 @@ pub const Devices = struct {
     pub fn twiStop(d: *Devices) bool {
         const io = &d.st.io;
         const t = &d.st.twi;
-        if (t.slave == 0 or io[TWCR] & 0x84 != 4) return false;
+        if (!d.ioRunning() or io[PRR] & 0x80 != 0 or t.slave == 0 or io[TWCR] & 0x84 != 4) return false;
         t.slave = 0;
         d.twiStatus(0xA0);
         return true;
@@ -3875,6 +3875,29 @@ test "TWI no peer NACK, collision, clock gating, arbitration loss and bus errors
         try testing.expectEqual(@as(u8, 0), d.st.twi.master);
     }
     try testing.expect(!d.twiReply(.ack, 0)); // no in-flight byte
+}
+
+test "TWI STOP preserves an addressed slave while power reduction or sleep stops its clock" {
+    for ([_]bool{ false, true }) |mega| for ([_]bool{ false, true }) |sleep| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.write(TWAR, 0x50);
+        d.write(TWCR, 0x45);
+        try testing.expect(d.twiAddress(0x28, false));
+        d.write(TWCR, 0xC5);
+        if (sleep) {
+            d.write(SMCR, 5);
+            Devices.sysSleeping(&d, true);
+        } else d.write(PRR, 0x80);
+        const frozen = d.st;
+        try testing.expect(!d.twiStop());
+        try testing.expectEqualDeep(frozen, d.st);
+        try testing.expectEqual(@as(?u8, null), d.pending());
+        if (sleep) Devices.sysSleeping(&d, false) else d.write(PRR, 0);
+        try testing.expect(d.twiStop());
+        try testing.expectEqual(@as(u8, 0xA0), d.read(TWSR));
+        try testing.expectEqual(@as(?u8, if (mega) 39 else 26), d.pending());
+    };
 }
 
 test "TWI slave address masks, general call, clock stretching, data ACK and transmitted bytes" {

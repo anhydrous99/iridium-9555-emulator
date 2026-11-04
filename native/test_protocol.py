@@ -46,6 +46,37 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_twi_stop_rejects_a_power_reduced_slave_without_losing_its_transaction(self):
+        for model, size in (("9555", 0x4000), ("9575", 0x20000)):
+            for reduced in (False, True):
+                with self.subTest(model=model, reduced=reduced):
+                    words = []
+
+                    def put(address, value):
+                        words.extend([0xE000 | ((value & 0xF0) << 4) | (value & 15), 0x9300, address])
+
+                    for address, value in ((0xBA, 0x50), (0xBC, 0x45),
+                                           (0xBC, 0xC5), (0x64, 0x80 if reduced else 0)):
+                        put(address, value)
+                    words += [0x9110, 0xB9, 0x9120, 0xBC]
+                    put(0x64, 0)
+                    words += [0x9130, 0xB9, 0x9140, 0xBC, 0xCFFF]
+                    firmware = b"".join(w.to_bytes(2, "little") for w in words).ljust(size, b"\xff")
+                    states = exchange("avr", firmware, [
+                        {"op": "hardware", "strict": True}, {"op": "run", "steps": 4},
+                        {"op": "twi", "action": "address", "address": 0x28, "read": False},
+                        {"op": "run", "steps": 4}, {"op": "twi", "action": "stop"},
+                        {"op": "run", "steps": 2}, {"op": "run", "steps": 2},
+                        {"op": "twi", "action": "stop"}, {"op": "run", "steps": 2},
+                    ], model=model)
+                    self.assertTrue(states[3]["accepted"])
+                    self.assertEqual(states[5]["accepted"], not reduced)
+                    self.assertEqual(states[6]["registers"][17:19], [0xF8, 0x45] if reduced else [0xA0, 0xC5])
+                    self.assertEqual(states[8]["accepted"], reduced)
+                    self.assertEqual(states[9]["registers"][19:21], [0xA0, 0xC5])
+                    self.assertIsNone(states[9]["halt"])
+                    self.assertIsNone(states[9]["model_error"])
+
     def test_flash_page_programming_completes_across_external_reset(self):
         # On EXTRF, boot code parks before it can issue another SPM operation.
         words = (0x9110, 0x54, 0xFD11, 0xCFFF, 0xE0E0, 0xE0F1,
