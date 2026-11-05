@@ -44,10 +44,7 @@ class SharedSecurityChecks:
             return handset.wait_screen(screen, max_steps=budget, chunk_steps=1000000)
 
         def press(key):
-            self.assertTrue(handset.key(key, True)["delivered"])
-            handset.step(1000000)
-            self.assertTrue(handset.key(key, False)["delivered"])
-            return handset.step(10000000)
+            return handset.press(key, hold_steps=1000000, settle_steps=10000000)
 
         def boot_with_known_modem_alerts():
             handset.control("initialize_ui")

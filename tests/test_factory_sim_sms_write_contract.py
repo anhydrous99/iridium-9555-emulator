@@ -15,7 +15,7 @@ import re
 import tempfile
 import unittest
 
-from factory_handset import EXECUTABLE, factory_firmware
+from factory_handset import EXECUTABLE, factory_firmware, require_factory_host
 from iridium.engine import Engine
 from sim_message_card import MessageSIM
 
@@ -31,6 +31,7 @@ READBACK_PDU = "0001FF05912143F500000331D90C"
 
 class SharedSIMSMSWriteChecks:
     def run_sms_store(self, *, memory_failure):
+        require_factory_host()
         firmware = next(image for image in factory_firmware(
             self.model, self.firmware_directory, modem=True) if image.image == "trx")
         card = MessageSIM(sms_write_memory_failure=memory_failure)

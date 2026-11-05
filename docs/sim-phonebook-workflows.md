@@ -1,5 +1,11 @@
 # Factory SIM phonebook and serial ADN storage
 
+This note records pre-cleanup phase observations. Artifact paths are local-only
+files ignored by Git. See the
+[factory-suite instructions](factory-e2e.md#running-the-factory-suite)
+to collect a new run; that command does not recreate historical
+reconciliation directories.
+
 The original handset SIM phonebook is read-only. The Extreme manual's printed
 page 75 describes externally programmed SIM entries and distinguishes them
 from editable My Phonebook entries. Both pinned firmware resource packs and
@@ -70,10 +76,10 @@ and explicit Exit leaves Drafts empty. Separate direct SIM-to-SMS assertions
 appear below; email recipients, simultaneous recipients and delivery are excluded.
 
 Previous evidence is retained in
-[factory-sim-phonebook](../test-artifacts/factory-sim-phonebook/README.md), including
+factory-sim-phonebook (`test-artifacts/factory-sim-phonebook/README.md`), including
 raw reports, native LCD/card captures, source snapshots, original-code listings,
 excluded calibration and independent audits. Firmware, guest RAM, callbacks,
-queue consumers and native halts were not replaced or patched. The current
+queue consumers and native halts were not replaced or patched. The recorded
 workflow additions below retain those boundaries; no subscriber authentication,
 network call, SMS delivery or physical card behavior is established here.
 
@@ -124,14 +130,15 @@ changes only that footer expectation; its two complete final journeys pass.
 The successful calibration alone is not counted as a factory feature pass.
 
 The SIM workflow phase evidence is in
-[factory-sim-workflows](../test-artifacts/factory-sim-workflows/report.json).
+factory-sim-workflows (`test-artifacts/factory-sim-workflows/report.json`).
 It adds six HTTP cases to the previous 206 and no peripheral or pure fixture
 IDs. The 34 inherited peripheral outcomes remain 30 passes/four ADN-reinsertion
 failures, with ten newest pure card-fixture passes retained separately.
 Complete original reinsertion/delete/recovery, restricted entries/PIN2,
 subscriber authentication and RF/service delivery remain outside these results.
 
-The current aggregate is [factory-storage-settings-gps](../test-artifacts/factory-storage-settings-gps/report.json).
+The pre-cleanup aggregate at commit `2023be0` is retained locally as
+`test-artifacts/factory-storage-settings-gps/report.json`.
 Its additional local-contact/recipient assertions are described in
 [contact boundaries and persistence](contact-boundaries-persistence.md); they add
 no peripheral or pure fixture IDs and preserve all earlier ordinary failures.

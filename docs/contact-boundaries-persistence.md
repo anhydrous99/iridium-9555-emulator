@@ -1,5 +1,11 @@
 # Contact and recipient boundary journeys
 
+This note records pre-cleanup phase observations. Artifact paths are local-only
+files ignored by Git. See the
+[factory-suite instructions](factory-e2e.md#running-the-factory-suite)
+to collect a new run; that command does not recreate historical
+reconciliation directories.
+
 These tests use the hash-pinned HT25003 and HL25003 factory images and the
 unchanged native runtime. Each case starts fresh original BC5, AVR and TRX
 workers. Local UI observations do not establish network delivery or physical
@@ -89,9 +95,9 @@ Save/shutdown/startup/readback. The stable 9555 terminal `F898` chain contains
 allocation/backlog failure investigated in [long SMS allocation](sms-long-text-allocation.md),
 not a demonstrated contact-field capacity limit or a proved physical-firmware
 bug. Earlier f3 default failures remain preserved as genuine failure evidence;
-these final failures use the current frozen source and remain enabled.
+these recorded failures use that phase's frozen source and remain enabled.
 
-The [contact-phase reconciliation](../test-artifacts/factory-contact-coverage/report.json)
+The contact-phase reconciliation (`test-artifacts/factory-contact-coverage/report.json`)
 adds eight HTTP cases: four passes and four ordinary failures. It retains all
 212 earlier outcomes unchanged, producing 220 HTTP outcomes: 198 passes and
 22 failures, with no errors, skips or expected failures. The 34 older peripheral

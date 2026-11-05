@@ -14,9 +14,7 @@ import os
 from pathlib import Path
 import unittest
 
-from factory_handset import FactoryHandset, HOME_CAPTIONS
-from iridium.engine import Engine
-from test_factory_phonebook_capacity_e2e import OriginalASCII1
+from factory_modem import FactoryModemChecks
 from test_factory_phonebook_e2e import EMPTY_PHONEBOOK, ENTRY_ADDED
 from test_factory_phonebook_fields_e2e import (
     PhonebookFieldChecks as _Fields, NAME, NAME_KEYS, PHONES,
@@ -25,10 +23,6 @@ from test_factory_phonebook_fields_e2e import (
 from test_factory_phonebook_fields_persistence_e2e import SharedExtendedPersistenceChecks as _Extended
 from test_factory_persistence_e2e import SharedPersistenceChecks as _Persistence
 from test_factory_text_entry_e2e import TEXT_MULTI_TAP, TEXT_LANGUAGE_MENU
-from test_factory_security_e2e import (
-    FIRMWARE_IDENTITY_WARNING, IERCC_DISABLED, IERCC_NOT_CONFIGURED,
-    SOS_MESSAGE_RECIPIENT_WARNING, STARTUP_SIM_ERROR,
-)
 from test_factory_settings_e2e import (
     VOLUME_MENU, KEYPAD_TONE_MENU, KEYPAD_SINGLE_TONE, KEYPAD_NO_TONE,
 )
@@ -37,10 +31,9 @@ from test_factory_settings_e2e import (
 VALUES = (NAME, *PHONES, EMAIL_64)
 
 
-class MaximumFieldPersistenceChecks:
+class MaximumFieldPersistenceChecks(FactoryModemChecks):
     # Reuse helpers only; the prior modules' independent cases stay undiscovered.
     type_keys = _Fields.type_keys
-    expect = _Persistence.expect
     home = _Persistence.home
     field_pixels = _Fields.field_pixels
     counter = _Fields.counter
@@ -50,7 +43,6 @@ class MaximumFieldPersistenceChecks:
     shutdown_and_restart = _Persistence.shutdown_and_restart
 
     def setUp(self):
-        self.evidence = []
         self.accepted_inputs = []
         self.cursor_observations = []
         self.cursor_field = None
@@ -58,28 +50,11 @@ class MaximumFieldPersistenceChecks:
         self.single_tone_restored = False
         self.fast_no_tone_input = False
         self.language_from_volume = False
-        self.boots = 0
-        self.request_method = Engine.request
-        self.handset = FactoryHandset(self, self.model, self.firmware_directory, modem=True)
-        self.workers = {
-            image: {"pid": engine._process.pid,
-                    "executable_sha256": sha256(Path(f"/proc/{engine._process.pid}/exe").read_bytes()).hexdigest()}
-            for image, engine in self.handset.session.engines.items()
-        }
-        self.addCleanup(self.finish)
-        self.font = OriginalASCII1(self.handset.session.firmware["bc5"])
+        self.start_handset()
         self.assertEqual(self.font.message(("Entry added", "successfully"), divider=False), ENTRY_ADDED)
         for remaining in (0, 1):
             self.assertEqual(sha256(self.expected_counter(remaining)).hexdigest(), COUNTER[remaining])
         self.boot_with_modem_alerts()
-
-    def physical(self, key, *, hold=300000, released=100000):
-        self.assertTrue(self.handset.key(key, True)["delivered"])
-        try:
-            self.handset.step(hold)
-        finally:
-            self.assertTrue(self.handset.key(key, False)["delivered"])
-        return self.handset.step(released) if released else self.handset.assert_healthy()
 
     def keys(self, *keys, settle=1000000):
         for key in keys:
@@ -153,23 +128,9 @@ class MaximumFieldPersistenceChecks:
         self.assertEqual(self.field_pixels(state, field)[:14], before)
         self.snapshot(f"maximum-field-{field}-overflow-rejected", state)
 
-    def snapshot(self, label, state=None):
-        state = self.handset.state() if state is None else state
-        label = f"{len(self.evidence):03d}-{label}"
-        target = self.handset.save_artifacts(label, state)
-        self.evidence.append({"label": label, "artifact": str(target), "boot": self.boots,
-                              "steps": {cpu["image"]: cpu["steps"] for cpu in state["processors"]},
-                              "frame_sha256": sha256(bytes(state["lcd"]["pixels"])).hexdigest()})
-        print(f"{self.model}: {label} boot{self.boots} TRX "
-              f"{next(cpu['steps'] for cpu in state['processors'] if cpu['image'] == 'trx')}", flush=True)
-        return target
-
     def finish(self):
         try:
-            state = self.handset.state()
-            self.final_state = state
-            self.final_images = state["images"]
-            self.final_artifact = str(self.handset.save_artifacts("final", state))
+            state = self.save_final_state()
             if any(cpu.get("halt") for cpu in state["processors"]):
                 # Read-only terminal evidence can distinguish the known command
                 # backlog from a TRX reset; it never repairs or resumes a core.
@@ -190,57 +151,7 @@ class MaximumFieldPersistenceChecks:
                     self.terminal_diagnostics["original_F898_chain"] = chain
                 Path(self.final_artifact + ".diagnostics.json").write_text(json.dumps(self.terminal_diagnostics, indent=2) + "\n")
         finally:
-            server_thread = self.handset.thread
-            self.handset.close()
-            self.http_server_thread_closed = server_thread is not None and not server_thread.is_alive()
-            self.engine_request_method_unchanged = Engine.request is self.request_method
-            self.worker_closure = {image: not Path(f"/proc/{worker['pid']}").exists()
-                                   for image, worker in self.workers.items()}
-            self.assertTrue(all(self.worker_closure.values()))
-            self.assertTrue(self.http_server_thread_closed)
-            self.assertTrue(self.engine_request_method_unchanged)
-
-    def boot_with_modem_alerts(self):
-        handset = self.handset
-        if self.boots:
-            state = handset.state()
-            self.assertEqual(next(cpu for cpu in state["processors"] if cpu["image"] == "bc5")["power_state"], 8)
-            self.assertFalse(state["ui_initialized"])
-            self.snapshot("completed-shutdown-before-original-warm-startup", state)
-        handset.control("initialize_ui")
-        handset.control("pause")
-        alerts = {STARTUP_SIM_ERROR: "absent-sim", FIRMWARE_IDENTITY_WARNING: "firmware-identity"}
-        required = {"absent-sim"}
-        if self.model == "9575":
-            alerts.update({IERCC_NOT_CONFIGURED: "iercc-not-configured", IERCC_DISABLED: "iercc-disabled",
-                           SOS_MESSAGE_RECIPIENT_WARNING: "sos-message-recipient"})
-            required = {"iercc-not-configured", "iercc-disabled", "sos-message-recipient"}
-        seen = set()
-        for elapsed in range(0, 200000001, 1000000):
-            state = handset.assert_healthy(require_lcd=False)
-            body = handset.screen_hash(state=state)
-            if body in alerts:
-                label = alerts[body]
-                self.assertNotIn(label, seen, "Original startup repeated an alert")
-                seen.add(label)
-                self.snapshot("startup-" + label, state)
-                self.assertTrue(handset.key("soft_right", True)["delivered"])
-                handset.step(500000)
-                self.assertTrue(handset.key("soft_right", False)["delivered"])
-                handset.step(500000)
-            elif required <= seen and handset.screen_hash(113, 128, state) == HOME_CAPTIONS:
-                self.assertEqual({cpu["image"] for cpu in state["processors"]}, {"bc5", "avr", "trx"})
-                self.assertTrue(state["processor_link"]["connected"])
-                self.assertEqual(state["keys"], [])
-                self.assertEqual({image: engine._process.pid for image, engine in handset.session.engines.items()},
-                                 {image: worker["pid"] for image, worker in self.workers.items()})
-                self.boots += 1
-                self.snapshot(f"original-boot-{self.boots}-home", state)
-                return
-            else:
-                handset.step(1000000)
-        self.snapshot("unknown-startup-screen")
-        self.fail("Original modem startup did not reach Home after recognized alerts")
+            self.close_handset()
 
     def test_all_six_maximum_fields_survive_completed_shutdown_and_original_warm_startup(self):
         self.maximum_fields_journey()

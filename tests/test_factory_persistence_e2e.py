@@ -47,10 +47,7 @@ class SharedPersistenceChecks:
                 self.assertNotIn(label, seen, "Modem startup repeated a recognized alert")
                 seen.add(label)
                 handset.save_artifacts(f"startup-{label}", state)
-                self.assertTrue(handset.key("soft_right", True)["delivered"])
-                handset.step(1000000)
-                self.assertTrue(handset.key("soft_right", False)["delivered"])
-                handset.step(10000000)
+                handset.press("soft_right", hold_steps=1000000, settle_steps=10000000)
                 elapsed += 11300000
             elif required <= seen and handset.screen_hash(113, 128, state) == HOME_CAPTIONS:
                 self.assertEqual({cpu["image"] for cpu in state["processors"]}, {"bc5", "avr", "trx"})

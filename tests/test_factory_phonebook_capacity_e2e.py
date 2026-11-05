@@ -103,9 +103,7 @@ class SharedPhonebookCapacityChecks:
             self.handset.press(key)
 
     def submit(self):
-        self.assertTrue(self.handset.key("soft_left", True)["delivered"])
-        self.handset.step(1000000)
-        self.assertTrue(self.handset.key("soft_left", False)["delivered"])
+        self.handset.press("soft_left", hold_steps=1000000, settle_steps=0)
 
     def expect(self, digest, first=16, last=113):
         return self.handset.wait_screen(digest, first=first, last=last, max_steps=20000000)

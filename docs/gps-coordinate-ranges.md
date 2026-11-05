@@ -1,5 +1,11 @@
 # GPS receiver coordinate-range guards
 
+This note records pre-cleanup phase observations. Artifact paths are local-only
+files ignored by Git. See the
+[factory-suite instructions](factory-e2e.md#running-the-factory-suite)
+to collect a new run; that command does not recreate historical
+reconciliation directories.
+
 Four [receiver-input tests](../tests/test_factory_gps_range_e2e.py) require an
 impossible latitude or longitude to leave the last valid fix intact. All four
 currently fail on HL25003: the original AVR publishes the supplied invalid
@@ -42,7 +48,8 @@ against 14,296 listed bytes of the pinned original AVR image; the relevant
 excerpts and source proof are preserved with the diagnostic package. No
 firmware image, guest cache, parser callback or display pixel was patched.
 
-The [phase reconciliation](../test-artifacts/factory-storage-settings-gps/report.json)
+The recorded pre-cleanup phase reconciliation
+(`test-artifacts/factory-storage-settings-gps/report.json`)
 preserves the four ordinary failures separately from
 harness errors, skips and the earlier GPS validity/altitude failures. Clock
 synchronization, fix age, RF loss/reacquisition and other invalid input classes

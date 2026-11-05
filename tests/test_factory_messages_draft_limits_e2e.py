@@ -164,11 +164,7 @@ class MessagesDraftLimitChecks:
         # Distinct physical cadence: a fixed400k total down interval followed
         # by release, then wait for the independently visible accepted count.
         # No accepted key is replayed; slow drawing can consume up to4M steps.
-        self.assertTrue(self.handset.key(key, True)["delivered"])
-        try:
-            self.handset.step(250000)
-        finally:
-            self.assertTrue(self.handset.key(key, False)["delivered"])
+        self.handset.press(key, hold_steps=250000, settle_steps=0)
         waited = 0
         while True:
             state = self.healthy()

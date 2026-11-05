@@ -6,6 +6,13 @@ specific journeys it asserts. It does **not** establish that every handset
 feature works, that the emulator matches physical hardware, or that a service
 request reached an Iridium network.
 
+The 236-case aggregate records the baseline at commit `2023be0`, before the
+shared-fixture cleanup. Its historical outcomes do not establish a new run of
+the changed suite; targeted cleanup validation is recorded separately below.
+Artifact paths are local-only files ignored by Git. The
+[running instructions](#running-the-factory-suite) collect a new invocation,
+not the historical reconciliation directories listed here.
+
 The suite exposed and fixed reversed Call/End labels on both models and a
 9575 restart that entered SOS mode. The idle board fixture had held active-low
 PK0 SOS asserted. Power's PJ3 change triggered the original GPIO poll, which
@@ -39,7 +46,7 @@ locking, PIN form validation, real-modem Phone Lock, factory model uploads,
 receiver fixes, voicemail configuration and Reset to Defaults.
 Each journey starts fresh workers and executes its own boot.
 
-The current aggregate has **236 HTTP cases: 210 passed, 26 failed,
+The recorded pre-cleanup aggregate has **236 HTTP cases: 210 passed, 26 failed,
 0 errors and 0 skips**. Sixteen new cases cover stored-SIM Inbox actions,
 selected preferences through completed shutdown and original warm startup,
 every local Single/Repetitive Alert minute choice, and GPS geographic-range
@@ -144,9 +151,11 @@ unavailable.
 The preceding snapshot has **144 execution/test/fixture files**, aggregate SHA256
 `0bef3606bf97b6cd2a25200160d6c42c0e99b19872e13abd50c7cf0cbcd032f4`. All 141 preceding sources
 and native `38fb483a…` remain unchanged; only three new HTTP modules were added.
-The current snapshot has **148 execution/test/fixture files**, aggregate SHA256
+The pre-cleanup snapshot had **148 execution/test/fixture files**, aggregate SHA256
 `6614fd70eb8ce8120ac1e85dccdd183f2a4bdf9d27044ea9aa5cad6736229b9e`. All 144 earlier files and
-the native executable remain unchanged; four new HTTP modules provide this phase.
+the native executable were unchanged during that phase; four new HTTP modules
+provided its added cases. This is the baseline source identity, not the
+identity of the subsequent fixture cleanup.
 
 The full 157-case report, per-case JSON/logs/screens, source snapshot and
 integrity audit remain in `test-artifacts/factory-local-completion/`. Its
@@ -175,7 +184,7 @@ component outcomes and diagnostic archives are in
 `test-artifacts/factory-contact-coverage/`. No new peripheral or pure fixture
 cases are added; all 34 peripheral outcomes and the ten newest pure checks
 remain inherited evidence.
-The current source snapshot, copied 220-case baseline, sixteen new HTTP
+The pre-cleanup source snapshot, copied 220-case baseline, sixteen new HTTP
 component outcomes and five diagnostic archives are in
 `test-artifacts/factory-storage-settings-gps/`. No new peripheral or pure fixture
 IDs are added.
@@ -183,11 +192,12 @@ The five preceding targeted HTTP reports and eight preceding
 SIM file/storage contracts remain in `test-artifacts/factory-storage-expansion/`.
 Original firmware binaries are excluded from the archives.
 
-The identical current report is published at
+Copies of that recorded baseline report are retained locally at
 `test-artifacts/factory-current-source/report.json` and
 `test-artifacts/factory-e2e/report.json`; its `evidence_directory` points to
-`test-artifacts/factory-storage-settings-gps/`. `./test-factory` discovers all 236
-HTTP cases and executes them serially. There are **34 separate peripheral case
+`test-artifacts/factory-storage-settings-gps/`. Those copies are historical
+evidence, not validation of later source changes. `./test-factory` discovers
+the HTTP cases and executes them serially. There are **34 recorded peripheral case
 IDs: 30 passed and 4 failed**. The thirty passing GPS/DSP/SIM contracts are
 unchanged: the earlier ten, four SIM file/cache/error cases and four
 SIM storage/service-gating cases, four empty/populated ADN consumer cases,
@@ -199,15 +209,50 @@ ordinary failures; fresh reinserted readback, deletion and recovery remain
 unreached. They are not four additional peripheral passes. The preceding pure
 card-fixture checks, including the ten ADN-fixture checks, remain passing; fixture
 checks are not handset feature passes. See [SIM phonebook workflows](sim-phonebook-workflows.md).
-The firmware-free test script passes on the 148-source snapshot: Python discovery runs 480 cases
+The firmware-free test script passed on that 148-source snapshot: Python discovery ran 480 cases
 with 287 explicit fixture-dependent skips and 193 non-skipped cases. The
 preceding 138-source run passed 450 Python cases with 257 fixture skips and
-193 non-skipped cases. Current UI checks pass 25 cases. Native protocol discovery runs 59 cases:
-41 pass and 18 require omitted fixtures. The sole hardware case is skipped,
-so no hardware test executes in this check. Fixture skips are not successful
+193 non-skipped cases. UI checks passed 25 cases. Native protocol discovery ran 59 cases:
+41 passed and 18 required omitted fixtures. The sole hardware case was skipped,
+so no hardware test executed in that check. Fixture skips are not successful
 factory coverage.
 
+## Shared-fixture cleanup validation
+
+The review fixes add an early Linux/procfs preflight, separate the shared
+three-core lifecycle from maximum-contact setup, centralize key contacts with
+explicit hold/release budgets and guaranteed release, and reuse the validated
+original-language resource decoder. Existing scenario assertions and physical
+instruction budgets are retained.
+
+On 2026-11-05, `./test` passed: 490 Python cases (203 executed and 287 explicit
+fixture skips), 25 UI cases and 41 native protocol cases (18 further fixture
+skips). The sole hardware case was skipped. The ten added firmware-free checks
+cover unsupported hosts, unavailable procfs, early rejection and report
+invalidation, key cadence, release after failure and invalid budgets.
+
+Separate targeted factory invocations completed **22 HTTP cases: 15 passed,
+7 ordinary failures, 0 errors and 0 skips**, plus one passing original SIM
+storage contract. All four settings-persistence and four alert-choice cases
+passed, as did both extended-contact persistence, both Inbox read/reply/forward/
+cancel, both main-menu journeys and the 9555 required-name contact case.
+The seven failures retain their historical IDs: four maximum-field cases,
+9555 Phone Lock, 9555 rapid long-draft entry and the 9575 north-pole range guard.
+Their BC5 panic, TRX reset and invalid-coordinate observations remain enabled.
+
+This is a targeted rerun, rather than a new execution of all 236 HTTP cases or
+34 peripheral contracts. Execution source hashes stayed unchanged during the
+runs and the native executable remained `38fb483a…`. Recorded worker, HTTP and
+SIM-peer closure checks passed. One interrupted 9575 contact attempt is retained
+as excluded harness history; its fresh complete rerun passed. Local-only reports,
+logs, captures and drivers are retained in `test-artifacts/factory-review-fixes/`.
+The historical aggregate and its baseline copies were not overwritten.
+
 ## Running the factory suite
+
+The optional factory-firmware suites require Linux with mounted, readable
+`/proc`, used to identify native workers and verify their lifecycle. Supply
+the original firmware locally; it is not included in this repository.
 
 ```sh
 IRIDIUM_TEST_FIRMWARE=/path/to/9555 \

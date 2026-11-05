@@ -1,5 +1,11 @@
 # Service Center Save changes an unchanged address type
 
+This note records pre-cleanup phase observations. Artifact paths are local-only
+files ignored by Git. See the
+[factory-suite instructions](factory-e2e.md#running-the-factory-suite)
+to collect a new run; that command does not recreate historical
+reconciliation directories.
+
 Both HT25003 (9555) and HL25003 (9575) change the stored service-center address
 type when the user opens Messages → Settings → Service Center and presses OK
 without editing the number. The synthetic card initially contains digits
@@ -47,7 +53,7 @@ external writable SMSP fixture responds to real UART traffic. No RF connection,
 authentication, SMS transmission or delivery is claimed.
 
 Evidence is preserved with the
-[200-outcome reconciliation](../test-artifacts/factory-sms-editor-settings/report.json).
+200-outcome reconciliation (`test-artifacts/factory-sms-editor-settings/report.json`).
 Its `http/` and `captures/` directories contain the two failing final reports and
 their final LCD/peer/card captures. The complete intermediate frames, wire audit,
 source snapshots and original-code excerpts are in

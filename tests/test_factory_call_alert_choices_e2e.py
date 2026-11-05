@@ -11,6 +11,7 @@ from pathlib import Path
 import unittest
 
 from factory_handset import FactoryHandset, HOME_CAPTIONS
+from factory_modem import FactoryModemChecks
 from iridium.assets import BC5Assets
 from iridium.engine import Engine
 from test_factory_call_settings_e2e import (
@@ -19,8 +20,6 @@ from test_factory_call_settings_e2e import (
 from test_factory_information_help_e2e import original_strings
 from test_factory_messages_local_e2e import MessagesLocalChecks as _Text
 from test_factory_phonebook_capacity_e2e import OriginalASCII1
-from test_factory_phonebook_fields_persistence_e2e import SharedExtendedPersistenceChecks as _HeldKeys
-from test_factory_phonebook_limits_persistence_e2e import MaximumFieldPersistenceChecks as _Startup
 
 
 LABELS = ("Off", "1 minute", "5 minutes", "10 minutes", "15 minutes", "30 minutes", "60 minutes")
@@ -32,14 +31,17 @@ class CallAlertChoiceChecks:
     # Reuse only helpers, without discovering the older independent tests.
     # Coupled-modem runs exposed unconsumed edge-only Save/Up contacts. Use
     # the established held contact while retaining the 2M budget for every key.
-    keys = _HeldKeys.keys
     expect = _Calls.expect
     open_history = _Calls.open_history
     open_meters = _Calls.open_meters
     expect_meter = _Calls.expect_meter
     text = _Text.text
     title = _Text.title
-    boot_with_modem_alerts = _Startup.boot_with_modem_alerts
+    boot_with_modem_alerts = FactoryModemChecks.boot_with_modem_alerts
+
+    def keys(self, *keys):
+        for key in keys:
+            self.handset.press(key, hold_steps=500000, settle_steps=1500000)
 
     def setUp(self):
         self.evidence = []

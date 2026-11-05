@@ -3,6 +3,7 @@
 from contextlib import redirect_stderr
 from hashlib import sha256
 import io
+import importlib
 import json
 import os
 from pathlib import Path
@@ -11,9 +12,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, mock_open, patch
 
-from factory_handset import FACTORY_HASHES, FIRMWARE_ENV, ROOT, factory_firmware
+from factory_handset import (
+    FACTORY_HASHES, FIRMWARE_ENV, ROOT, FactoryHandset, factory_firmware, require_factory_host,
+)
 from iridium.firmware import parse_firmware
 from iridium.profiles import PROFILES
 
@@ -33,6 +36,47 @@ class FactoryFixtureTests(unittest.TestCase):
             (directory / filename).write_bytes(data)
             hashes[image] = sha256(data).hexdigest()
         return directory, hashes
+
+    def test_factory_host_rejects_unsupported_system_before_starting_workers(self):
+        for platform in ("darwin", "win32"):
+            with self.subTest(platform=platform), patch("factory_handset.sys.platform", platform), \
+                    patch("factory_handset.Session") as session:
+                with self.assertRaisesRegex(ValueError, "require Linux.*readable /proc"):
+                    FactoryHandset(self, "9555", self.directory)
+                session.assert_not_called()
+
+    def test_factory_host_rejects_missing_or_unreadable_procfs(self):
+        for error in (FileNotFoundError("no procfs"), PermissionError("unreadable procfs")):
+            with self.subTest(error=type(error).__name__), patch("factory_handset.sys.platform", "linux"), \
+                    patch("factory_handset.Path.open", side_effect=error):
+                with self.assertRaisesRegex(ValueError, "require Linux.*readable /proc"):
+                    require_factory_host()
+
+    def test_factory_host_accepts_readable_linux_procfs(self):
+        opened = mock_open(read_data=b"x")
+        with patch("factory_handset.sys.platform", "linux"), patch("factory_handset.Path.open", opened):
+            require_factory_host()
+        opened.assert_called_once_with("rb")
+        opened().read.assert_called_once_with(1)
+
+    def test_procfs_contracts_reject_unsupported_host_before_loading_or_starting_workers(self):
+        cases = (
+            ("storage", "SharedSIMStorageChecks", "run_storage_card", {"sms_available": True}),
+            ("phonebook", "SharedSIMPhonebookChecks", "run_adn_card", {"populated": True}),
+            ("phonebook_write", "SharedSIMPhonebookWriteChecks", "run_phonebook", {"reject_edit": False}),
+            ("sms_write", "SharedSIMSMSWriteChecks", "run_sms_store", {"memory_failure": False}),
+            ("service_center", "SharedSIMServiceCenterChecks", "run_service_center", {"memory_failure": False}),
+        )
+        for name, checks, method, arguments in cases:
+            module = importlib.import_module(f"test_factory_sim_{name}_contract")
+            fixture = getattr(module, checks)()
+            with self.subTest(contract=name), patch("factory_handset.sys.platform", "darwin"), \
+                    patch.object(module, "factory_firmware") as firmware, \
+                    patch.object(module, "Engine") as engine:
+                with self.assertRaisesRegex(ValueError, "require Linux.*readable /proc"):
+                    getattr(fixture, method)(**arguments)
+                firmware.assert_not_called()
+                engine.assert_not_called()
 
     def test_factory_gate_rejects_modified_bytes_even_with_valid_model_and_size(self):
         for model in PROFILES:
@@ -122,6 +166,7 @@ class FactoryFixtureTests(unittest.TestCase):
             main = runpy.run_path(str(ROOT / "test-factory"))["main"]
         report.write_text('{"passed":true}')
         with patch.dict(os.environ, directories), patch.dict(FACTORY_HASHES, approved_hashes), \
+                patch.dict(main.__globals__, {"require_factory_host": lambda: None}), \
                 patch("subprocess.run", side_effect=OSError("build unavailable")), \
                 redirect_stderr(io.StringIO()):
             self.assertEqual(main(), 2)
@@ -156,6 +201,7 @@ class FactoryFixtureTests(unittest.TestCase):
         for suite, tests, skips, expected_failures, unexpected_successes in cases:
             with self.subTest(tests=tests, skips=skips, expected_failures=expected_failures), \
                     patch.dict(os.environ, directories), patch.dict(FACTORY_HASHES, approved_hashes), \
+                    patch.dict(main.__globals__, {"require_factory_host": lambda: None}), \
                     patch("subprocess.run") as build, \
                     patch.object(unittest.defaultTestLoader, "discover", return_value=suite), \
                     redirect_stderr(io.StringIO()):
@@ -178,6 +224,7 @@ class FactoryFixtureTests(unittest.TestCase):
             main = runpy.run_path(str(ROOT / "test-factory"))["main"]
         success = unittest.FunctionTestCase(lambda: None)
         with patch.dict(os.environ, directories), patch.dict(FACTORY_HASHES, approved_hashes), \
+                patch.dict(main.__globals__, {"require_factory_host": lambda: None}), \
                 patch("subprocess.run"), \
                 patch.object(unittest.defaultTestLoader, "discover", return_value=unittest.TestSuite([success])), \
                 redirect_stderr(io.StringIO()):
@@ -191,6 +238,91 @@ class FactoryFixtureTests(unittest.TestCase):
         for model, firmware in report["firmware"].items():
             self.assertEqual({image["image"]: image["payload_sha256"] for image in firmware},
                              approved_hashes[model])
+
+    def test_runner_host_failure_invalidates_report_before_build_or_discovery(self):
+        directory = self.directory / "artifacts"
+        directory.mkdir()
+        report = directory / "report.json"
+        report.write_text('{"passed":true}')
+        environment = {variable: "declared-factory-input" for variable in FIRMWARE_ENV.values()}
+        environment["IRIDIUM_E2E_ARTIFACTS"] = str(directory)
+        with patch.object(sys, "path", sys.path.copy()):
+            main = runpy.run_path(str(ROOT / "test-factory"))["main"]
+        fixture = Mock()
+        fixture.describe.return_value = {}
+        host = Mock(side_effect=ValueError("Factory-firmware tests require Linux with mounted, readable /proc"))
+        stderr = io.StringIO()
+        with patch.dict(os.environ, environment), \
+                patch.dict(main.__globals__, {"factory_firmware": lambda *a, **k: [fixture],
+                                              "require_factory_host": host}), \
+                patch("subprocess.run") as build, \
+                patch.object(unittest.defaultTestLoader, "discover") as discovery, \
+                redirect_stderr(stderr):
+            self.assertEqual(main(), 2)
+        self.assertIn("require Linux", stderr.getvalue())
+        host.assert_called_once()
+        build.assert_not_called()
+        discovery.assert_not_called()
+        self.assertFalse(report.exists())
+
+
+class FactoryKeyContactTests(unittest.TestCase):
+    def handset(self):
+        handset = Mock()
+        handset.test = self
+        handset.key.return_value = {"delivered": True}
+        handset.step.return_value = {"phase": "stepped"}
+        handset.state.return_value = {"phase": "released"}
+        return handset
+
+    def test_key_contacts_preserve_edge_held_and_zero_release_budgets(self):
+        cases = (
+            ({}, [("key", "1", True), ("key", "1", False), ("step", 2000000)]),
+            ({"hold_steps": 500000, "settle_steps": 1500000},
+             [("key", "1", True), ("step", 500000), ("key", "1", False), ("step", 1500000)]),
+            ({"hold_steps": 250000, "settle_steps": 0},
+             [("key", "1", True), ("step", 250000), ("key", "1", False), ("state",)]),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                handset = self.handset()
+                FactoryHandset.press(handset, "1", **arguments)
+                actual = [(call[0], *call[1]) for call in handset.mock_calls]
+                self.assertEqual(actual, expected)
+
+    def test_failed_hold_releases_contact_without_running_release_budget(self):
+        handset = self.handset()
+        handset.step.side_effect = RuntimeError("original processor halted")
+        with self.assertRaisesRegex(RuntimeError, "processor halted"):
+            FactoryHandset.press(handset, "2", hold_steps=500000, settle_steps=1500000)
+        self.assertEqual(handset.key.call_args_list,
+                         [call("2", True), call("2", False)])
+        handset.step.assert_called_once_with(500000)
+
+    def test_unconsumed_press_still_releases_client_ownership(self):
+        handset = self.handset()
+        handset.key.return_value = {"delivered": False}
+        with self.assertRaisesRegex(AssertionError, "press was not delivered"):
+            FactoryHandset.press(handset, "3", hold_steps=500000)
+        self.assertEqual(handset.key.call_count, 2)
+        self.assertEqual(handset.key.call_args, call("3", False))
+        handset.step.assert_not_called()
+
+    def test_rejected_release_fails_instead_of_running_more_instructions(self):
+        handset = self.handset()
+        handset.key.side_effect = [{"delivered": True}, {"delivered": False}]
+        with self.assertRaisesRegex(AssertionError, "release was not delivered"):
+            FactoryHandset.press(handset, "4")
+        handset.step.assert_not_called()
+
+    def test_invalid_key_budgets_fail_before_changing_contacts(self):
+        for arguments in ({"hold_steps": -1}, {"settle_steps": 10000001},
+                          {"hold_steps": True}, {"settle_steps": 0.5}):
+            with self.subTest(arguments=arguments):
+                handset = self.handset()
+                with self.assertRaisesRegex(ValueError, "Key budgets"):
+                    FactoryHandset.press(handset, "5", **arguments)
+                handset.key.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -12,13 +12,13 @@ import struct
 import unittest
 
 from factory_handset import FactoryHandset, HOME_CAPTIONS
+from factory_modem import FactoryModemChecks
 from gps_receiver_frames import GPSReceiverFixture, ubx
 from iridium.engine import Engine
 from test_factory_extreme_settings_e2e import GPS_UPDATE_MENU, ONE_TIME, REAL_TIME
 from test_factory_gps_e2e import GPS_PROMPT
 from test_factory_phonebook_capacity_e2e import OriginalASCII1
 import test_factory_gps_coordinate_limits_e2e as _coordinates
-import test_factory_phonebook_limits_persistence_e2e as _startup
 
 
 INITIAL = (377749000, -1224194000, 8)
@@ -56,7 +56,7 @@ class Factory9575GPSRangeE2ETests(unittest.TestCase):
     row = _coordinates.Factory9575GPSCoordinateLimitsE2ETests.row
     line = _coordinates.Factory9575GPSCoordinateLimitsE2ETests.line
     expected = _coordinates.Factory9575GPSCoordinateLimitsE2ETests.expected
-    boot_with_modem_alerts = _startup.MaximumFieldPersistenceChecks.boot_with_modem_alerts
+    boot_with_modem_alerts = FactoryModemChecks.boot_with_modem_alerts
 
     def setUp(self):
         self.evidence = []

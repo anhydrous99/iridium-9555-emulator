@@ -12,7 +12,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from factory_handset import EXECUTABLE, factory_firmware
+from factory_handset import EXECUTABLE, factory_firmware, require_factory_host
 from iridium.engine import Engine
 from sim_language_card import StorageSIM
 
@@ -37,6 +37,7 @@ NUMBER_INDEX = 0x400AA9FD + FIRST_SIM_INDEX * 3
 
 class SharedSIMPhonebookChecks:
     def run_adn_card(self, *, populated):
+        require_factory_host()
         firmware = next(image for image in factory_firmware(
             self.model, self.firmware_directory, modem=True) if image.image == "trx")
         card = StorageSIM()

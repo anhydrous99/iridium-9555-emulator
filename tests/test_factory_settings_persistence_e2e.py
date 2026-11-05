@@ -6,12 +6,12 @@ physical timeout timing, audio completion, RTC accuracy or network service.
 
 from hashlib import sha256
 import os
-import struct
 import unittest
 
 from factory_handset import HOME_CAPTIONS
 from iridium.assets import BC5Assets
-from test_factory_phonebook_limits_persistence_e2e import MaximumFieldPersistenceChecks as _Fixture
+from factory_modem import FactoryModemChecks
+from test_factory_information_help_e2e import original_strings
 from test_factory_persistence_e2e import SharedPersistenceChecks as _Power
 from test_factory_settings_e2e import (
     SETUP, VOLUME_MENU, KEYPAD_TONE_MENU, KEYPAD_SINGLE_TONE, KEYPAD_NO_TONE,
@@ -43,15 +43,7 @@ FRENCH_ALERTS = {
 }
 
 
-class SettingsPersistenceChecks:
-    # Alias only fixture/observation methods, never the older test methods.
-    setUp = _Fixture.setUp
-    finish = _Fixture.finish
-    snapshot = _Fixture.snapshot
-    keys = _Fixture.keys
-    physical = _Fixture.physical
-    expect = _Fixture.expect
-    expected_counter = _Fixture.expected_counter
+class SettingsPersistenceChecks(FactoryModemChecks):
     shutdown_and_restart = _Power.shutdown_and_restart
 
     def text(self, state, value, row, left=2, width=118, selected=False):
@@ -89,19 +81,7 @@ class SettingsPersistenceChecks:
         assets = BC5Assets(fw.data, fw.profile)
         language = assets.file_bytes(45 if self.model == "9575" else 43)
         self.language_resource_sha256 = sha256(language).hexdigest()
-        words = struct.unpack(">" + str(len(language) // 2) + "H", language)
-        self.strings = {}
-        pos = 0
-        while pos < len(words):
-            kind, locale, size = words[pos:pos + 3]
-            part = words[pos + 3:pos + 3 + size]
-            pos += 3 + size
-            if kind == 4 and locale in (0, 5):
-                count = part[0]
-                offsets, blob = part[1:1 + count], part[1 + count:]
-                self.strings[locale] = {0x1000 + i: "".join(map(chr, blob[o + 1:o + 1 + blob[o]]))
-                                        for i, o in enumerate(offsets)}
-        self.assertEqual(pos, len(words))
+        self.strings = {5: original_strings(fw, 5)}
         self.assertEqual(self.strings[5][0x105A], "Langue")
         self.assertEqual(self.strings[5][0x1062], "Saisie texte")
         self.assertEqual(self.strings[5][0x1134], "Sélect")

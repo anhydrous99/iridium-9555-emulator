@@ -1,5 +1,11 @@
 # Original modem SIM boundary
 
+This note records pre-cleanup phase observations. Artifact paths are local-only
+files ignored by Git. See the
+[factory-suite instructions](factory-e2e.md#running-the-factory-suite)
+to collect a new run; that command does not recreate historical
+reconciliation directories.
+
 The telephony model supplies separate external SIM inputs, firmware output
 pins and card-presence edge delivery. Factory contracts execute original TRX
 instructions from reset through real UART3 exchanges. On both models, finite
@@ -17,9 +23,10 @@ reset signature. These results do not establish general SIM provisioning,
 restricted-entry/PIN2 authentication or network service. GUI drafts are a
 separate local BC5 flash feature.
 
-The [current reconciliation](../test-artifacts/factory-storage-settings-gps/report.json)
-contains **236 HTTP outcomes: 210 passes and 26 ordinary failures**.
-The sixteen current HTTP additions include four passing stored-SIM Inbox
+The pre-cleanup reconciliation at commit `2023be0`, retained locally as
+`test-artifacts/factory-storage-settings-gps/report.json`, records
+**236 HTTP outcomes: 210 passes and 26 ordinary failures**.
+The sixteen HTTP additions in that phase include four passing stored-SIM Inbox
 journeys: full read/Reply/Forward cancellation and real-card Delete No/Yes.
 See [stored SIM messages](stored-sim-messages.md) for finite PDU/status boundaries.
 These cases preload an external card; they do not supply incoming RF messages,
@@ -31,8 +38,10 @@ historical evidence; no peripheral or pure fixture IDs are added now. The
 preceding 220-outcome/144-source contact phase remains unchanged in
 `test-artifacts/factory-contact-coverage/`. Its eight additions had four passes
 and four ordinary maximum-field failures. All 144 earlier execution files and
-native `38fb483a…` remain unchanged; the current 148-source aggregate is
+native `38fb483a…` were unchanged in that phase; its recorded 148-source aggregate is
 `6614fd70eb8ce8120ac1e85dccdd183f2a4bdf9d27044ea9aa5cad6736229b9e`.
+That source identity and those outcomes precede the shared-fixture cleanup;
+they do not claim a rerun of the changed sources.
 The [coverage ledger](factory-e2e.md) records the complete scope and checks.
 
 ## Pins and interrupt evidence
@@ -154,7 +163,7 @@ after actual reset release and active clock. The original stop is
 [test_factory_sim_file_contract.py](../tests/test_factory_sim_file_contract.py)
 has four passing test methods across both models: two data orders per model
 and one memory-error variant per model, using six fresh original workers in
-total. The [final log](../test-artifacts/factory-storage-expansion/checks/sim-file-contract.log)
+total. The final log (`test-artifacts/factory-storage-expansion/checks/sim-file-contract.log`)
 and six raw peripheral captures are retained with the aggregate evidence.
 [test_sim_language_card.py](../tests/test_sim_language_card.py) has nine
 firmware-free fixture checks for framing, retained suffixes, reset/clock
@@ -203,9 +212,9 @@ asserted together. All UART capture drops are zero. The verified reports record
 unchanged test/fixture hashes, unchanged 107 baseline source files, the live
 worker executable hash and closed workers. No AT command is used.
 
-The retained [9555 report](../test-artifacts/factory-storage-expansion/peripheral/storage-9555.json),
-[9575 report](../test-artifacts/factory-storage-expansion/peripheral/storage-9575.json)
-and [raw peripheral captures](../test-artifacts/factory-storage-expansion/peripheral/)
+The retained 9555 report (`test-artifacts/factory-storage-expansion/peripheral/storage-9555.json`),
+9575 report (`test-artifacts/factory-storage-expansion/peripheral/storage-9575.json`)
+and raw peripheral captures (`test-artifacts/factory-storage-expansion/peripheral/`)
 contain the final automated evidence. The verified logs, capture audit and
 provenance are also retained under
 `/tmp/iridium-sim-storage-contract-expansion/`. ADN geometry is declared in
@@ -256,14 +265,14 @@ from the four automated pass counts. The metadata/record consumer has no
 direct SST-bit guard; later caller or GUI availability policy remains
 unestablished. No ADN service-gating requirement or firmware defect is inferred.
 
-The final [9555 report](../test-artifacts/factory-sim-consumers/peripheral/adn-9555-report.json)
-and [9575 report](../test-artifacts/factory-sim-consumers/peripheral/adn-9575-report.json)
+The final 9555 report (`test-artifacts/factory-sim-consumers/peripheral/adn-9555-report.json`)
+and 9575 report (`test-artifacts/factory-sim-consumers/peripheral/adn-9575-report.json`)
 record all four outcomes. Their exact raw captures are:
 
 | Model | Empty-record capture | Populated-record capture |
 | --- | --- | --- |
-| 9555 | [Empty ADN](../test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9555SIMPhonebookContractTests.test_original_adn_metadata_and_two_empty_records_initialize_phonebook_consumer.json) | [Adg / +12345](../test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9555SIMPhonebookContractTests.test_original_populated_adn_record_updates_used_count_name_and_number_index.json) |
-| 9575 | [Empty ADN](../test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9575SIMPhonebookContractTests.test_original_adn_metadata_and_two_empty_records_initialize_phonebook_consumer.json) | [Adg / +12345](../test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9575SIMPhonebookContractTests.test_original_populated_adn_record_updates_used_count_name_and_number_index.json) |
+| 9555 | Empty ADN (`test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9555SIMPhonebookContractTests.test_original_adn_metadata_and_two_empty_records_initialize_phonebook_consumer.json`) | Adg / +12345 (`test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9555SIMPhonebookContractTests.test_original_populated_adn_record_updates_used_count_name_and_number_index.json`) |
+| 9575 | Empty ADN (`test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9575SIMPhonebookContractTests.test_original_adn_metadata_and_two_empty_records_initialize_phonebook_consumer.json`) | Adg / +12345 (`test-artifacts/factory-sim-consumers/peripheral/test_factory_sim_phonebook_contract.Factory9575SIMPhonebookContractTests.test_original_populated_adn_record_updates_used_count_name_and_number_index.json`) |
 
 Original C/listing excerpts, source snapshots, wire/capture audits and provenance
 remain under `/tmp/iridium-sim-adn-contract-expansion/`. Final source SHA256 is
@@ -340,7 +349,7 @@ SIM Adg is reopened and all external card data remains unchanged. Earlier Copy
 calibration required an extra Back footer even though the original success
 modal has a blank footer; that excluded checker error is not a feature failure.
 
-The current component reports, frozen sources, original-font/node audits and
+The SIM workflow component reports, frozen sources, original-font/node audits and
 excluded calibration join `test-artifacts/factory-sim-workflows/`. These are
 finite same-boot local workflows, not SIM programming, unrestricted contact
 encodings/capacity, authentication, calls, SMS transmission or delivery.
@@ -398,8 +407,8 @@ That bound did not establish a permanent GUI block or authentication diagnosis.
 It established no usable Messages screen, SMS composition/save, SIM-contact
 save or service completion. The raw diagnostic
 is archived with its executed driver, HTTP actions and original LCDs in
-[`sim-http-measured-runtime.tar.gz`](../test-artifacts/factory-storage-expansion/diagnostics/sim-http-measured-runtime.tar.gz).
-The [boundary summary](../test-artifacts/factory-storage-expansion/diagnostics/messages-boundary.md)
+sim-http-measured-runtime.tar.gz (`test-artifacts/factory-storage-expansion/diagnostics/sim-http-measured-runtime.tar.gz`).
+The boundary summary (`test-artifacts/factory-storage-expansion/diagnostics/messages-boundary.md`)
 records the instruction accounting and evidence limits. The working copy is
 `/tmp/iridium-sim-http-measured-runtime/`.
 Some frame names contain the main driver's instruction budget and exclude
@@ -474,13 +483,13 @@ not established preference-store failures. Their sources and outcomes remain
 separate diagnostic history.
 
 The final strict reports are
-[9555 expiry](../test-artifacts/factory-sim-consumers/http/messages-expiry-9555.json),
-[9575 expiry](../test-artifacts/factory-sim-consumers/http/messages-expiry-9575.json),
-[9555 delivery reports](../test-artifacts/factory-sim-consumers/http/messages-delivery-9555.json)
-and [9575 delivery reports](../test-artifacts/factory-sim-consumers/http/messages-delivery-9575.json).
+9555 expiry (`test-artifacts/factory-sim-consumers/http/messages-expiry-9555.json`),
+9575 expiry (`test-artifacts/factory-sim-consumers/http/messages-expiry-9575.json`),
+9555 delivery reports (`test-artifacts/factory-sim-consumers/http/messages-delivery-9555.json`)
+and 9575 delivery reports (`test-artifacts/factory-sim-consumers/http/messages-delivery-9575.json`).
 Complete captures, original-byte evidence and excluded calibration history
 are retained in the
-[Messages archive](../test-artifacts/factory-sim-consumers/diagnostics/messages-local-expansion.tar.gz).
+Messages archive (`test-artifacts/factory-sim-consumers/diagnostics/messages-local-expansion.tar.gz`).
 All 12 workers matched native `38fb483a…` and closed; all four external peers
 closed. The 113 prior execution/test/fixture files stayed unchanged.
 
@@ -572,19 +581,19 @@ BC5 healthy. They do not pause the modem/DSP, change key tones or bypass a
 queue consumer. Neither rapid nor patient cases reach the intended 201/1,000
 input, overflow, storage or complete saved-readback milestones. See
 [allocation evidence](sms-long-text-allocation.md)
-and the [extended SMS evidence](../test-artifacts/factory-sms-extended/README.md).
+and the extended SMS evidence (`test-artifacts/factory-sms-extended/README.md`).
 
 Earlier reports, source proof and captures are in
-[the SMS/drafts evidence directory](../test-artifacts/factory-sms-drafts/README.md).
+the SMS/drafts evidence directory (`test-artifacts/factory-sms-drafts/README.md`).
 Four old preference journeys passed again under the revised external-peer
 helper; those reruns replace earlier evidence rather than adding case IDs.
-The [preceding 200-outcome reconciliation](../test-artifacts/factory-sms-editor-settings/report.json)
+The preceding 200-outcome reconciliation (`test-artifacts/factory-sms-editor-settings/report.json`)
 retains the unchanged 186-case baseline and all fourteen new strict HTTP reports,
 source proof, actual worker hashes and closures. Its diagnostic archives retain
 the separate cadence investigations and excluded calibration history.
 
 The original finite write boundary was researched in the retained
-[write-contract investigation](../test-artifacts/factory-sim-consumers/diagnostics/sim-message-write-contract-next.tar.gz).
+write-contract investigation (`test-artifacts/factory-sim-consumers/diagnostics/sim-message-write-contract-next.tar.gz`).
 Original **modem CMGW** storage targets F202/`6F3C` with
 `A0 DC record 04 B0`. This differs from GUI **Save as draft**, which writes
 local BC5 flash without a SIM UPDATE RECORD.

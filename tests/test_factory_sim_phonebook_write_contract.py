@@ -14,7 +14,7 @@ import re
 import tempfile
 import unittest
 
-from factory_handset import EXECUTABLE, factory_firmware
+from factory_handset import EXECUTABLE, factory_firmware, require_factory_host
 from iridium.engine import Engine
 from sim_phonebook_card import EMPTY_ADN, PhonebookSIM
 from test_factory_sim_service_center_contract import _ServiceCenterWire
@@ -151,6 +151,7 @@ class _ADNWire(_ServiceCenterWire):
 
 class SharedSIMPhonebookWriteChecks:
     def run_phonebook(self, *, reject_edit):
+        require_factory_host()
         firmware = next(image for image in factory_firmware(self.model, self.firmware_directory, modem=True)
                         if image.image == "trx")
         sources = ("test_factory_sim_phonebook_write_contract.py", "sim_phonebook_card.py",

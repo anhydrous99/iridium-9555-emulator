@@ -194,7 +194,7 @@ unreached.
 The patient source remains SHA256
 `9859e9b68c3750a459d1481b10c30dbe47e08d3606c51e8dd8ba7ce0b78aee48`.
 There are zero errors, skips or expected failures. All twelve workers and four
-peer threads closed. These are four separate current-source invocations, not
+peer threads closed. These are four separate invocations of that recorded source, not
 one complete factory-suite run.
 
 ## Complementary allocator diagnostic

@@ -15,7 +15,7 @@ import re
 import tempfile
 import unittest
 
-from factory_handset import EXECUTABLE, factory_firmware
+from factory_handset import EXECUTABLE, factory_firmware, require_factory_host
 from iridium.engine import Engine
 from sim_service_center_card import INITIAL_SMSP, ServiceCenterSIM
 
@@ -178,6 +178,7 @@ class _ServiceCenterWire:
 
 class SharedSIMServiceCenterChecks:
     def run_service_center(self, *, memory_failure):
+        require_factory_host()
         firmware = next(image for image in factory_firmware(self.model, self.firmware_directory, modem=True) if image.image == "trx")
         sources = ("test_factory_sim_service_center_contract.py", "sim_service_center_card.py", "test_sim_service_center_card.py")
         hashes = {name: sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in sources}

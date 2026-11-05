@@ -169,6 +169,14 @@ report and diagnostic LCD/state artifacts under `test-artifacts/factory-e2e/`
 (`IRIDIUM_E2E_ARTIFACTS` overrides the destination). See the
 [feature coverage ledger](docs/factory-e2e.md) for tested journeys and the
 remaining local-feature, service, GPS and hardware gaps.
+
+The optional factory-firmware suites require Linux with mounted, readable
+`/proc` for native-worker identity and lifecycle evidence. Generated artifacts
+are local-only and ignored by Git; the ledger's historical reconciliation
+directories are not recreated by `./test-factory`. See the
+[factory-suite instructions](docs/factory-e2e.md#running-the-factory-suite)
+to collect a new run.
+
 Local UI cases execute BC5/AVR; modem-dependent security and persistence cases
 also load the factory telephony image. Original incoming modem data initializes
 the saved-phonebook index; see the [startup evidence](docs/phonebook-startup.md).

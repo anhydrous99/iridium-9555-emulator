@@ -13,7 +13,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
-from factory_handset import FIRMWARE_ENV, factory_firmware
+from factory_handset import FIRMWARE_ENV, factory_firmware, require_factory_host
 
 
 class FactoryResult(unittest.TextTestResult):
@@ -42,6 +42,7 @@ def main():
         for model, variable in FIRMWARE_ENV.items():
             firmware_directory = os.environ[variable]
             images[model] = [image.describe() for image in factory_firmware(model, firmware_directory, modem=True)]
+        require_factory_host()
     except (OSError, ValueError) as error:
         print(f"Factory E2E preflight failed: {error}", file=sys.stderr)
         return 2

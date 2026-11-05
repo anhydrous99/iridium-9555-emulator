@@ -12,7 +12,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from factory_handset import EXECUTABLE, factory_firmware
+from factory_handset import EXECUTABLE, factory_firmware, require_factory_host
 from iridium.engine import Engine
 from sim_language_card import StorageSIM
 
@@ -28,6 +28,7 @@ SMS_METADATA = bytes.fromhex("00 00 01 60 6F 3C 04 00 11 F0 44 01 02 01 B0")
 
 class SharedSIMStorageChecks:
     def run_storage_card(self, *, sms_available):
+        require_factory_host()
         firmware = next(image for image in factory_firmware(
             self.model, self.firmware_directory, modem=True) if image.image == "trx")
         card = StorageSIM(sms_available=sms_available)

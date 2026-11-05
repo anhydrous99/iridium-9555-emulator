@@ -36,17 +36,8 @@ class SharedExtendedPersistenceChecks:
 
     def keys(self, *keys, settle=2000000):
         for key in keys:
-            if settle < 2000000:
-                _Fields.keys(self, key, settle=settle)
-                continue
-            # Coupled-modem traffic can outlast a momentary edge-only press.
-            # Hold the real input, keeping the same total instruction budget.
-            self.assertTrue(self.handset.key(key, True)["delivered"])
-            try:
-                self.handset.step(500000)
-            finally:
-                self.assertTrue(self.handset.key(key, False)["delivered"])
-            self.handset.step(settle - 500000)
+            hold = 500000 if settle >= 2000000 else 0
+            self.handset.press(key, hold_steps=hold, settle_steps=settle - hold)
 
     def setUp(self):
         self.evidence = []

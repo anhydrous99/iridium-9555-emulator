@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 
 from iridium.assets import Bitmap
@@ -36,6 +37,18 @@ FACTORY_HASHES = {
 HOME_CAPTIONS = "b27866e4b66c4276d7f13b5b830b672ddf8f348dab67e38c8df5326a58de66d9"
 
 
+def require_factory_host():
+    """Worker identity evidence requires Linux and readable procfs."""
+    message = "Factory-firmware tests require Linux with mounted, readable /proc"
+    if sys.platform != "linux":
+        raise ValueError(message)
+    try:
+        with Path("/proc/self/exe").open("rb") as executable:
+            executable.read(1)
+    except OSError as error:
+        raise ValueError(message) from error
+
+
 def factory_firmware(model, directory, *, modem=False):
     """Reject missing, mixed-model or modified images before calling them factory."""
     directory = Path(directory)
@@ -53,6 +66,7 @@ def factory_firmware(model, directory, *, modem=False):
 
 class FactoryHandset:
     def __init__(self, testcase, model, firmware_directory, *, modem=False):
+        require_factory_host()
         self.test = testcase
         self.model = model
         self.epoch = 0
@@ -126,9 +140,21 @@ class FactoryHandset:
             "sequence": sequence, "epoch": self.epoch if epoch is None else epoch,
         })
 
-    def press(self, key, settle_steps=2000000):
-        self.test.assertTrue(self.key(key, True)["delivered"], f"{key} press was not delivered")
-        self.test.assertTrue(self.key(key, False)["delivered"], f"{key} release was not delivered")
+    def press(self, key, settle_steps=2000000, *, hold_steps=0):
+        """Hold a real contact, always release it, then run the release budget."""
+        if any(type(value) is not int or not 0 <= value <= 10000000
+               for value in (hold_steps, settle_steps)):
+            raise ValueError("Key budgets must be integers from 0 to 10000000 instructions")
+        pressed = False
+        try:
+            pressed = self.key(key, True)["delivered"]
+            self.test.assertTrue(pressed, f"{key} press was not delivered")
+            if hold_steps:
+                self.step(hold_steps)
+        finally:
+            released = self.key(key, False)["delivered"]
+            if pressed:
+                self.test.assertTrue(released, f"{key} release was not delivered")
         if settle_steps:
             return self.step(settle_steps)
         return self.state()

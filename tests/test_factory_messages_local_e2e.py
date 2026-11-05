@@ -91,10 +91,7 @@ class MessagesLocalChecks:
 
     def press(self, key, *, hold=500000, settle=500000):
         self.peer.check()
-        self.assertTrue(self.handset.key(key, True)["delivered"])
-        self.handset.step(hold)
-        self.assertTrue(self.handset.key(key, False)["delivered"])
-        state = self.handset.step(settle)
+        state = self.handset.press(key, hold_steps=hold, settle_steps=settle)
         self.peer.check()
         return state
 
