@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 # User-supplied firmware and upgrade packages stay outside version control.
 firmware/
+test-artifacts/
 *.bin
 *.dfu
 *.hex

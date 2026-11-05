@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 KEY_CODES = {str(n): 0x64 + n for n in range(10)} | {
     "*": 0x79, "#": 0x78, "up": 0x82, "down": 0x83,
-    "soft_left": 0x96, "soft_right": 0x97, "green": 0x8D,
-    "red": 0x8C, "volume_up": 0xA0, "volume_down": 0xA1, "convenience": 0xAA,
+    "soft_left": 0x96, "soft_right": 0x97, "green": 0x8C,
+    "red": 0x8D, "volume_up": 0xA0, "volume_down": 0xA1, "convenience": 0xAA,
 }
 
 
@@ -46,6 +46,18 @@ class HandsetProfile:
     @property
     def power_pin(self) -> tuple[int, int]:
         return (8, 3) if self.model == "9575" else (2, 0)
+
+    @property
+    def button_pins(self) -> dict[str, tuple[int, int]]:
+        return {"power": self.power_pin} | ({"sos": (9, 0)} if self.model == "9575" else {})
+
+    @property
+    def modem_uart(self) -> int:
+        return 3 if self.model == "9575" else 0
+
+    @property
+    def modem_power_pin(self) -> tuple[int, int]:
+        return (2, 4) if self.model == "9575" else (0, 5)
 
     @property
     def image_sizes(self) -> dict[str, int]:

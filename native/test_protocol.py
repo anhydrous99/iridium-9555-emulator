@@ -46,6 +46,82 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_sim_pin_protocol_rejects_wrong_images_and_invalid_arguments_without_mutation(self):
+        for image, size in (("ptt", 0xA7BF8), ("bc5", 0x310FBA), ("avr", 0x4000)):
+            with self.subTest(image=image):
+                state = exchange(image, bytes(size), [{"op": "uart_pins", "port": 3, "value": 1}])[-1]
+                self.assertEqual(state["error"], "TrxOnly")
+        invalid = (
+            ({"port": True}, "ExpectedInteger"),
+            ({"port": 4}, "IntegerOutOfRange"),
+            ({"port": -1}, "IntegerOutOfRange"),
+            ({"value": True}, "ExpectedInteger"),
+            ({"value": 65536}, "IntegerOutOfRange"),
+            ({"value": 2}, "BadPinMask"),
+            ({"mask": True}, "ExpectedInteger"),
+            ({"mask": 65536}, "IntegerOutOfRange"),
+            ({"mask": -1}, "IntegerOutOfRange"),
+        )
+        commands = [{"op": "uart_pins", "port": 3, "value": 0x101}]
+        for arguments, _ in invalid:
+            commands.extend([{"op": "uart_pins", "port": 3, "value": 0, **arguments},
+                             {"op": "uart_pins", "port": 3}])
+        commands.append({"op": "state"})
+        states = exchange("trx", bytes(0x260760), commands)
+        for index, (_, error) in enumerate(invalid):
+            with self.subTest(index=index):
+                self.assertEqual(states[2 + index * 2]["error"], error)
+                self.assertEqual(states[3 + index * 2]["inputs"], 0x101)
+        self.assertEqual(states[-1]["steps"], 0)
+
+    def test_sim_inputs_validate_atomically_and_survive_only_warm_modem_reset(self):
+        base = 0x80001600
+        words = (0x05000000 | (base >> 10), 0x8410A000 | (base & 0x3FF),
+                 0x821020FF, 0xC220A010, 0xC600A010, 0x10800000, 0x01000000)
+        code = b"".join(word.to_bytes(4, "big") for word in words).ljust(0x260760, b"\xff")
+        states = exchange("trx", code, [
+            {"op": "uart_pins", "port": 3},
+            {"op": "uart_pins", "port": 3, "value": 0x101},
+            {"op": "uart_pins", "port": 3, "value": 0, "mask": 2},
+            {"op": "uart_pins", "port": 3, "value": -1},
+            {"op": "uart_pins", "port": 2, "value": 0},
+            {"op": "uart_pins", "port": 3, "mask": 1},
+            {"op": "uart_pins", "port": 3},
+            {"op": "state"}, {"op": "run", "steps": 5},
+            {"op": "uart_pins", "port": 3},
+            {"op": "warm_reset"}, {"op": "uart_pins", "port": 3},
+            {"op": "run", "steps": 5},
+            {"op": "uart_pins", "port": 3, "value": 0, "mask": 0x100},
+            {"op": "reset"}, {"op": "uart_pins", "port": 3},
+        ])
+        self.assertEqual(states[1]["pins"], 0)
+        for index in (2, 7, 12):
+            self.assertEqual(states[index]["inputs"], 0x101)
+        self.assertEqual(states[3]["error"], "BadPinMask")
+        self.assertEqual(states[4]["error"], "IntegerOutOfRange")
+        self.assertEqual(states[5]["error"], "BadPort")
+        self.assertEqual(states[6]["error"], "MissingField")
+        self.assertEqual(states[8]["steps"], 0)
+        self.assertEqual(states[9]["registers"][3], 0x1FF)
+        self.assertEqual(states[10]["outputs"], 0xFE)
+        self.assertEqual(states[12]["outputs"], 0)
+        self.assertEqual(states[13]["registers"][3], 0x1FF)
+        self.assertEqual(states[14]["inputs"], 1)
+        self.assertEqual(states[14]["outputs"], 0xFE)
+        self.assertEqual(states[16]["pins"], 0)
+
+    def test_9575_reset_releases_power_and_sos_but_warm_reset_preserves_held_sos(self):
+        firmware = b"\xff\xcf" + b"\xff" * (14296 - 2)
+        states = exchange("avr", firmware, [
+            {"op": "pin_state"}, {"op": "pins", "port": 9, "value": 0},
+            {"op": "warm_reset"}, {"op": "pin_state"},
+            {"op": "reset"}, {"op": "pin_state"},
+        ], model="9575")
+        for index in (1, 6):
+            self.assertNotEqual(states[index]["inputs"][8] & 8, 0, "PJ3 Power must be released")
+            self.assertNotEqual(states[index]["inputs"][9] & 1, 0, "PK0 SOS must be released")
+        self.assertEqual(states[4]["inputs"][9] & 1, 0, "Warm reset must preserve a held external input")
+
     def test_twi_stop_rejects_a_power_reduced_slave_without_losing_its_transaction(self):
         for model, size in (("9555", 0x4000), ("9575", 0x20000)):
             for reduced in (False, True):
@@ -445,6 +521,64 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(states[3]["irq_level"], 15)
         self.assertEqual(states[4]["irq_level"], 0)
         self.assertEqual(states[6]["irq_level"], 0)
+
+    def test_modem_warm_reset_preserves_guest_programmed_flash_and_clears_volatile_state(self):
+        words = []
+
+        def address(value):
+            # sethi/or %g2, then access through that register.
+            words.extend([0x05000000 | (value >> 10), 0x8410A000 | (value & 0x3FF)])
+
+        def store(target, value, opcode):
+            address(target)
+            words.extend([0x03000000 | (value >> 10), 0x82106000 | (value & 0x3FF), opcode])
+
+        address(0x80000300)
+        words.append(0xC600A000)  # ld [%g2], %g3: observe the UART RX queue after reset.
+        for target, value in ((0xAAA, 0xAA), (0x554, 0x55), (0xAAA, 0xA0), (0x600000, 0x1234)):
+            store(target, value, 0xC2B08020)  # stha %g1, [%g2] 1: real flash command interface.
+        for target in (0x40000080, 0x70090080):
+            store(target, 0xA5, 0xC220A000)  # st %g1, [%g2]: SDRAM and on-chip RAM.
+        store(0x80000300, 0x41, 0xC220A000)
+        store(0x80000300, 0x42, 0xC220A000)
+        words.extend([0x10800000, 0x01000000])  # ba .; nop
+        code = b"".join(word.to_bytes(4, "big") for word in words)
+        for image, size, entry in (("trx", 0x260760, 0x10000), ("ptt", 0xA7BF8, 0x400000)):
+            with self.subTest(image=image):
+                states = exchange(image, code.ljust(size, b"\xff"), [
+                    {"op": "run", "steps": len(words)},
+                    {"op": "read", "address": 0x600000, "count": 2},
+                    {"op": "read", "address": 0x40000080, "count": 4},
+                    {"op": "read", "address": 0x70090080, "count": 4},
+                    {"op": "uart_io", "port": 0, "rx": [0x42], "tx_limit": 1},
+                    {"op": "irq", "level": 7}, {"op": "warm_reset"},
+                    {"op": "read", "address": 0x600000, "count": 2},
+                    {"op": "read", "address": 0x40000080, "count": 4},
+                    {"op": "read", "address": 0x70090080, "count": 4},
+                    {"op": "uart_io", "port": 0, "tx_limit": 255},
+                    {"op": "run", "steps": 3}, {"op": "reset"},
+                    {"op": "read", "address": 0x600000, "count": 2},
+                    {"op": "read", "address": entry, "count": 4},
+                ])
+                self.assertIsNone(states[1]["halt"])
+                self.assertEqual(states[2]["values"], [0x12, 0x34])
+                for index in (3, 4):
+                    self.assertEqual(states[index]["values"], [0, 0, 0, 0xA5])
+                self.assertEqual(states[5]["accepted"], 1)
+                self.assertEqual(states[5]["values"], [0x41])
+                self.assertNotIn("error", states[7])
+                for key in ("pc", "registers", "steps", "halt", "irq_level"):
+                    self.assertEqual(states[7][key], states[0][key], key)
+                self.assertEqual(states[7]["pc"], entry)
+                self.assertEqual(states[8]["values"], [0x12, 0x34])
+                for index in (9, 10):
+                    self.assertEqual(states[index]["values"], [0, 0, 0, 0])
+                self.assertEqual(states[11]["values"], [])
+                self.assertEqual(states[12]["registers"][3], 0, "Warm reset must discard queued UART RX")
+                self.assertIsNone(states[12]["halt"])
+                self.assertEqual(states[13]["pc"], entry)
+                self.assertEqual(states[14]["values"], [0xFF, 0xFF])
+                self.assertEqual(states[15]["values"], list(code[:4]))
 
     def test_uart_batch_validation_precedes_input_and_output_mutation(self):
         # Enable TX, transmit one byte, then wait for its completion.
@@ -1189,7 +1323,7 @@ class OriginalBc5HardwareTests(unittest.TestCase):
                                     self.fail("Original UI callback did not release the left soft key")
                             self.assertEqual(state["last_call"], probe_before)
 
-    def test_unestablished_electrical_sos_contact_is_rejected_atomically_on_both_profiles(self):
+    def test_sos_is_not_a_bc5_matrix_contact_on_either_profile(self):
         for model, directory, _, _ in self.profiles():
             with self.subTest(model=model):
                 engine = self.worker(model, directory)

@@ -1,7 +1,8 @@
 # 9575 Extreme control evidence
 
-This preserves the earlier software-probe investigation. Current startup uses
-the coupled AVR power input and GPIO matrix; see [inferred hardware](inferred-hardware.md).
+This preserves the earlier software-probe investigation and the later executed
+AVR input evidence. Current controls use the GPIO matrix plus independent AVR
+power and SOS inputs; see [inferred hardware](inferred-hardware.md).
 
 Observed on 2026-11-02 using the downloaded HL25003 BC5 payload, SHA-256
 `21b9f28484bc1be0a5dc5cce78444e50b265b0b025ee40ed1d332830f7e90da1`.
@@ -39,7 +40,7 @@ screens consume it. Calling this original routine with a scratch event
 | Star / hash | `0x79` / `0x78` | `0xD0` / `0xCF` |
 | Up / down | `0x82` / `0x83` | `0xCA` / `0xCB` |
 | Left / right soft key | `0x96` / `0x97` | `0xC8` / `0xCE` |
-| Green / red | `0x8D` / `0x8C` | `0xC9` / `0x8C` |
+| Green / red | `0x8C` / `0x8D` | `0x8C` / `0xC9` |
 | Volume up / down | `0xA0` / `0xA1` | `0xCC` / `0xCD` |
 | Convenience / location | `0xAA` | `0xAA` |
 | SOS | `0xAB` | `0xAB` |
@@ -48,6 +49,14 @@ The normalizer's digit path at `0x79DEA..0x79E08` adds `0x6E` to raw digits;
 its switch handles the listed navigation keys. Other widget normalizers can
 apply different contextual mappings. Injection belongs at the raw boundary,
 not at the normalized diagnostic codes.
+
+Factory HTTP/LCD journeys on 2026-11-04 corrected the earlier green/red labels
+on both HT25003 and HL25003: raw `0x8C` opens Dialed Calls from home and starts
+the call-request screen from number entry; raw `0x8D` returns from Dialed Calls
+or cancels number entry to home. See
+[`test_factory_calls_e2e.py`](../tests/test_factory_calls_e2e.py).
+The pending call-request screen does not establish a connected call or a
+working end-call transaction without a modem/service transport.
 
 The built-in keypad test independently identifies convenience and SOS:
 
@@ -61,8 +70,65 @@ The built-in keypad test independently identifies convenience and SOS:
   accepts `0xAA` at `0x7E6EC`. An original HT25003 home-screen press/release of
   `0xAA` left the home screen running without a halt or display error. The
   initial convenience action can be inactive. **`0xAA` must not be labeled
-  as the physical power button on either model.** A power-switch event path
-  remains unresolved; recording that control must not claim firmware delivery.
+  as the physical power button on either model.** The later AVR investigation
+  established power and SOS inputs separately, as described below.
+
+## AVR power and SOS inputs
+
+On 2026-11-04, the unmodified HL25003 BC5 image above and AVR image SHA-256
+`8b2e5df7b59d04f526facfeb422939ef09d5df11603da0f7ad207262fd30ddc2`
+established the following firmware-visible input mapping. This is an inferred
+board contract from original instructions and execution, not a measurement of
+a physical handset's wiring or analog timing.
+
+| Control | BC5 logical selector | AVR physical selector | AVR input | Released / pressed |
+| --- | --- | --- | --- | --- |
+| Power | `0x20` | `0x86` | PJ3 | HIGH / LOW |
+| SOS | `0x46` | `0x90` | PK0 | HIGH / LOW |
+
+The AVR translation table begins at image byte `0x36D4`. Logical selector
+`0x20 >> 1` selects byte `0x36E4 = 0x86`; `0x46 >> 1` selects
+`0x36F7 = 0x90`. The translated selector encodes port in the high nibble and
+bit in bits 3..1. Original SPI register 4 replies independently reflected all
+four PJ3/PK0 combinations: selector `0x20` returned `0x86 | PJ3`, while
+`0x46` returned `0x90 | PK0`. Toggling power did not change the SOS reply.
+
+BC5 `0xB473A` polls the SOS input through `0xB4922 -> 0xB4AC2`, using logical
+selector `0x46` and SPI register 4. It compares the sampled level with data
+word `0xF831`. A falling level creates original event `[2, 0xAB, 1]`; a rising
+level creates `[2, 0xAB, 4]`. Instructions `0xB477A..0xB4796` construct that
+event, and `0xB479C` dispatches it through handler `0x71492`. AVR attention
+processing reaches this poll through `0xC6E1C -> 0xB4932`.
+
+This explains the factory E2E restart regression. The old idle fixture left
+PK0 LOW. Changing PJ3 caused the original attention handler to sample that
+asserted SOS input, even with no keypad contacts held. After 55,040 BC5
+instructions, data word `0xF756` contained raw SOS `0xAB`; the captured guest
+stack included returns to `0x71558`, `0x8327E` and `0xB47A2`. The original
+SOS handler had run before the power button's 500 ms shutdown hold completed.
+
+The emergency controller pointer is data word `0xF842`; its state is word 3
+of that object. Setter `0xB9078` changes the state and persists it through
+`0xB97BA` as logical setting `0x2A` (word offset 10 of persistent-store key
+`0x2B0`). The spurious press changed normal state 2 to state 0 and saved 0.
+Constructor `0xB8E78` restored that value on restart. Home-caption function
+`0x7A2B4` chooses the usual Help action only in state 2, explaining the
+otherwise healthy SOS / Cancel screen after reboot.
+
+Releasing PK0 HIGH before the same unmodified startup prevented the spurious
+event: PJ3's hold reached shutdown state 8 with controller state 2 and no SOS
+key, then restart returned to the original Menu / Help screen. With PJ3 still
+released, PK0 LOW alone delivered raw `0xAB`; releasing PK0 cleared the key
+and left the original 20-second countdown visible. The host SOS control now
+drives this AVR input rather than calling the original software key entry.
+The native BC5 matrix still rejects code `0xAB`, since SOS is not a matrix
+contact.
+
+The restart and countdown journeys are exercised in
+[`test_factory_e2e.py`](../tests/test_factory_e2e.py) and
+[`test_factory_extreme_e2e.py`](../tests/test_factory_extreme_e2e.py).
+Receiver fixes and emergency-service delivery remain separate, unavailable
+contracts; a correct input or countdown is not evidence of either outcome.
 
 ## Executed location and SOS behavior
 

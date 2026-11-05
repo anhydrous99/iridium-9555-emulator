@@ -168,6 +168,8 @@ pub const Model = struct {
     ptt: bool = false,
     latch: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     uarts: [4]Uart = @splat(.{}),
+    sim_inputs: u16 = 0,
+    sim_control_pending: bool = false,
     external_uart_events: [2]u8 = @splat(0),
     irq_config: [16]u32 = @splat(0),
     timers: [5]Timer = @splat(.{}),
@@ -208,6 +210,26 @@ pub const Model = struct {
 
     pub fn uartDropped(m: *const Model, port: u2) u64 {
         return m.uarts[port].tx_dropped;
+    }
+
+    /// Original 33E04/table10A354 reads external bits separately from SIM outputs.
+    pub fn setSimPinsIn(m: *Model, value: u16, selected: u16) void {
+        const selected_inputs = selected & 0x101;
+        const before = m.sim_inputs;
+        m.sim_inputs = (m.sim_inputs & ~selected_inputs) | (value & selected_inputs);
+        // Original 348F4 bit0 schedules port3's SIMmdm callback (3DF08).
+        if (!m.ptt and (before ^ m.sim_inputs) & 1 != 0) {
+            m.sim_control_pending = true;
+            m.external_uart_events[1] |= 1;
+        }
+    }
+
+    pub fn simPinsOut(m: *const Model) u16 {
+        return @intCast(m.uarts[3].pins & 0xFE);
+    }
+
+    pub fn simPins(m: *const Model) u16 {
+        return m.simPinsOut() | m.sim_inputs;
     }
 
     /// Peripheral source clocks. Firmware implies 16.8 MHz: 700000*(23+1), or PTT 2800000*(5+1).
@@ -305,10 +327,9 @@ pub const Model = struct {
     }
 
     fn externalUartSummary(m: *const Model) u32 {
-        // DCE64's two dispatchers use callback tables for ports 3 and 2 respectively,
-        // not separate RX/TX directions: 347E8 handles 400A5FEC, 348F4 handles 400A6004.
+        // DCE64: 347E8 handles port2 at 400A5FEC, 348F4 port3 at 400A6004.
         return (if (m.uarts[2].pending() != 0) @as(u32, 4) else 0) |
-            (if (m.uarts[3].pending() != 0) @as(u32, 2) else 0);
+            (if (m.uarts[3].pending() != 0 or m.sim_control_pending) @as(u32, 2) else 0);
     }
 
     fn word(m: *Model, a: u32) u32 {
@@ -342,7 +363,7 @@ pub const Model = struct {
                 4 => return u.status(),
                 8 => return u.control,
                 0x0C => return u.divisor,
-                0x10 => return u.pins,
+                0x10 => return if (!m.ptt and location.port == 3) m.simPins() else u.pins,
                 0x14 => return u.modem,
                 else => {},
             }
@@ -353,8 +374,7 @@ pub const Model = struct {
             0x8000_0148 => if (m.interruptSource()) |source| source else 0,
             // External UART2/3 TX and RX events as consumed by 0x347E8 / 0x348F4.
             0x8000_1310 => m.uarts[2].pending() << 8 | m.uarts[3].pending(),
-            // No external modem-control line-change event has been supplied.
-            0x8000_1314 => 0,
+            0x8000_1314 => @intFromBool(m.sim_control_pending),
             // Original 0xDCE64 / PTT 0x70013444 dispatch bit 0 to the compare-event ISR.
             0x8000_1318 => @as(u32, @intFromBool(m.alarmPending())) | m.externalUartSummary(),
             0x8000_0900 => m.scaler,
@@ -385,6 +405,8 @@ pub const Model = struct {
             // Inferred read-to-ack: 0x2A9EC consumes each event word with no later clear write.
             m.alarm_pending[(a - 0x8000_1300) / 4] &= ~@as(u16, @truncate(mask(bits) << sh));
         }
+        // Inferred read-to-ack: original 348F4 reads status after the outer 1304 strobe.
+        if (a == 0x8000_1314 and (mask(bits) << sh) & 1 != 0) m.sim_control_pending = false;
         return result;
     }
 
@@ -458,6 +480,12 @@ pub const Model = struct {
                 }
                 return;
             }
+            if (!m.ptt and location.port == 3 and location.offset == 0x10) {
+                // Original output mask10A344 excludes card detect and the other input bit.
+                u.pins = ((u.pins & ~(mask(bits) << sh)) |
+                    (@as(u32, @truncate(value)) & mask(bits)) << sh) & 0xFE;
+                return;
+            }
             const cell: ?*u32 = switch (location.offset) {
                 4 => &u.config,
                 8 => &u.control,
@@ -470,8 +498,10 @@ pub const Model = struct {
                 reg.* = (reg.* & ~(mask(bits) << sh)) | (@as(u32, @truncate(value)) & mask(bits)) << sh;
                 if (location.offset == 4) {
                     reg.* &= ~@as(u32, 0xFF); // FIFO flags are read-only
-                    if (location.port >= 2)
-                        m.external_uart_events[location.port - 2] = @truncate(u.pending());
+                    if (location.port >= 2) {
+                        const events = &m.external_uart_events[location.port - 2];
+                        events.* = (events.* & 1) | @as(u8, @truncate(u.pending()));
+                    }
                 }
                 return;
             }
@@ -678,6 +708,65 @@ test "four UARTs preserve independent byte streams, FIFO state and big-endian da
         try std.testing.expectEqual(@as(?u8, @intCast(0x50 + port)), m.uartPop(@intCast(port)));
         try std.testing.expectEqual(@as(?u8, @intCast(0x60 + port)), m.uartPop(@intCast(port)));
         try std.testing.expectEqual(@as(?u8, null), m.uartPop(@intCast(port)));
+    }
+}
+
+test "SIM inputs remain independent from firmware outputs and big-endian writes" {
+    var m: Model = .{ .gpa = std.testing.allocator, .nwin = 8 };
+    defer m.deinit();
+    const d = m.device();
+    m.setSimPinsIn(0x101, 0x101);
+    d.write(d.ctx, 0x8000_1610, 32, 0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u16, 0xFE), m.simPinsOut());
+    try std.testing.expectEqual(@as(u64, 0x1FF), d.read(d.ctx, 0x8000_1610, 32));
+    d.write(d.ctx, 0x8000_1610, 8, 0); // high byte cannot erase low control or input bits
+    try std.testing.expectEqual(@as(u16, 0x1FF), m.simPins());
+    d.write(d.ctx, 0x8000_1613, 8, 0x54);
+    try std.testing.expectEqual(@as(u16, 0x54), m.simPinsOut());
+    try std.testing.expectEqual(@as(u16, 0x155), m.simPins());
+    m.setSimPinsIn(0, 0x100);
+    try std.testing.expectEqual(@as(u16, 0x55), m.simPins());
+    m.setSimPinsIn(0, 1);
+    try std.testing.expectEqual(@as(u16, 0x54), m.simPins());
+    try std.testing.expectEqual(@as(u4, 0), m.irqLevel());
+    try std.testing.expectEqual(@as(?u8, null), m.uartPop(3));
+}
+
+test "SIM card edges reach original port3 status and survive the outer IRQ acknowledge" {
+    var m: Model = .{ .gpa = std.testing.allocator, .nwin = 8 };
+    defer m.deinit();
+    const d = m.device();
+    d.write(d.ctx, 0x8000_0128, 32, 0x68);
+    m.setSimPinsIn(0x100, 0x100); // bit8 has no evidenced edge meaning
+    try std.testing.expectEqual(@as(u4, 0), m.irqLevel());
+    m.setSimPinsIn(1, 1);
+    try std.testing.expectEqual(@as(u4, 8), m.irqLevel());
+    d.write(d.ctx, 0x8000_1604, 32, 0); // changing UART masks cannot erase a card edge
+    try std.testing.expectEqual(@as(u4, 8), m.irqLevel());
+    d.write(d.ctx, 0x8000_1304, 32, 0);
+    try std.testing.expectEqual(@as(u4, 0), m.irqLevel());
+    try std.testing.expectEqual(@as(u64, 2), d.read(d.ctx, 0x8000_1318, 32));
+    try std.testing.expectEqual(@as(u64, 0), d.read(d.ctx, 0x8000_1314, 8));
+    try std.testing.expectEqual(@as(u64, 1), d.read(d.ctx, 0x8000_1317, 8));
+    try std.testing.expectEqual(@as(u64, 0), d.read(d.ctx, 0x8000_1314, 32));
+    try std.testing.expectEqual(@as(u64, 0), d.read(d.ctx, 0x8000_1318, 32));
+    m.setSimPinsIn(1, 1); // unchanged level cannot retrigger
+    try std.testing.expectEqual(@as(u4, 0), m.irqLevel());
+    m.setSimPinsIn(0, 1);
+    try std.testing.expectEqual(@as(u4, 8), m.irqLevel());
+    try std.testing.expectEqual(@as(u64, 1), d.read(d.ctx, 0x8000_1314, 32));
+}
+
+test "SIM input separation does not change other UART or PTT pin latches" {
+    for ([_]bool{ false, true }) |ptt| {
+        var m: Model = .{ .gpa = std.testing.allocator, .nwin = 8, .ptt = ptt };
+        defer m.deinit();
+        const d = m.device();
+        for (uart_bases, 0..) |base, port| {
+            if (!ptt and port == 3) continue;
+            d.write(d.ctx, base + 0x10, 32, 0x1234_5678);
+            try std.testing.expectEqual(@as(u64, 0x1234_5678), d.read(d.ctx, base + 0x10, 32));
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 The emulation target is the hardware contract recoverable from the HT25003 and
 HL25003 instructions, supplemented by the CPU and peripheral specifications.
 An inferred digital device is a useful test model without claiming measured
-electrical equivalence. Missing modem boot-ROM and DSP images are not replaced
+electrical equivalence. Missing modem boot-ROM and unimplemented DSP execution are not replaced
 with fabricated code or successful service responses.
 
 ## Implemented devices
@@ -73,6 +73,7 @@ the complete service interval elapses; it cannot acknowledge that reply early.
 | SPI handshake | PB0 | PA7 |
 | Attention | PA3 | PC2 |
 | Released power input | PC0 high | PJ3 high |
+| Released SOS input | N/A | PK0 high |
 
 Original BC5 initialization `0xB165E`/`0xC707E` programs the GPIO direction,
 pulses reset and waits for handshake. The original AVR SPI command parser
@@ -80,17 +81,38 @@ generates every reply. Reset retains external levels, flash, EEPROM and fuses.
 New SPI links baseline the BC5's lifetime reset counter before guest execution,
 so earlier pulses are not replayed after Session reset or AVR replacement.
 
-When AVR and a modem image are loaded, the host connects AVR USART0 to modem
-logical UART1. Traffic awaiting delivery when AVR resets, or completed while it
+When AVR and a modem image are loaded, the host connects AVR USART0 on 9555 or
+USART3 on 9575 to modem logical UART1. Traffic awaiting delivery when AVR resets, or completed while it
 is held in reset, is discarded with the receive backlog. It is not replayed when
 the receiver starts again.
 Telephony initializes DPL port1 at `0xE2B8C..0xE2B90`; its table
 at `0x10A2F8` resolves that to physical `0x80000200`, IRQ5. PTT has an additional
 logical-port remap; its DPL port1 resolves to the same physical peripheral.
-The AVR's channel-routing instructions identify USART0 as the modem endpoint.
+The 9555 AVR's channel-routing instructions identify USART0 as the modem endpoint.
+In HL25003, the initialized register-pointer table at flash `0x36CE` contains
+USART3/USART2/USART0. RX vector `0xD8` enters `0x100A`, which feeds the original
+DPL receiver through USART3; USART0's vector `0x64` instead feeds the raw GPS
+parser through `0xF66 -> 0x256E`.
 The board connection remains an inference from those two firmware contracts.
 
+With BC5 loaded, logical PA5 (physical PA5 on 9555, PC4 on 9575) gates modem
+execution. A rising enable warm resets the modem, retaining its emulated flash
+and clearing volatile state. Disabled/reset epochs discard queued bytes.
+Previously the modem ran before the AVR's final boot reset: its startup retries
+expired and the AVR reset erased the received prefix, leaving the BC5 AT manager
+stopped. Starting the real modem after link enable restores bidirectional AT
+traffic on 9555, including an original successful Phone Lock response.
+This scheduling model follows the firmware's link-enable contract; physical
+CPU power/reset wiring and delays remain unmeasured. It does not resolve the
+subsequent original TRX DSP-fatal reboot. The 9575 reaches its original IERCC
+and emergency-recipient setup warnings after the SPI pacing fix.
+
 The host runs in 4096-instruction quanta and transfers completed bytes in order.
+SPI keeps the 128-instruction service cadence while chip select remains
+asserted, including gaps between successive single-byte DMAs. Advancing the AVR
+4096 instructions during those gaps let its original frame timeout discard the
+tail of a valid 48-byte 9575 CAPPV request. With the selected-transaction cadence,
+the entire original frame reaches TRX, which echoes it and returns its own OK.
 Each coupled quantum runs BC5 first and applies reset before selecting auxiliary
 processors. Explicit steps keep halted cores paused and advance surviving cores
 for the requested budget; a new halt ends the coupled request.
@@ -107,7 +129,75 @@ workers. The two modem images are not simultaneous physical processors.
 counts, pending bytes and errors. Satellite scenarios remain separate until
 an executing firmware transport supports their particular service.
 
+## 9575 receiver serial and position publication
+
+HL25003's receiver uses AVR USART0, separately from modem DPL on USART3.
+The original RX vector `0x64 -> 0xF66 -> 0x256E` fills the receiver ring;
+foreground `0x266C` parses UBX and NMEA. Original SPI command0/register19 with
+argument0 starts the receiver and raises PJ7; argument1 stops it. The host does
+not invoke the parser or write its coordinate buffers.
+
+Receiver tests supply checksum-correct UBX NAV-POSLLH, NAV-SOL, NAV-TIMEUTC and
+NAV-VELNED for one epoch, plus NMEA GST error estimates. Original `0x339C`
+requires the complete field mask `0x1FFF`: the four UBX messages alone provide
+`0x11FF`, so no position is published until GST supplies the remaining fields.
+The tests acknowledge actual outgoing CFG-MSG requests, preserve unsent UART
+suffixes under backpressure and collect complete frames before responding.
+Corrupt UBX/NMEA checksums and an incomplete epoch leave the published buffer
+empty. Completing the epoch produces the exact original 14-byte position
+response through SPI command1/register20.
+
+The HTTP journey enables Current Location with physical keypad input and feeds
+the same external serial packets. Actual AVR publication/IRQ and BC5 SPI polls
+produce LCD latitude `37deg46'29"`, longitude `-122deg25'09"`, altitude `+98 ft`
+and eight satellites. Leaving and reopening retains coordinates/count while
+requesting an updated fix. This establishes the supplied-byte software path;
+GNSS radio acquisition, handset/network clock synchronization and fix age
+remain unverified. See the [factory coverage ledger](factory-e2e.md)
+and [receiver fixtures](../tests/gps_receiver_frames.py).
+
+Additional HTTP cases retain the last valid fix after corrupt UBX, incomplete
+or bad-checksum NMEA, mixed epochs and a complete no-fix epoch, then accept a
+complete valid epoch. Distinguishing NAV-SOL fix type from its validity flags
+exposed an original AVR error at `0x2D14–0x2D22`: byte 10 bit 0 is copied into
+packed validity instead of byte 11 bit 0. Invalid type 3/flags 0 replaces the fix;
+valid type 2/flags 1 does not update it. Both functional regressions stay enabled;
+see [solution-validity evidence](gps-solution-validity.md).
+
+GPS user permission does not alone determine receiver power. Original HL
+`0xB829C` creates a startup acquisition owner, which a supplied complete fix
+releases; `0xB8B84` schedules standby after three seconds with no remaining
+owners. Original `0xB8618` also requires PS key23 and RAM `F736` for an automatic
+hold. `0x6ADFE` derives `F736` from inverted external PJ5. Tests exercise both
+levels while preserving the other AVR inputs, then restore default HIGH. The
+physical role of this gate is unknown. Under gateLOW, saved Enabled starts
+PJ7; cancelling disable keeps it high, while saved Disabled permits natural
+standby. These are firmware-derived digital contracts, not measured board power.
+
+A separate second-epoch probe exposed a shipped negative-altitude formatting
+defect after the original parser correctly retained the sign. See
+[HL25003 altitude evidence](gps-altitude-sign.md); positive-coordinate format
+regressions must not be read as proof of signed-altitude correctness.
+
 ## Modem timer and frame interrupts
+
+The telephony payload contains embedded initial DSP program/data blobs.
+Original `0x700443EC` copies audio program/data from `0x70066514`/`0x70064F6C`
+and modem program/data from `0x70072394`/`0x7006AEAC`, then verifies readback.
+The native model stores these DSP memory windows but does not execute their
+programs or advance DSP-owned queue consumers. This is an execution/service
+gap; it is inaccurate to describe all DSP firmware as absent from the package.
+The modem boot ROM remains outside the supplied upgrade payload.
+
+A bounded factory Phone Lock diagnostic reproduced the fatal independently of
+PIN acceptance. At modem step `306527262`, original `0x70044B5C` read command
+queue producer `B0006CE0=1B52` and DSP-owned consumer `B0006CE4=1B3A`; advancing
+the producer wrapped to the unchanged consumer, so it reported modem command
+queue full and passed fatal `0xFFFF` to `0x700448EC`. The captured stack identifies
+opcode4/length5 `MSG_PAYLOAD_BURST_SEARCH_CMD`, built by `0x7005F5C4` during
+background burst search. The separate Sapphyre fatal flag remained zero.
+The later watchdog reset is the original fatal handler's outcome. The model
+does not suppress it or pretend that the DSP consumed the queued commands.
 
 The digital timer block advances with guest execution, including CPU sleep.
 The original RTOS initializes the prescaler/reload/control registers and
@@ -118,6 +208,16 @@ tables. The aggregate interrupt is source 10, configured by guest code.
 Both UART groups carry receive and transmit events; their event latches and
 readiness snapshots allow the original deferred handlers to run without an
 interrupt storm.
+
+Telephony UART3 now separates SIM input mask `0x101` from output mask `0xFE`.
+Input-bit-0 changes latch source-10 events and `0x80001314` bit0 for the
+original SIM modem-control callback; unchanged levels and bit8 produce no
+edge. The outer `0x80001304` strobe acknowledges the IRQ while status survives
+until read, an explicit read-to-ack inference. Original-firmware contracts
+verify debounce, reset, external ATR, the transmitted SELECT for DF `7F20`,
+invalid ATR rejection, removal and retained-card warm startup. They supply
+no successful file response. See [SIM device contract](sim-device-contract.md)
+for register evidence, reset lifecycle and the remaining filesystem boundary.
 
 Frame channel 28's original handler calls `0x37944`, clearing the modem's
 watchdog supervision counter. The original regression runs telephony for
@@ -292,14 +392,38 @@ all 25 matrix contacts through GPIO columns, IRQ15, the original debounce
 routine and scanner state, including release. An ordinary soft key also reaches
 the original UI callback. No application probe runs after that warm reset.
 Separate tests keep the released input high beyond 500 ms and verify that a
-low level held for 500 ms enters the original shutdown state. The unestablished
-SOS contact is rejected without changing instructions, registers or contacts.
+low level held for 500 ms enters the original shutdown state. The BC5 matrix
+operation rejects SOS code `0xAB`: the 9575's SOS control uses a separate AVR
+input, not a contact in that matrix.
+
+On HL25003, original BC5 `0xB473A -> 0xB4922 -> 0xB4AC2` reads logical SOS
+selector `0x46` through SPI register 4. Its AVR translation-table entry at
+image byte `0x36F7` is `0x90`, selecting active-low PK0 independently of PJ3.
+Original SPI replies were verified for all four PJ3/PK0 combinations. BC5
+compares the input with data word `0xF831`; `0xB477A..0xB4796` constructs
+raw key `0xAB` with phase 1 on LOW and phase 4 on HIGH, then `0xB479C` calls
+the original handset key handler. The input is sampled by the original AVR
+interrupt/SPI/attention path; no host software-key callback is needed.
+
+Both PJ3 and PK0 must be released HIGH in the idle fixture. Leaving PK0 LOW
+caused the next PJ3 change to be observed as a real SOS press before shutdown,
+with no matrix contacts held. Original code persisted emergency-controller
+state 0 instead of normal state 2; restart consequently displayed SOS / Cancel.
+Releasing PK0 prevented that transition, preserved state 2 through completed
+shutdown state 8, and returned to Menu / Help on restart. Conversely, PK0 LOW
+alone, with PJ3 HIGH, produced the original 20-second SOS countdown and a
+matching release event. See [control evidence](9575-controls.md#avr-power-and-sos-inputs)
+for image identities, dispatch addresses and persistent-store details.
+This establishes the inferred digital pin contract for this firmware; it does
+not establish physical switch mechanics, analog timing or emergency-service
+transport.
 
 Original power-on also enables AVR logical PA5: `0x6BE4C -> 0x69DE6 ->
 0x6B030 -> 0xAB5BC` on 9555, and `0x6BED0 -> 0x69DE6 -> 0x6B046 ->
 0xB4812` on 9575. That output is physical PA5/PC4 respectively and starts
 the AVR USART links. The matching power-down helper clears it. This establishes
-serial-link gating; it does not establish a physical modem reset or CPU power
-pin. REA decoder capture
+serial-link gating; the emulator uses it to schedule modem startup as described
+above. It does not establish a measured physical modem reset or CPU power pin.
+REA decoder capture
 `ev_34dddbb434f839d778c38094dfe0e95e8f7a54d0b139a8478f5536549ea826af`
 records the 9555 enable/disable helpers.

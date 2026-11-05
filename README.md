@@ -11,9 +11,9 @@ Strict MMIO checks and bounded bus traces support modified-firmware testing.
 See [implemented hardware and evidence](docs/inferred-hardware.md).
 
 The scope is behavior recoverable from the supplied firmware and component
-specifications. Unshipped boot-ROM/DSP code and unestablished RF/service behavior
-are excluded. The 9575 SOS electrical wiring remains unknown; that control uses
-its established original software input entry. Offline satellite scenarios are
+specifications. The unshipped boot ROM, unimplemented DSP execution and unestablished RF/service behavior
+are excluded. The 9575 SOS input uses the original firmware's AVR PK0 mapping.
+Physical board wiring remains unmeasured. Offline satellite scenarios are
 separate from the executing modem's transport.
 
 ## Run
@@ -116,8 +116,8 @@ the supplied image and discards the experiment's RAM and flash changes.
   key starts the original cancellable emergency countdown. GPS positions remain
   unavailable without a connected receiver; the emulator makes no emergency
   call or transmission. Power drives the active-low AVR input and executes the
-  original long-hold shutdown path. The SOS control retains the software input
-  boundary because its electrical wiring is not established.
+  original long-hold shutdown path. SOS drives active-low AVR PK0, and its
+  original GPIO poll generates the emergency key event.
   See [control evidence](docs/9575-controls.md).
 - The ST7541 model decodes the executing firmware's LCD command/data stream.
   Unknown pixels and capture errors are explicit. The handset profile places
@@ -130,9 +130,15 @@ the supplied image and discards the experiment's RAM and flash changes.
   These scenarios are **not connected to the executing modem** and perform no
   radio transmission, audio transport, network authentication, or real calls.
 
-The GPS receiver, unshipped modem boot block/DSP code, unestablished BlueCore
-peripherals, RF behavior and SIM/provisioning remain outside the implemented
-contracts. Unknown MMIO remains visible and fails in strict mode. Current
+External GPS receiver bytes can be supplied through the 9575 AVR USART0 probe;
+factory tests verify their propagation to coordinates on the original LCD.
+The telephony UART3 probe also accepts external SIM input levels. Separate
+factory contracts verify original card detection, reset/ATR, removal, warm
+startup, file-data publication and empty SMS storage initialization using a
+finite synthetic read-only card; see the [SIM boundary](docs/sim-device-contract.md).
+GNSS radio acquisition, the unshipped modem boot block, DSP execution, unestablished
+BlueCore peripherals, RF behavior and provisioned SIM storage remain outside the
+implemented contracts. Unknown MMIO remains visible and fails in strict mode. Current
 coverage is described in [inferred hardware](docs/inferred-hardware.md);
 [hardware evidence](docs/hardware-evidence.md) preserves the earlier investigation.
 
@@ -142,6 +148,8 @@ coverage is described in [inferred hardware](docs/inferred-hardware.md);
 ./test
 IRIDIUM_TEST_FIRMWARE=/home/arxherre/Documents/Projects/rev-firmware/firmware ./test
 IRIDIUM_TEST_FIRMWARE=/path/to/9555 IRIDIUM_TEST_9575_FIRMWARE=firmware/9575 ./test
+# Require both unmodified factory releases and run the HTTP end-to-end journeys:
+IRIDIUM_TEST_FIRMWARE=/path/to/9555 IRIDIUM_TEST_9575_FIRMWARE=/path/to/9575 ./test-factory
 ```
 
 The first command runs CPU, bus, device, parser, IPC, local API, scenario and UI
@@ -152,6 +160,34 @@ navigation and the original missing-SIM error. Deliberate opcode changes must
 change execution, including an altered application initializer that must fail
 visibly. The original-image suites run separately for each supplied handset
 directory and are explicitly skipped when their environment variable is unset.
+
+`./test-factory` builds the native worker, verifies pinned HT25003/HL25003 BC5,
+AVR and telephony TRX payload hashes, and drives real HTTP controls through original firmware
+to LCD assertions. It fails when either handset's fixtures are missing, modified,
+or for the wrong model, and rejects empty or skipped runs. It saves a JSON run
+report and diagnostic LCD/state artifacts under `test-artifacts/factory-e2e/`
+(`IRIDIUM_E2E_ARTIFACTS` overrides the destination). See the
+[feature coverage ledger](docs/factory-e2e.md) for tested journeys and the
+remaining local-feature, service, GPS and hardware gaps.
+Local UI cases execute BC5/AVR; modem-dependent security and persistence cases
+also load the factory telephony image. Original incoming modem data initializes
+the saved-phonebook index; see the [startup evidence](docs/phonebook-startup.md).
+Both Phone Lock journeys remain enabled as failing
+regressions: 9555 accepts the PIN before an original TRX DSP-fatal reboot;
+9575 takes the same reboot path during PIN entry. Restart enforcement remains
+unverified. A longer 9575 reset/contact-retention journey also reaches that
+DSP-fatal path after verifying its saved contents. Two enabled 9575
+negative-altitude regressions also fail: the
+original HL25003 formatter displays a positive altitude after correctly parsing
+the negative receiver value. See the [firmware defect evidence](docs/gps-altitude-sign.md).
+A maximum-length email regression also fails: the original 9575 Emergency editor accepts
+74 characters but its prefill routine rejects that saved length on reopening.
+The [boundary evidence](docs/email-prefill-limit.md) includes a working
+73-character control and the original comparison responsible for the failure.
+Two GPS validity regressions expose another original AVR defect: NAV-SOL
+fix type is read in place of the validity flags, accepting an invalid 3D
+position and rejecting a valid 2D position. See the
+[solution-validity evidence](docs/gps-solution-validity.md).
 
 GitHub Actions runs the firmware-free suite on pushes and pull requests with
 Python 3.10, Node 22, and checksum-verified Zig 0.17.0.
