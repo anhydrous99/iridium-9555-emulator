@@ -231,7 +231,7 @@ skips). The sole hardware case was skipped. The ten added firmware-free checks
 cover unsupported hosts, unavailable procfs, early rejection and report
 invalidation, key cadence, release after failure and invalid budgets.
 
-Separate targeted factory invocations completed **22 HTTP cases: 15 passed,
+At commit `372e2d8`, targeted factory invocations completed **22 HTTP cases: 15 passed,
 7 ordinary failures, 0 errors and 0 skips**, plus one passing original SIM
 storage contract. All four settings-persistence and four alert-choice cases
 passed, as did both extended-contact persistence, both Inbox read/reply/forward/
@@ -247,6 +247,15 @@ SIM-peer closure checks passed. One interrupted 9575 contact attempt is retained
 as excluded harness history; its fresh complete rerun passed. Local-only reports,
 logs, captures and drivers are retained in `test-artifacts/factory-review-fixes/`.
 The historical aggregate and its baseline copies were not overwritten.
+
+A subsequent SIM-evidence fix saves UART/card captures before teardown integrity
+assertions and closes the handset even if capture persistence fails. Two new
+firmware-free regressions cover unexpected writes, changed card contents and
+evidence-write failures across the three affected fixtures. All 20 fixture
+checks and `./test` pass: 492 Python cases (205 executed, 287 fixture skips),
+25 UI cases and 41 native protocol cases (18 fixture skips); the hardware case
+remains skipped. No factory-firmware journeys were rerun for this output-order
+and cleanup change; the targeted results above retain their recorded commit.
 
 ## Running the factory suite
 

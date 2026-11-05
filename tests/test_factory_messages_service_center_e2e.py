@@ -69,8 +69,11 @@ class MessagesServiceCenterChecks:
             finally:
                 self.peer.close()
         finally:
-            self.peer_evidence = self.peer.evidence()
             try:
+                self.peer_evidence = self.peer.evidence()
+                if path:
+                    Path(str(path) + ".peer.json").write_text(
+                        json.dumps(self.peer_evidence, indent=2) + "\n")
                 writes = [e for e in self.card.events if e["kind"] == "header"
                           and e["bytes"][1] in (0xDC, 0xD6, 0x32)]
                 self.assertTrue(all(e["selected"] == 0x6F42 and
@@ -79,9 +82,6 @@ class MessagesServiceCenterChecks:
                 self.assertEqual(self.card.contents, self.initial_contents)
                 self.assertEqual({k: v for k, v in self.card.records.items() if k != 0x6F42},
                                  {k: v for k, v in self.initial_records.items() if k != 0x6F42})
-                if path:
-                    Path(str(path) + ".peer.json").write_text(
-                        json.dumps(self.peer_evidence, indent=2) + "\n")
             finally:
                 self.handset.close()
                 self.worker_closure = {image: not Path(f"/proc/{worker['pid']}").exists()

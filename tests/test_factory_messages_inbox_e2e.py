@@ -74,8 +74,10 @@ class MessagesInboxChecks:
             finally:
                 self.peer.close()
         finally:
-            self.peer_evidence = self.peer.evidence()
             try:
+                self.peer_evidence = self.peer.evidence()
+                if path:
+                    Path(str(path) + ".peer.json").write_text(json.dumps(self.peer_evidence, indent=2) + "\n")
                 writes = [event for event in self.card.events if event["kind"] == "header"
                           and event["bytes"][1] in (0xDC, 0xD6, 0x32)]
                 self.assertTrue(all(event["selected"] in (0x6F3C, 0x6F43) for event in writes))
@@ -83,8 +85,6 @@ class MessagesInboxChecks:
                                  {key: rows for key, rows in self.initial_records.items() if key != 0x6F3C})
                 self.assertEqual({key: value for key, value in self.card.contents.items() if key != 0x6F43},
                                  {key: value for key, value in self.initial_contents.items() if key != 0x6F43})
-                if path:
-                    Path(str(path) + ".peer.json").write_text(json.dumps(self.peer_evidence, indent=2) + "\n")
             finally:
                 self.handset.close()
                 self.worker_closure = {image: not Path(f"/proc/{worker['pid']}").exists()

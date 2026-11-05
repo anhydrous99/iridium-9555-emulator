@@ -1,6 +1,7 @@
 """Firmware-free checks that the factory suite cannot give false assurance."""
 
 from contextlib import redirect_stderr
+from copy import deepcopy
 from hashlib import sha256
 import io
 import importlib
@@ -323,6 +324,74 @@ class FactoryKeyContactTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Key budgets"):
                     FactoryHandset.press(handset, "5", **arguments)
                 handset.key.assert_not_called()
+
+
+class FactorySIMEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+
+    def fixtures(self):
+        from sim_language_card import StorageSIM
+        from sim_message_card import MessageSIM
+        from sim_service_center_card import ServiceCenterSIM
+        from test_factory_messages_local_e2e import MessagesLocalChecks
+        from test_factory_messages_inbox_e2e import MessagesInboxChecks
+        from test_factory_messages_service_center_e2e import MessagesServiceCenterChecks
+        return ((MessagesLocalChecks, StorageSIM), (MessagesInboxChecks, MessageSIM),
+                (MessagesServiceCenterChecks, ServiceCenterSIM))
+
+    def fixture(self, checks, card_type):
+        from factory_sim_peer import FactorySIMPeer
+        from iridium.engine import Engine
+        fixture = unittest.TestCase()
+        fixture.card = card_type()
+        fixture.initial_records = deepcopy(fixture.card.records)
+        fixture.initial_contents = dict(fixture.card.contents)
+        fixture.handset = Mock()
+        fixture.handset.state.return_value = {"images": []}
+        path = self.directory / checks.__name__
+        fixture.handset.save_artifacts.return_value = path
+        fixture.peer = Mock(spec=FactorySIMPeer)
+        fixture.peer.card = fixture.card
+        fixture.peer.controls = []
+        fixture.peer.wire = [{"tx": [0xA0, 0xDC, 1, 4, 32]}]
+        fixture.peer.workers = {}
+        fixture.peer.errors = []
+        fixture.peer.request_method = Engine.request
+        fixture.peer.thread = Mock()
+        fixture.peer.thread.is_alive.return_value = False
+        fixture.peer.evidence.side_effect = lambda: FactorySIMPeer.evidence(fixture.peer)
+        return fixture, Path(str(path) + ".peer.json")
+
+    def test_failed_card_validation_preserves_peer_evidence_and_closes_handset(self):
+        for checks, card_type in self.fixtures():
+            faults = ("write",) if checks.__name__ == "MessagesLocalChecks" else ("write", "contents")
+            for fault in faults:
+                with self.subTest(fixture=checks.__name__, fault=fault):
+                    fixture, sidecar = self.fixture(checks, card_type)
+                    sidecar.unlink(missing_ok=True)
+                    if fault == "write":
+                        fixture.card.events.append({"kind": "header", "selected": 0x6F3A,
+                                                    "bytes": [0xA0, 0xDC, 1, 4, 32]})
+                    else:
+                        fixture.card.contents[0x6F05] = b"\x05\x04"
+                    with self.assertRaises(AssertionError):
+                        checks.finish(fixture)
+                    self.assertEqual(json.loads(sidecar.read_text()), fixture.peer_evidence)
+                    fixture.peer.close.assert_called_once_with()
+                    fixture.handset.close.assert_called_once_with()
+
+    def test_failed_peer_evidence_write_still_closes_handset(self):
+        for checks, card_type in self.fixtures():
+            with self.subTest(fixture=checks.__name__):
+                fixture, _ = self.fixture(checks, card_type)
+                with patch.object(Path, "write_text", side_effect=OSError("disk full")), \
+                        self.assertRaisesRegex(OSError, "disk full"):
+                    checks.finish(fixture)
+                fixture.peer.close.assert_called_once_with()
+                fixture.handset.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

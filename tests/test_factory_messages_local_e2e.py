@@ -58,16 +58,18 @@ class MessagesLocalChecks:
             finally:
                 self.peer.close()
         finally:
-            self.peer_evidence = self.peer.evidence()
-            self.assertFalse(any(event["kind"] == "header" and event["bytes"][1] in (0xD6, 0xDC, 0x32)
-                                 for event in self.peer.card.events), "Read-only journey attempted a card write")
-            if path:
-                Path(str(path) + ".peer.json").write_text(
-                    json.dumps(self.peer_evidence, indent=2) + "\n")
-            self.handset.close()
-            self.worker_closure = {image: not Path(f"/proc/{worker['pid']}").exists()
-                                   for image, worker in self.peer.workers.items()}
-            self.assertTrue(all(self.worker_closure.values()))
+            try:
+                self.peer_evidence = self.peer.evidence()
+                if path:
+                    Path(str(path) + ".peer.json").write_text(
+                        json.dumps(self.peer_evidence, indent=2) + "\n")
+                self.assertFalse(any(event["kind"] == "header" and event["bytes"][1] in (0xD6, 0xDC, 0x32)
+                                     for event in self.peer.card.events), "Read-only journey attempted a card write")
+            finally:
+                self.handset.close()
+                self.worker_closure = {image: not Path(f"/proc/{worker['pid']}").exists()
+                                       for image, worker in self.peer.workers.items()}
+                self.assertTrue(all(self.worker_closure.values()))
 
     def read(self, image, address, count=1):
         return self.handset.request("POST", "/api/probe", {
