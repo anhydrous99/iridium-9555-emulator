@@ -20,10 +20,10 @@ ALL_KEYS = set(KEY_CODES) | {"power", "convenience", "sos"}
 LIMITATIONS = [
     "Digital hardware behavior and processor clock ratios are inferred from firmware; physical timing is not calibrated.",
     "Empty upgrade images need factory settings; original factory routines provision these before hardware startup.",
-    "Keys use the GPIO matrix and power uses AVR inputs; the 9575 SOS electrical path is unresolved and uses its known software entry.",
+    "Keys use the GPIO matrix; power and 9575 SOS use firmware-derived AVR inputs.",
     "LCD output uses inferred serial/controller models; resource previews remain separate from live output.",
     "Satellite service scenarios are offline and are not connected to the modem firmware.",
-    "Unshipped modem boot ROM/DSP code, unestablished RF behavior and SIM/provisioning are outside the modeled scope.",
+    "The modem boot ROM is unshipped; DSP execution, RF behavior and SIM/provisioning are outside the modeled scope.",
 ]
 
 
@@ -105,8 +105,8 @@ class Session:
                         if primary and primary.state.get("bc5_hardware") and code is not None and key != "sos":
                             if firmware.image != "bc5":
                                 self._request(primary, "key", code=code, pressed=False)
-                        elif key == "power" and self.spi_link and firmware.image != "avr":
-                            self._power_input(False)
+                        elif key in self.profile.button_pins and self.spi_link and firmware.image != "avr":
+                            self._button_input(key, False)
                     # A new AVR starts a new board boot. Reset the retained primary
                     # so no native DMA byte remains owned by the retired SPI link.
                     if restart_board:
@@ -182,7 +182,8 @@ class Session:
 
     def _active_processors(self):
         return [worker for image, worker in self.engines.items()
-                if (not self.modem_link or image not in ("trx", "ptt") or image == self.modem_image)
+                if (not self.modem_link or image not in ("trx", "ptt")
+                    or image == self.modem_image and self.modem_link.powered)
                 and not (image == "avr" and self.spi_link and self.spi_link.hold_reset)]
 
     def _board_quantum(self, limit):
@@ -191,9 +192,12 @@ class Session:
 
     def _connect_modem(self):
         if "avr" in self.engines and self.modem_image in self.engines:
-            endpoints = ((self.engines["avr"], 0), (self.engines[self.modem_image], 1))
-            if not self.modem_link or self.modem_link.endpoints != endpoints:
-                self.modem_link = ModemLink(self.engines["avr"], self.engines[self.modem_image], self.modem_image)
+            endpoints = ((self.engines["avr"], self.profile.modem_uart), (self.engines[self.modem_image], 1))
+            power_pin = self.profile.modem_power_pin if "bc5" in self.engines else None
+            if (not self.modem_link or self.modem_link.endpoints != endpoints
+                    or self.modem_link.power_pin != power_pin):
+                self.modem_link = ModemLink(self.engines["avr"], self.engines[self.modem_image], self.modem_image,
+                                           avr_port=self.profile.modem_uart, power_pin=power_pin)
         else:
             self.modem_link = None
         if "bc5" in self.engines and "avr" in self.engines:
@@ -358,15 +362,15 @@ class Session:
             try:
                 key_code = self.profile.key_codes.get(key)
                 worker = self.engines.get("bc5")
-                if changed and worker and worker.state.get("bc5_hardware") and key_code is not None and key != "sos":
+                if changed and key in self.profile.button_pins and self.spi_link:
+                    self._button_input(key, down)
+                    delivered = electrical = True
+                elif changed and worker and worker.state.get("bc5_hardware") and key_code is not None and key != "sos":
                     if self.ui_initialized and worker.request("read", address=self.profile.key_callback, count=2)["values"] == [0, 0]:
                         self.ui_initialized = False
                     self._request(worker, "key", code=key_code, pressed=down)
                     delivered = electrical = True
-                elif changed and key == "power" and self.spi_link:
-                    self._power_input(down)
-                    delivered = electrical = True
-                elif changed and self.ui_initialized and key_code is not None:
+                elif changed and self.ui_initialized and key_code is not None and key != "sos":
                     worker = self.engines["bc5"]
                     self._idle(worker)
                     callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
@@ -406,9 +410,9 @@ class Session:
             return {"ok": True, "delivered": delivered, "message": message,
                     "generation": self.key_generations[key], "key_epoch": self.key_epoch}
 
-    def _power_input(self, pressed):
+    def _button_input(self, key, pressed):
         worker = self.engines["avr"]
-        port, bit = self.profile.power_pin
+        port, bit = self.profile.button_pins[key]
         value = worker.request("pin_state")["inputs"][port]
         value = value & ~(1 << bit) if pressed else value | (1 << bit)
         self._request(worker, "pins", port=port, value=value)
@@ -416,7 +420,7 @@ class Session:
     def probe(self, image: str, operation: str, arguments: dict) -> dict:
         if operation not in ("read", "write", "call", "state", "pins", "uart_rx", "uart_tx", "spi",
                              "adc", "irq", "trace", "uart_io", "comparator", "async_clock", "twi",
-                             "program_read", "fuses", "pin_state", "serial", "call_resume", "key"):
+                             "program_read", "fuses", "pin_state", "serial", "call_resume", "key", "uart_pins"):
             raise ValueError("Unsupported debugger operation")
         with self._lock:
             self._ensure_open()
@@ -602,7 +606,7 @@ class Session:
                 setup.get("halt") or not (setup.get("last_call") or {}).get("returned")):
             raise EngineError(f"Original application setup did not return: {setup.get('halt')}")
         # Startup samples the released, active-low power button before polling changes.
-        self._power_input(False)
+        self._button_input("power", False)
         try:
             self._request(worker, "warm_reset")
             self._idle(worker)
@@ -617,7 +621,7 @@ class Session:
             else:
                 raise EngineError("Original firmware did not power on within the startup budget")
         finally:
-            self._power_input(False)
+            self._button_input("power", False)
         self._idle(worker)
         callback = worker.request("read", address=self.profile.key_callback, count=2)["values"]
         if callback == [0, 0]:

@@ -116,7 +116,7 @@ test "multiple contacts combine directly selected columns without adding ghost p
     try std.testing.expectEqual(@as(u16, 0), m.inputs());
 }
 
-test "unestablished keys fail atomically, including SOS absent from both supplied matrices" {
+test "unknown matrix contacts fail atomically, including the separate SOS input" {
     var m: Model = .{};
     try m.setKey(0xAA, true);
     select(&m, mask);

@@ -55,6 +55,34 @@ class Avr:
 
 
 class SpiLinkTests(unittest.TestCase):
+    def test_selected_transaction_keeps_service_cadence_between_single_byte_dmas(self):
+        for model in ("9555", "9575"):
+            with self.subTest(model=model):
+                bc5 = Bc5(serial(0x81, sequence=1, active=True, remaining=1),
+                          serial(sequence=1), serial(sequence=1),
+                          serial(0x30, sequence=2, active=True, remaining=1),
+                          serial(sequence=2, output=0x8010))
+                avr = Avr(0, 0x80)
+                link = SpiLink(bc5, avr, model)
+                link.exchange()
+                avr.advance()
+                link.exchange()
+                self.assertFalse(link.pending)
+                self.assertEqual(link.quantum, 128)
+                avr.advance(link.quantum)
+                link.exchange()
+                self.assertEqual(link.transferred, 1, "An idle DMA must not invent a byte")
+                self.assertEqual(link.quantum, 128)
+                link.exchange()
+                self.assertEqual(link.transferred, 2)
+                avr.advance()
+                link.exchange()
+                self.assertFalse(link.pending)
+                self.assertEqual(link.quantum, 4096)
+                self.assertEqual([args for op, args in bc5.calls if op == "serial"],
+                                 [{}, {"received": 0, "sequence": 1}, {}, {},
+                                  {"received": 0x80, "sequence": 2}])
+
     def test_partial_avr_execution_preserves_the_inter_byte_service_phase(self):
         bc5 = Bc5(serial(0x11, sequence=1, active=True, remaining=2),
                   *(serial(sequence=1, active=True, remaining=2) for _ in range(3)),
@@ -171,7 +199,7 @@ class SpiLinkTests(unittest.TestCase):
     def test_bytes_and_replies_are_pipelined_across_separate_exchanges(self):
         bc5 = Bc5(serial(0x81, sequence=10, active=True, remaining=2),
                   serial(0x0B, sequence=11, active=True, remaining=1),
-                  serial(sequence=12))
+                  serial(sequence=12, output=0x8010))
         avr = Avr(0x00, 0x80)
         link = SpiLink(bc5, avr, "9555")
         self.assertEqual(link.quantum, 4096)

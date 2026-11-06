@@ -305,7 +305,7 @@ class SessionTests(unittest.TestCase):
 
     def test_power_on_rejects_owned_power_before_mutating_the_board(self):
         worker = self.initialize_key_handler()
-        self.session._power_input = Mock()
+        self.session._button_input = Mock()
         self.session._step = Mock()
         self.browser_key("tab-a", 1, True, key="power")
         self.session.ui_initialized = False
@@ -317,7 +317,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.key_epoch, epoch)
         self.assertEqual(self.session.keys, {"power"})
         worker.request.assert_not_called()
-        self.assertEqual([call.args[0] for call in self.session._power_input.call_args_list], [True])
+        self.assertEqual([call.args for call in self.session._button_input.call_args_list], [("power", True)])
         self.assertFalse(self.browser_key("tab-b", 1, True, key="power")["delivered"])
         self.assertFalse(self.browser_key("tab-a", 2, False, key="power")["delivered"])
         self.assertTrue(self.browser_key("tab-b", 2, False, key="power")["delivered"])
@@ -325,15 +325,32 @@ class SessionTests(unittest.TestCase):
 
     def test_shared_power_input_changes_only_for_first_press_and_last_release(self):
         self.initialize_key_handler()
-        self.session._power_input = Mock()
+        self.session._button_input = Mock()
         self.session._step = Mock()
         self.assertTrue(self.browser_key("tab-a", 1, True, key="power")["delivered"])
         self.assertFalse(self.browser_key("tab-b", 1, True, key="power")["delivered"])
         self.assertFalse(self.browser_key("tab-a", 2, False, key="power")["delivered"])
         self.assertEqual(self.session.keys, {"power"})
         self.assertTrue(self.browser_key("tab-b", 2, False, key="power")["delivered"])
-        self.assertEqual([call.args[0] for call in self.session._power_input.call_args_list], [True, False])
+        self.assertEqual([call.args for call in self.session._button_input.call_args_list],
+                         [("power", True), ("power", False)])
         self.assertEqual([call.args[0] for call in self.session._step.call_args_list], [5200000, 150000])
+        self.assertEqual(self.session.keys, set())
+
+    def test_shared_sos_uses_avr_input_only_for_first_press_and_last_release(self):
+        self.session.load(parse_firmware(bytes(0x36BB22), "bc5_main.bin"))
+        self.session.load(parse_firmware(bytes(14296), "avr.bin"))
+        self.session._button_input = Mock()
+        self.session._step = Mock()
+        self.session._call = Mock()
+        self.assertTrue(self.browser_key("tab-a", 1, True, key="sos")["delivered"])
+        self.assertFalse(self.browser_key("tab-b", 1, True, key="sos")["delivered"])
+        self.assertFalse(self.browser_key("tab-a", 2, False, key="sos")["delivered"])
+        self.assertTrue(self.browser_key("tab-b", 2, False, key="sos")["delivered"])
+        self.assertEqual([call.args for call in self.session._button_input.call_args_list],
+                         [("sos", True), ("sos", False)])
+        self.assertEqual([call.args for call in self.session._step.call_args_list], [(150000,), (150000,)])
+        self.session._call.assert_not_called()
         self.assertEqual(self.session.keys, set())
 
     def test_two_clients_inject_only_first_press_and_last_release(self):

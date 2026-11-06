@@ -1,7 +1,8 @@
-"""Firmware-inferred AVR USART0 ↔ modem logical UART1 wiring.
+"""Firmware-inferred AVR modem USART ↔ modem logical UART1 wiring.
 
-The AVR routes DPL channel 7 on USART0; the modem DPL initializer selects
-logical UART1. Instruction quanta are deterministic, not a measured clock ratio.
+The AVR modem endpoint is USART0 on 9555 and USART3 on 9575; the modem DPL
+initializer selects logical UART1. The handset's link-enable output gates
+modem execution. Instruction quanta are not a measured clock ratio.
 """
 
 from .engine import EngineError
@@ -10,9 +11,12 @@ from .engine import EngineError
 class ModemLink:
     quantum = 4096
 
-    def __init__(self, avr, modem, image):
-        self.endpoints = ((avr, 0), (modem, 1))
+    def __init__(self, avr, modem, image, *, avr_port=0, power_pin=None):
+        self.endpoints = ((avr, avr_port), (modem, 1))
         self.image = image
+        self.power_pin = power_pin
+        self.powered = power_pin is None
+        self.power_resets = 0
         self.pending = [bytearray(), bytearray()]
         self.delivered = [0, 0]
         self.error = None
@@ -21,9 +25,22 @@ class ModemLink:
         if self.error:
             raise EngineError(self.error)
         try:
+            if self.power_pin is not None:
+                port, bit = self.power_pin
+                snapshot = self.endpoints[0][0].request("pin_state")
+                pins = snapshot.get("pins") if isinstance(snapshot, dict) else None
+                if (not isinstance(pins, list) or len(pins) <= port
+                        or any(type(value) is not int or not 0 <= value <= 255 for value in pins)):
+                    raise EngineError("Invalid AVR pins on modem power link")
+                enabled = bool(pins[port] & (1 << bit)) and not avr_reset
+                if enabled and not self.powered:
+                    self.endpoints[1][0].request("warm_reset")
+                    self.power_resets += 1
+                    self.pending = [bytearray(), bytearray()]
+                self.powered = enabled
             for direction, (source, port) in enumerate(self.endpoints):
                 response = source.request("uart_io", port=port)
-                if direction == 1 and avr_reset:
+                if not self.powered or direction == 1 and avr_reset:
                     self.pending[direction].clear()
                 else:
                     self.pending[direction].extend(response["values"])
@@ -31,6 +48,9 @@ class ModemLink:
                     raise EngineError("UART capture overflow on the processor link; reset before continuing")
                 if len(self.pending[direction]) > 4096:
                     raise EngineError("Processor link backlog exceeded 4096 bytes; reset before continuing")
+            if not self.powered:
+                self.pending = [bytearray(), bytearray()]
+                return
             for direction, pending in enumerate(self.pending):
                 if not pending:
                     continue
@@ -48,7 +68,10 @@ class ModemLink:
 
     def state(self):
         return {"connected": True, "modem": self.image,
-                "assumption": "inferred-avr-usart0-modem-uart1",
+                "assumption": "inferred-avr-modem-usart-to-modem-uart1",
+                "avr_port": self.endpoints[0][1],
+                "power_managed": self.power_pin is not None, "powered": self.powered,
+                "power_resets": self.power_resets,
                 "quantum_instructions": self.quantum,
                 "avr_to_modem": self.delivered[0], "modem_to_avr": self.delivered[1],
                 "pending": [len(data) for data in self.pending], "error": self.error}
@@ -70,6 +93,7 @@ class SpiLink:
         self.error = None
         self._byte = self._reply = None
         self._clocked_at = None
+        self._selected = False
 
     @property
     def quantum(self):
@@ -77,7 +101,8 @@ class SpiLink:
             remaining = 128 - (self.avr.state["steps"] - self._clocked_at)
             if remaining > 0:
                 return remaining
-        return 128 if self.pending else 4096
+        # Firmware starts successive single-byte DMAs within one selected transaction.
+        return 128 if self.pending or self._selected else 4096
 
     @staticmethod
     def _number(value, maximum):
@@ -140,6 +165,7 @@ class SpiLink:
                              value=(0x1000 if handshake else 0) | (0x4000 if attention else 0))
 
             selected = bool(gpio["direction"] & 0x10 and not gpio["output"] & 0x10)
+            self._selected = selected and not held
             if self._byte is not None and self._reply is None and not held and selected and (not unserviced or reset):
                 reply = self.avr.request("spi", value=self._byte[0])
                 if not isinstance(reply, dict) or "value" not in reply:

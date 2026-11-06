@@ -6,7 +6,8 @@ entry points; the loaded image selects the handset throughout the host and UI.
 `iridium/engine.py` owns a native worker and its bounded JSON-lines transport.
 `iridium/session.py` serializes debugger actions, input events and satellite
 scenarios. `iridium/board.py` connects BC5 serial DMA to the executing AVR SPI
-slave and AVR USART0 to the selected modem's UART1. `iridium/server.py` exposes that session
+slave and the AVR modem USART (0 on 9555, 3 on 9575) to the selected modem's UART1.
+`iridium/server.py` exposes that session
 on all IPv4 interfaces by default (`--host 127.0.0.1` restricts access to loopback).
 `ui/` renders state without synthesizing firmware menus.
 While running it polls 50 ms after each completed response, with only one state
@@ -16,7 +17,8 @@ Paused sessions retain the slower 1,250 ms polling interval.
 `native/main.zig` adapts the original CPU/SoC implementations under
 `native/vendor/`. Each processor lives in a separate OS process because the
 inherited models use process-global state. The host schedules 4096-instruction
-quanta, reducing them to 128 while SPI transfers need service. This is a
+quanta, reducing them to 128 while SPI transfers need service, including gaps
+between single-byte DMA requests while chip select remains asserted. This is a
 deterministic digital board schedule, not measured physical clock ratios.
 The scenario clock remains separate from the firmware transports.
 
@@ -91,6 +93,10 @@ flags. Its original reset code executes from the configured reset vector. A cold
 AVR reset restores the supplied program and clears the experiment's device state.
 An active flash programming operation continues across external reset with its
 remaining time and captured page data; the temporary page buffer is reset.
+TRX/PTT `warm_reset` retains emulated flash while clearing CPU, RAM, peripheral
+and observation state. A cold modem reset restores flash from the source image.
+These operations do not provide the unshipped boot ROM or execute the DSP
+program/data blobs embedded in the modem payload.
 
 The Python transport applies one 30-second deadline to sending a request and
 receiving its reply. Timeouts, disconnects, malformed replies and oversized replies
@@ -118,7 +124,20 @@ operation changes the original file. The AVR also exposes device stimuli:
 {"op":"spi","value":0}
 ```
 
-UART queues and SPI replies require intervening CPU execution. The coupled board wires AVR SPI to BC5 and USART0 to the selected modem.
+UART queues and SPI replies require intervening CPU execution. The coupled board
+wires AVR SPI to BC5 and the model-specific modem USART to the selected modem.
+With BC5 loaded, the firmware's link-enable output (PA5 on 9555, PC4 on 9575)
+gates modem execution. A rising enable starts a flash-preserving modem reset;
+disable or AVR reset discards transport backlog. This inferred startup schedule
+prevents modem startup frames from expiring before the AVR's final boot reset.
+Standalone AVR/modem experiments remain independently clocked. Physical modem
+power/reset wiring and clock ratios remain unmeasured.
+
+The 9575 receiver input is AVR USART0. Tests supply external UBX/NMEA packets
+through `uart_io`; the original AVR parses them, publishes its packed SPI
+registers and the original BC5 renders the location. The host does not write
+coordinate globals or feed the offline satellite scenario into firmware.
+GNSS radio acquisition and handset/network time synchronization are excluded.
 `uart_io`, `pin_state`, `serial`, `adc`, `comparator`, `async_clock`, `twi`,
 `fuses` and `program_read` expose explicit device stimuli/observations; see the
 [inferred hardware protocol](inferred-hardware.md).
@@ -159,6 +178,13 @@ Power-on is rejected while a client still owns the power button; release the
 button before starting a new boot. Reset attempts every loaded processor before
 reporting a worker failure, so surviving processors release their contacts.
 
+Original incoming modem data also advances startup from state `0x10` to `0x20`
+and invokes the saved-phonebook index builder. A BC5/AVR-only startup can display
+an empty index while its contact records remain intact in flash. Retention
+journeys therefore include the genuine TRX image; see
+[phonebook startup evidence](phonebook-startup.md). No host callback fills this
+cache.
+
 The AVR executes every SPI command and produces the handshake/attention GPIO
 levels. The host services both processors during bounded probes; `last_call.pending`
 and `call_resume` preserve a live probe while an external peripheral needs CPU
@@ -171,8 +197,9 @@ feed GPIO IRQ15, debounce, scanning and the original key mapper. UI press/releas
 requests include 150,000 instructions for contact settling; native `key` plus
 explicit `run` requests permit timing-sensitive tests. Power drives PC0 on 9555
 or PJ3 on 9575 LOW while pressed, including the original 500ms shutdown hold.
-The 9575 SOS wire is unestablished and retains the original software-input
-boundary. The convenience key, location screens and emergency countdown execute
+The 9575 SOS input drives active-low AVR PK0; original SPI GPIO polling maps
+that input to the emergency key. Reset releases both PJ3 Power and PK0 SOS;
+warm reset preserves held external levels. The convenience key, location screens and emergency countdown execute
 in guest code. No GPS coordinates or emergency-service responses are fabricated.
 
 The UI's initialized state clears when original firmware enters shutdown, so a
@@ -223,7 +250,10 @@ before injection can be retried, while a later scheduler failure does not cause
 the same transition to be injected twice.
 
 `/api/probe` accepts the native `read`, `write`, `call`, `state`, `pins`,
-`uart_rx`, `uart_tx` and `spi` operations. Numeric addresses are JSON integers.
+`uart_rx`, `uart_tx`, `uart_pins` and `spi` operations. Numeric addresses are JSON integers.
+Telephony-only `uart_pins` requires port `3` and separates external inputs from
+firmware outputs; see the [SIM contract](sim-device-contract.md). Pin probes
+do not advance processors or supply a card filesystem.
 BC5 `call` and `call_resume` service the connected board while the function
 waits for SPI. Continuations retain their requested instruction limit. Native
 validation runs before peripheral execution, and serial MMU faults finalize the

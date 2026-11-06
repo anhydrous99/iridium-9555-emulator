@@ -192,14 +192,7 @@ fn initialize(init: std.process.Init, path: []const u8) !void {
         .trx, .ptt => {
             const expected: usize = if (current_image == .trx) 0x260760 else 0xA7BF8;
             if (firmware.len != expected) return error.BadTrxImageSize;
-            @memset(&m.flash, 0xFF);
-            const offset: usize = if (current_image == .trx) 0 else 0x400000 - m.flash_base;
-            @memcpy(m.flash[offset..][0..firmware.len], firmware);
-            try m.reset(init.gpa, if (current_image == .trx) .p1 else .p2, 8);
-            trx_model = .{ .gpa = init.gpa, .nwin = 8, .ptt = current_image == .ptt };
-            attachTrxDevices();
-            trx_flash = .{ .mem = &m.flash, .base = m.flash_base, .bus = &m.bus };
-            m.cpu.asi1 = trx_flash.device();
+            try resetModem(init.gpa, true);
         },
     }
     ready = true;
@@ -403,6 +396,26 @@ fn attachTrxDevices() void {
     m.bus.dev = .{ .ctx = &trx_model, .read = trxRead, .write = trxWrite };
 }
 
+fn resetModem(gpa: std.mem.Allocator, restore_image: bool) !void {
+    const sim_inputs = if (ready and !restore_image and current_image == .trx) trx_model.sim_inputs else 0;
+    if (ready) {
+        trx_model.deinit();
+        m.deinit();
+        ready = false;
+    }
+    if (restore_image) {
+        @memset(&m.flash, 0xFF);
+        const offset: usize = if (current_image == .trx) 0 else 0x400000 - m.flash_base;
+        @memcpy(m.flash[offset..][0..firmware.len], firmware);
+    }
+    try m.reset(gpa, if (current_image == .trx) .p1 else .p2, 8);
+    trx_model = .{ .gpa = gpa, .nwin = 8, .ptt = current_image == .ptt, .sim_inputs = sim_inputs };
+    attachTrxDevices();
+    trx_flash = .{ .mem = &m.flash, .base = m.flash_base, .bus = &m.bus };
+    m.cpu.asi1 = trx_flash.device();
+    ready = true;
+}
+
 fn trxRead(_: *anyopaque, address: u32, bits: u8) u64 {
     if (hardware_strict and !trx.devices.modeledAccess(address, false)) {
         hardwareFault(&m.bus, address, false);
@@ -439,18 +452,7 @@ fn reset(init: std.process.Init) !void {
             avr_cpu.st.pc = avr_dev.resetVector();
             if (handset == .@"9575") avr_cpu.st.sp = 0x21FF;
         },
-        .trx, .ptt => {
-            trx_model.deinit();
-            m.deinit();
-            @memset(&m.flash, 0xFF);
-            const offset: usize = if (current_image == .trx) 0 else 0x400000 - m.flash_base;
-            @memcpy(m.flash[offset..][0..firmware.len], firmware);
-            try m.reset(init.gpa, if (current_image == .trx) .p1 else .p2, 8);
-            trx_model = .{ .gpa = init.gpa, .nwin = 8, .ptt = current_image == .ptt };
-            attachTrxDevices();
-            trx_flash = .{ .mem = &m.flash, .base = m.flash_base, .bus = &m.bus };
-            m.cpu.asi1 = trx_flash.device();
-        },
+        .trx, .ptt => try resetModem(init.gpa, true),
     }
     resetCounters();
 }
@@ -464,6 +466,7 @@ fn idleAvrInputs() void {
     // Released active-low power button; auxiliary PC1/PJ4 low and PD4/PJ5 high.
     if (handset == .@"9575") {
         avr_dev.setPinsIn(8, 0x28);
+        avr_dev.setPinsIn(9, 1); // Released active-low SOS input, PK0.
     } else {
         avr_dev.setPinsIn(2, 1);
         avr_dev.setPinsIn(3, 0x10);
@@ -766,7 +769,7 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
             avr_soc.loader.coldReset(&avr_cpu);
             avr_cpu.st.pc = avr_dev.resetVector();
             if (handset == .@"9575") avr_cpu.st.sp = 0x21FF;
-        } else return error.ResetUnavailable;
+        } else try resetModem(init.gpa, false);
         resetCounters();
     } else if (std.mem.eql(u8, op.string, "reset_clock")) {
         if (current_image != .avr) return error.AvrOnly;
@@ -807,6 +810,16 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
     } else if (std.mem.eql(u8, op.string, "serial")) {
         if (current_image != .bc5) return error.Bc5Only;
         return serial(out, obj);
+    } else if (std.mem.eql(u8, op.string, "uart_pins")) {
+        if (current_image != .trx) return error.TrxOnly;
+        if (try number(u2, obj, "port", null) != 3) return error.BadPort;
+        if (obj.contains("value")) {
+            const value = try number(u16, obj, "value", null);
+            const selected = try number(u16, obj, "mask", 0x101);
+            if ((value | selected) & ~@as(u16, 0x101) != 0) return error.BadPinMask;
+            trx_model.setSimPinsIn(value, selected);
+        } else if (obj.contains("mask")) return error.MissingField;
+        return json(out, .{ .port = @as(u2, 3), .inputs = trx_model.sim_inputs, .outputs = trx_model.simPinsOut(), .pins = trx_model.simPins(), .input_mask = @as(u16, 0x101), .output_mask = @as(u16, 0xFE) });
     } else if (std.mem.eql(u8, op.string, "pins")) {
         if (current_image == .bc5) {
             const value = try number(u16, obj, "value", null);

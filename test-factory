@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Run both handsets' factory-firmware HTTP end-to-end tests without silent skips."""
+
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parent
+sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
+
+from factory_handset import FIRMWARE_ENV, factory_firmware, require_factory_host
+
+
+class FactoryResult(unittest.TextTestResult):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.passed_tests = []
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self.passed_tests.append(test.id())
+
+
+def main():
+    directory = Path(os.environ.get("IRIDIUM_E2E_ARTIFACTS", ROOT / "test-artifacts/factory-e2e"))
+    report = directory / "report.json"
+    try:
+        report.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Factory E2E could not invalidate the previous report: {error}", file=sys.stderr)
+        return 2
+    images = {}
+    try:
+        for model, variable in FIRMWARE_ENV.items():
+            if not os.environ.get(variable):
+                raise ValueError(f"Set {variable} to the {model} factory firmware directory")
+        for model, variable in FIRMWARE_ENV.items():
+            firmware_directory = os.environ[variable]
+            images[model] = [image.describe() for image in factory_firmware(model, firmware_directory, modem=True)]
+        require_factory_host()
+    except (OSError, ValueError) as error:
+        print(f"Factory E2E preflight failed: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        subprocess.run(["zig", "build", "-j2"], cwd=ROOT, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Factory E2E build failed: {error}", file=sys.stderr)
+        return 2
+    suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_factory*e2e.py")
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.monotonic()
+    result = unittest.TextTestRunner(verbosity=2, resultclass=FactoryResult).run(suite)
+    passed = (result.wasSuccessful() and result.testsRun > 0
+              and not result.skipped and not result.expectedFailures)
+    directory.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps({
+        "passed": passed, "tests_run": result.testsRun,
+        "started_at": started_at, "duration_seconds": time.monotonic() - started,
+        "passed_tests": result.passed_tests,
+        "failures": [{"test": test.id(), "traceback": detail} for test, detail in result.failures],
+        "errors": [{"test": test.id(), "traceback": detail} for test, detail in result.errors],
+        "skipped": [{"test": test.id(), "reason": reason} for test, reason in result.skipped],
+        "expected_failures": [{"test": test.id(), "traceback": detail}
+                              for test, detail in result.expectedFailures],
+        "unexpected_successes": [test.id() for test in result.unexpectedSuccesses],
+        "firmware": images,
+        "scope": "HTTP to native factory BC5/AVR and telephony TRX where requested to LCD; supplied GPS receiver bytes included, RF acquisition and satellite service excluded",
+    }, indent=2) + "\n")
+    print(f"Factory E2E report: {report}", file=sys.stderr)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

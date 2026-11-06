@@ -99,7 +99,9 @@ class ProbeTests(unittest.TestCase):
             bc5, avr = images(model)
             data = bytearray(bc5.data)
             data[0x100:0x102] = b"\xe0\0"
-            receiver = [0] * 5000 + [0xE52A, 0xCFFF]  # r18=0x5A after more than one board quantum
+            ddr, port, mask = (0x27, 0x28, 0x10) if model == "9575" else (0x21, 0x22, 0x20)
+            power = [0xE000 | ((mask & 0xF0) << 4), 0x9300, ddr, 0x9300, port]
+            receiver = power + [0] * 5000 + [0xE52A, 0xCFFF]  # r18=0x5A after more than one board quantum
             firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
                         parse_firmware(b"".join(word.to_bytes(2, "little") for word in receiver).ljust(
                             0x4000 if model == "9555" else 0x20000, b"\xff"), "avr.bin", "avr", model=model)]
@@ -108,6 +110,9 @@ class ProbeTests(unittest.TestCase):
                                                image + ".bin", image, model=model))
             for modem in ("none", "trx", "ptt"):
                 with self.subTest(model=model, modem=modem), Session(EXECUTABLE, firmware, modem_image=modem) as session:
+                    session.control("step", 128)
+                    if session.modem_link:
+                        self.assertTrue(session.modem_link.powered)
                     primary = session.engines["bc5"]
                     stopped = primary.request("call", entry=0x100, steps=1)
                     self.assertEqual(stopped["halt"], "probe-did-not-return")
@@ -341,8 +346,14 @@ class ProbeTests(unittest.TestCase):
                         self.assertEqual(session.engines["avr"].state["registers"][18], 0xFF)
 
     def test_yielding_reset_probes_discard_modem_backlog_and_keep_later_traffic(self):
+        def fmt3(op, op3, rd, rs1, immediate):
+            return (op << 30) | (rd << 25) | (op3 << 19) | (rs1 << 14) | 0x2000 | immediate
+
         for model in ("9555", "9575"):
             bc5, avr = images(model)
+            ddr, port, mask, control, status, uart_data = (
+                (0x27, 0x28, 0x10, 0x131, 0x130, 0x136) if model == "9575"
+                else (0x21, 0x22, 0x20, 0xC1, 0xC0, 0xC6))
             for image, size in (("trx", 0x260760), ("ptt", 0xA7BF8)):
                 for operation, later in (("call", False), ("call_resume", False), ("call", True)):
                     data = bytearray(bc5.data)
@@ -351,18 +362,25 @@ class ProbeTests(unittest.TestCase):
                         words.extend(operand(0x14, value) + operand(0x25, address))
                     words += [0x0114] * 5000 + [0x00E2]
                     data[0x100:0x100 + len(words) * 2] = b"".join(w.to_bytes(2, "little") for w in words)
-                    # Cold startup sleeps with reception disabled; EXTRF enables USART0.
-                    receiver = [0x9100, 0x54, 0xFF01, 0xC00A, 0xE100, 0x9300, 0xC1,
-                                0x9110, 0xC0, 0xFF17, 0xCFFC, 0x9120, 0xC6, 0xCFFF,
+                    # Both boots power the modem; only EXTRF enables the handset's modem USART.
+                    receiver = [0xE000 | ((mask & 0xF0) << 4), 0x9300, ddr, 0x9300, port,
+                                0x9100, 0x54, 0xFF01, 0xC00A, 0xE100, 0x9300, control,
+                                0x9110, status, 0xFF17, 0xCFFC, 0x9120, uart_data, 0xCFFF,
                                 0xE005, 0x9300, 0x53, 0x9588, 0xCFFE]
                     sender = [0x01000000] * (1200 if later else 0)
-                    sender += [0x03200000, 0x82106200, 0x84102051, 0xC4206000, 0x10800000, 0x01000000]
+                    # Echo a host-supplied UART byte, allowing old and fresh boot traffic to differ.
+                    sender += [0x03200000, 0x82106200, fmt3(3, 0, 2, 1, 4),
+                               fmt3(2, 0x11, 0, 2, 0x80), 0x12BFFFFE, 0x01000000,
+                               fmt3(3, 0, 2, 1, 0), fmt3(3, 4, 2, 1, 0), 0x10800000, 0x01000000]
                     firmware = [parse_firmware(bytes(data), "bc5.bin", "bc5", model=model),
                                 parse_firmware(b"".join(w.to_bytes(2, "little") for w in receiver).ljust(len(avr.data), b"\xff"),
                                                "avr.bin", "avr", model=model),
                                 parse_firmware(b"".join(w.to_bytes(4, "big") for w in sender).ljust(size, b"\xff"),
                                                image + ".bin", image, model=model)]
                     with self.subTest(model=model, image=image, operation=operation, later=later), Session(EXECUTABLE, firmware, modem_image=image) as session:
+                        session.control("step", 128)
+                        self.assertTrue(session.modem_link.powered)
+                        self.assertEqual(session.probe(image, "uart_io", {"port": 1, "rx": [81], "tx_limit": 0})["accepted"], 1)
                         session.control("step", 128)
                         self.assertEqual(session.modem_link.state()["pending"], [0, 0 if later else 1])
                         if operation == "call_resume":
@@ -372,8 +390,11 @@ class ProbeTests(unittest.TestCase):
                         else:
                             result = session.probe("bc5", "call", {"entry": 0x100, "steps": 10000})
                         self.assertTrue(result["last_call"]["returned"])
-                        session.control("step", 256)
-                        self.assertEqual(session.engines["avr"].state["registers"][18], 81 if later else 0)
+                        self.assertEqual(session.probe(image, "uart_io", {"port": 1, "rx": [82], "tx_limit": 0})["accepted"], 1)
+                        session.control("step", 2048)
+                        session.control("step", 128)
+                        self.assertEqual(session.engines["avr"].state["registers"][18], 82)
+                        self.assertEqual(session.modem_link.power_resets, 2)
                         self.assertEqual(session.spi_link.resets, 1)
                         self.assertIsNone(session.engines["avr"].state["halt"])
 
