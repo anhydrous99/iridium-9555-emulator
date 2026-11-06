@@ -30,7 +30,7 @@ class SharedPersistenceChecks:
         handset = self.handset
         handset.control("initialize_ui")
         handset.control("pause")
-        alerts = {STARTUP_SIM_ERROR: "absent-sim", FIRMWARE_IDENTITY_WARNING: "firmware-identity"}
+        alerts = {STARTUP_SIM_ERROR: "absent-sim"}
         required = {"absent-sim"}
         if self.model == "9575":
             alerts.update({IERCC_NOT_CONFIGURED: "iercc-not-configured",
@@ -42,6 +42,7 @@ class SharedPersistenceChecks:
         while elapsed <= 200000000:
             state = handset.assert_healthy(require_lcd=False)
             body = handset.screen_hash(state=state)
+            self.assertNotEqual(body, FIRMWARE_IDENTITY_WARNING, "Factory release metadata was rejected")
             if body in alerts:
                 label = alerts[body]
                 self.assertNotIn(label, seen, "Modem startup repeated a recognized alert")

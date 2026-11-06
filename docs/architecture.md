@@ -174,10 +174,42 @@ boot, stopping immediately if the worker reports a halt.
 scheduler idle and invokes original device/factory setup only to provision the
 settings absent from the upgrade package. The original code writes its own
 persistent-store records. The host then warm resets with the active-low AVR
-power button released HIGH. Guest IRQs, ADC completion, GRev classification,
+power button released HIGH. Guest IRQs, ADC completion, board classification,
 application setup and power polling perform the rest of startup. No application
 start, charging-state or animation-completion callback is injected after reset.
-AIO0=640 is an explicit virtual GRev board-ID fixture.
+AIO0=600 selects the virtual 9555 REVJ fixture; AIO0=640 selects the virtual
+9575 GRev fixture. The original boot-version classifier treats GRev as Extreme,
+so using GRev for a 9555 selects the wrong release checksum.
+
+After the first factory-default reset, verified factory BC5/AVR/TRX payloads
+receive the release manifest normally supplied by the upgrade executable's
+`AT+PSKVER` command. The manifests are `HT25003,9656,0,DB24002,0,65534,` and
+`HL25003,0,0,DB24002,11407,65534,`. The two updaters put the AVR checksum in
+different fields. Original 9555 writer `0xC9288` / 9575 writer `0xE6438` stores
+key `0x2B3`; original allocation/free routines own the temporary input buffer.
+Warm startup retains that record. Any modified BC5/AVR/TRX payload or selected
+PTT skips automatic release provisioning, leaving its compatibility checks
+available for experiments.
+
+The supplied modem upgrade begins at flash `0x10000` and omits its boot ROM.
+At each telephony reset, an explicit virtual handoff fixture supplies big-endian
+version 4000 at RAM `0x70000002`. Original TRX `0x37124` formats that field as
+`BOOT0fa0`; original handset code classifies 4000..4199 as the supported family.
+The exact physical boot revision remains unknown. Native state exposes
+`boot_handoff_fixture` with the address and current value, including debugger
+overrides; cold/warm modem reset reapplies the fixture. No boot-ROM code or
+successful modem service response is supplied by this fixture.
+
+The CSR bank descriptor also lives outside the supplied application payload.
+Original `0x1E46C` reads tag 8 through the flash bank's `D397` descriptor; an
+erased bank header previously made that lookup return zero. Both original
+upgraders supply expected revision `FFFE` in the last `PSKVER` field. The
+explicit virtual bank-header fixture supplies that tag at physical flash word
+`0x100`, outside the original payload, and reports its word address/current revision as
+`bank_header_fixture`. Fresh reset reapplies the descriptor; warm reset retains
+the flash contents. The release checker still rejects a deliberately incorrect
+component checksum in the factory regression.
+
 Power-on is rejected while a client still owns the power button; release the
 button before starting a new boot. Reset attempts every loaded processor before
 reporting a worker failure, so surviving processors release their contacts.

@@ -23,6 +23,11 @@ from iridium.profiles import PROFILES
 
 
 class FactoryFixtureTests(unittest.TestCase):
+    def test_release_provisioning_hashes_match_independent_factory_pins(self):
+        for model, profile in PROFILES.items():
+            with self.subTest(model=model):
+                self.assertEqual(dict(zip(("bc5", "avr", "trx"), profile.release_hashes)), FACTORY_HASHES[model])
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

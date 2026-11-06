@@ -16,6 +16,7 @@ var handset: Handset = .@"9555";
 const max_steps = 10_000_000;
 const max_probe_steps = 100_000_000;
 const max_memory = 4096;
+const modem_boot_version_fixture: u16 = 4000;
 
 const BcMem = struct {
     pub var data: [0x10000]u16 = @splat(0);
@@ -165,8 +166,10 @@ fn initialize(init: std.process.Init, path: []const u8) !void {
                 profile.code_words = 0xFEF96 / 2;
             }
             Bc.hardware_enabled = true;
-            try Bc.setAnalog(0, 640); // Virtual GRev board-ID fixture: original callback bin154..168.
+            // REVJ selects 9555; GRev selects Extreme in the original version classifier.
+            try Bc.setAnalog(0, if (handset == .@"9575") 640 else 600);
             try Bc.init(init.gpa, init.io, std.Io.Dir.cwd(), profile);
+            initializeBc5BankHeader();
             attachBc5Devices();
         },
         .avr => {
@@ -409,11 +412,19 @@ fn resetModem(gpa: std.mem.Allocator, restore_image: bool) !void {
         @memcpy(m.flash[offset..][0..firmware.len], firmware);
     }
     try m.reset(gpa, if (current_image == .trx) .p1 else .p2, 8);
+    // The unshipped boot ROM's handoff selects BC5's 4000..4199 handset family.
+    if (current_image == .trx)
+        std.mem.writeInt(u16, m.bytes(0x7000_0002, 2).?[0..2], modem_boot_version_fixture, .big);
     trx_model = .{ .gpa = gpa, .nwin = 8, .ptt = current_image == .ptt, .sim_inputs = sim_inputs };
     attachTrxDevices();
     trx_flash = .{ .mem = &m.flash, .base = m.flash_base, .bus = &m.bus };
     m.cpu.asi1 = trx_flash.device();
     ready = true;
+}
+
+fn initializeBc5BankHeader() void {
+    // Original bank-header lookup needs tag 8; both updaters expect revision FFFE.
+    @memcpy(Bc.flash.words[0x100..][0..6], &[_]u16{ 0xD397, 0x102, 8, 0x105, 0, 0xFFFE });
 }
 
 fn trxRead(_: *anyopaque, address: u32, bits: u8) u64 {
@@ -436,6 +447,7 @@ fn reset(init: std.process.Init) !void {
             keypad_model = .{};
             gpio_inputs = 0;
             Bc.reset();
+            initializeBc5BankHeader();
             attachBc5Devices();
         },
         .avr => {
@@ -569,7 +581,20 @@ fn state(out: *std.Io.Writer) !void {
         .model_error = model_error,
         .hardware_strict = hardware_strict,
         .bc5_hardware = current_image == .bc5 and Bc.hardware_enabled,
-        .board_id_fixture = if (current_image == .bc5) .{ .name = "virtual-grev", .aio0 = Bc.analog_inputs[0] } else null,
+        .board_id_fixture = if (current_image == .bc5) .{
+            .name = if (handset == .@"9575") @as([]const u8, "virtual-grev") else "virtual-revj",
+            .aio0 = Bc.analog_inputs[0],
+        } else null,
+        .bank_header_fixture = if (current_image == .bc5) .{
+            .name = "virtual-csr-bank",
+            .flash_word_address = @as(u32, 0x100),
+            .revision = Bc.flash.words[0x105],
+        } else null,
+        .boot_handoff_fixture = if (current_image == .trx) .{
+            .name = "virtual-handset-family",
+            .address = @as(u32, 0x7000_0002),
+            .version = std.mem.readInt(u16, m.bytes(0x7000_0002, 2).?[0..2], .big),
+        } else null,
         .serial_waiting = serial_waiting,
         .serial_peer = serial_peer,
         .gpio = if (current_image == .bc5) .{

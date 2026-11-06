@@ -63,8 +63,15 @@ and AVR images are required. After the boot
 animation, the original home screen appears automatically with **Searching for
 Iridium**, **Acquiring time**, **Menu** and **Help**. Press the left soft key to
 open the original main menu. Initialization and animation take time to finish.
-The virtual board-ID fixture selects the firmware's GRev bin with AIO0=640;
-it is not a measured identification of a physical handset. Without the flag,
+Factory startup also provisions the upgrade tool's release-version record for
+verified, unmodified BC5/AVR/telephony images. Modified images and PTT retain
+their original version checks. The virtual board-ID fixtures select REVJ on
+9555 (AIO0=600) and GRev on 9575 (AIO0=640). A virtual modem boot-handoff
+version of 4000 selects the supported handset family. These fixtures do not
+identify measured physical hardware or provide the missing boot ROM.
+A virtual CSR flash-bank header supplies the `FFFE` revision expected by the
+original upgrade tools; processor state identifies both metadata fixtures.
+Without the flag,
 the interface starts paused; **Power on handset** invokes the same scenario.
 
 Supply a directory to load BC5, AVR, telephony and PTT images. Telephony and PTT

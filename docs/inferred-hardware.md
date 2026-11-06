@@ -347,11 +347,14 @@ through the two bytes of `0xFF8C` and `0xFF79`. The host provides samples at
 this hardware boundary; the original software queue, interrupt handlers and
 callback instructions execute normally. Analog settling time is uncalibrated.
 
-Both board-detection callbacks classify 8-bit samples 154..168 as revision 11,
-`GRev`. AIO0=640 is an explicit virtual board fixture within that interval,
-not a measured handset voltage. External AIO samples survive reset. Original
-integration tests provision factory settings through original routines once,
-then warm-reset and verify natural ADC completion, `GRev` selection and
+Both board-detection callbacks classify 8-bit samples 137..153 as revision 10,
+`REVJ`, and 154..168 as revision 11, `GRev`. The default virtual fixture uses
+AIO0=600 for 9555 REVJ and AIO0=640 for 9575 GRev. The original version checker
+classifies GRev as Extreme, which requires its distinct updater checksum field.
+These are explicit virtual fixtures, not measured handset voltages. External
+AIO samples survive reset. Original integration tests provision factory settings
+through original routines once,
+then warm-reset and verify natural ADC completion, board-revision selection and
 application LCD output without application probes after that reset. They also
 exercise the actual interrupt wrapper, nested interrupts and debugger probes
 with hardware enabled on both models.
