@@ -280,6 +280,15 @@ pub const Cpu = struct {
     }
 
     fn fetch(c: *Cpu, pc: u32) ?u32 {
+        for (c.bus.backing) |backing| {
+            if (pc < backing.base) continue;
+            const offset = pc - backing.base;
+            if (offset >= backing.mem.len) continue;
+            if (backing.mem.len - offset >= 4 and pc <= 0xFFFF_FFFC)
+                return std.mem.readInt(u32, backing.mem[offset..][0..4], .big);
+            break;
+        }
+        // An instruction can cross contiguous backing regions or the address-space wrap.
         var w: u32 = 0;
         for (0..4) |k| {
             const p = c.bus.unitPtr(pc +% @as(u32, @intCast(k))) orelse return null;
@@ -670,6 +679,27 @@ fn runN(c: *Cpu, n: usize) !void {
 fn testFormat3(op: u2, op3: u6, rd: u5, rs1: u5, operand: u13, immediate: bool) u32 {
     return @as(u32, op) << 30 | @as(u32, rd) << 25 | @as(u32, op3) << 19 |
         @as(u32, rs1) << 14 | @as(u32, @intFromBool(immediate)) << 13 | operand;
+}
+
+test "instruction fetch reads changed backing bytes and preserves split-region faults" {
+    var bytes = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 };
+    const backing = [_]bus_mod.Backing(u8){
+        .{ .base = 0x1000, .mem = &bytes },
+        .{ .base = 0x2000, .mem = bytes[0..2] },
+        .{ .base = 0x2002, .mem = bytes[2..4] },
+    };
+    var bus = try Bus.init(testing.allocator, &.{}, &backing);
+    defer bus.deinit();
+    var regs: Regs = .{};
+    var cpu: Cpu = .{ .r = &regs, .bus = &bus };
+    try testing.expectEqual(@as(?u32, 0x12345678), cpu.fetch(0x1000));
+    try testing.expectEqual(@as(?u32, 0x9ABCDEF0), cpu.fetch(0x1004));
+    try testing.expectEqual(@as(?u32, 0x12345678), cpu.fetch(0x2000));
+    bytes[1] = 0xFF;
+    try testing.expectEqual(@as(?u32, 0x12FF5678), cpu.fetch(0x1000));
+    try testing.expectEqual(@as(?u32, 0x12FF5678), cpu.fetch(0x2000));
+    try testing.expectEqual(@as(?u32, null), cpu.fetch(0x2001));
+    try testing.expectEqual(@as(?u32, null), cpu.fetch(0x1008));
 }
 
 test "tagged arithmetic: tags, carry, signed overflow and precise trap-on-overflow" {

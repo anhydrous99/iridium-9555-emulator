@@ -476,10 +476,17 @@ fn idleAvrInputs() void {
 fn state(out: *std.Io.Writer) !void {
     var registers: [32]u32 = @splat(0);
     var uart_dropped: [4]u64 = @splat(0);
+    var uart_empty: [4]bool = @splat(true);
+    var pins: [11]u16 = undefined;
+    var inputs: [11]u16 = undefined;
     if (current_image == .avr) {
         for (&uart_dropped, avr_dev.st.usart) |*lost, uart| lost.* = uart.out_dropped;
+        for (&uart_empty, avr_dev.st.usart) |*empty, uart| empty.* = uart.out_head == uart.out_tail;
+        for (pins[0..avr_dev.portCount()], 0..) |*pin, index| pin.* = avr_dev.pin(@intCast(index));
+        for (inputs[0..avr_dev.portCount()], 0..) |*pin, index| pin.* = avr_dev.st.pins_in[index];
     } else if (current_image == .trx or current_image == .ptt) {
         for (&uart_dropped, 0..) |*lost, port| lost.* = trx_model.uartDropped(@intCast(port));
+        for (&uart_empty, trx_model.uarts) |*empty, uart| empty.* = uart.tx.head == uart.tx.tail;
     }
     var lcd_numbers: [lcd_buffer.len]u16 = undefined;
     for (lcd_buffer[0..lcd_len], 0..) |byte, index| lcd_numbers[index] = byte;
@@ -508,6 +515,18 @@ fn state(out: *std.Io.Writer) !void {
         },
     }
     try json(out, .{
+        ._links = .{
+            .pins = if (current_image == .avr) pins[0..avr_dev.portCount()] else null,
+            .inputs = if (current_image == .avr) inputs[0..avr_dev.portCount()] else null,
+            .uart_empty = if (current_image == .avr) uart_empty[0..avr_dev.uartCount()] else if (current_image != .bc5) @as([]bool, &uart_empty) else null,
+            .serial = if (current_image == .bc5 and serial_dma == null) .{
+                .value = @as(?u8, null),
+                .sequence = serial_sequence,
+                .active = serial_waiting,
+                .remaining = @as(u16, 0),
+                .gpio = .{ .output = Bc.dev.low[0x62], .direction = Bc.dev.low[0x61], .reset_count = gpio_reset_count },
+            } else null,
+        },
         .image = @tagName(current_image),
         .handset = @tagName(handset),
         .pc = pc,
@@ -599,9 +618,18 @@ fn flushLog() void {
     }
 }
 
+fn setAccessLogging(enabled: bool) void {
+    switch (current_image) {
+        .bc5 => BcMem.bus.log_classified = enabled,
+        .avr => avr_bus.log_classified = enabled,
+        .trx, .ptt => m.bus.log_classified = enabled,
+    }
+}
+
 fn refillFuel(steps: u64) void {
     // Block-copy instructions can perform many accesses. Fuel bounds these independently of steps.
     const fuel = steps * 32 + (1 << 22);
+    setAccessLogging(trace_enabled);
     switch (current_image) {
         .bc5 => BcMem.bus.resetRun(fuel),
         .avr => avr_bus.resetRun(fuel),
@@ -754,6 +782,7 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
         const enabled = if (obj.contains("enabled")) try boolean(obj, "enabled") else trace_enabled;
         flushLog();
         trace_enabled = enabled;
+        setAccessLogging(enabled);
         try json(out, .{ .enabled = trace_enabled, .accesses = trace_buffer[0..trace_len], .dropped = trace_dropped });
         trace_len = 0;
         return;

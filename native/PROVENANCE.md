@@ -9,6 +9,17 @@ Local adaptations: slim module export roots omit external harnesses and tests re
 
 The common bus precomputes the 16-bit BC5 address classification in a 64 KiB table. Byte buses and wider addresses retain range lookup. Access logging, device routing, faults and fuel accounting are unchanged; exhaustive classification and original-firmware regressions cover the adaptation.
 
+Contiguous byte-bus reads/writes and SPARC instruction fetches now locate backing
+memory once per access; split regions retain the byte-by-byte path, including
+partial writes on faults. AVR timer prescalers use equivalent power-of-two
+shifts, and idle timer/UART work and unnecessary GPIO reconstruction are skipped.
+AVR and modem interrupt selection scans enabled/pending sources in the original
+priority order. These optimizations retain instruction counts, cycles, device
+events, fuel and trace accounting; boundary, timer and priority tests cover them.
+The adapter disables classified-access recording when tracing is off, avoiding
+records that would be discarded. Unclassified diagnostics remain recorded;
+standalone vendor buses retain full logging by default.
+
 The BC5 flash model now uses an explicitly inferred Am29LV320DB-compatible profile, replacing the upstream inconsistent ID/geometry stub. Its CFI values and sector layout follow [AMD publication 23579, revision C+6](https://www.insidegadgets.com/wp-content/uploads/2012/12/AM29LV320D.pdf). The actual handset part is unidentified; command timing, erase suspend and protection changes are incomplete. No persistent-store values or handset application instructions are supplied by the model.
 
 The AVR UART model records cumulative per-port output-capture losses when its bounded host queue fills. This adds host diagnostics without changing guest serial timing or status flags. The native adapter also stops when the existing AVR watchdog model requests a reset.

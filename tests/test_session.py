@@ -50,6 +50,28 @@ class SessionTests(unittest.TestCase):
         return self.session.key(key, pressed, client_id=client, sequence=sequence,
                                 epoch=self.session.key_epoch if epoch is None else epoch)
 
+    def test_runner_pacing_accounts_for_work_and_still_yields_when_behind(self):
+        self.session.running = True
+        with patch.object(self.session._stop, 'wait', side_effect=[False, False, True]) as wait, \
+                patch.object(self.session, '_step') as step, \
+                patch('iridium.session.time.monotonic', side_effect=[0, .005, 1, 1.05]):
+            self.session._loop()
+        self.assertEqual([call.args for call in step.call_args_list], [(200000,), (200000,)])
+        delays = [call.args[0] for call in wait.call_args_list]
+        for actual, expected in zip(delays, [.02, .015, .001]):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_custom_workers_keep_sequential_step_order_and_halt_reporting(self):
+        first = self.session.engines['avr']
+        second = Mock(state={'halt': 'ready'})
+        sequence = []
+        first.request = lambda op, **args: sequence.append(('avr', op, args)) or {
+            'image': 'avr', 'halt': 'firmware-reset-requested', 'pc': 1}
+        second.request = lambda op, **args: sequence.append(('trx', op, args)) or {
+            'image': 'trx', 'halt': None, 'pc': 2}
+        self.assertTrue(self.session._step_processor_group([first, second], 128))
+        self.assertEqual(sequence, [('avr', 'run', {'steps': 128}), ('trx', 'run', {'steps': 128})])
+
     def test_patch_replacement_is_executed_and_closes_old_worker(self):
         old = self.session.engines["avr"]
         patch = parse_firmware(b"\1\2" + bytes(8676), "avr.bin")

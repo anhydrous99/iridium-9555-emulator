@@ -1,5 +1,68 @@
 # Performance evaluation
 
+## Coupled phone execution (November 5, 2026)
+
+The full three-processor phone exceeds 2× baseline performance on both models.
+Baseline is `8753a7a`; both executables use Zig 0.17.0 ReleaseSafe. These runs
+use the pinned original BC5, AVR and telephony images on the same host,
+sequentially, with five fixed-budget samples and five live throughput windows.
+Raw samples, executable/source hashes and checkpoint digests are in
+[coupled.json](performance/coupled.json).
+
+| Model | Coupled 2m instructions, before → after | Speedup | Live throughput, before → after | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 9555 | 1.285 → 0.598 s | **2.15×** | 1.06 → 2.88 M instructions/s | **2.72×** |
+| 9575 | 1.386 → 0.670 s | **2.07×** | 0.98 → 2.37 M instructions/s | **2.41×** |
+
+Instruction counts refer to BC5 steps while AVR and modem execution remain coupled.
+The live workload polls the real HTTP server while the background runner executes.
+The separate HTTP input workload sends 20 press/release pairs with concurrent
+polling. HTTP completion is measured; browser paint time is not. Individual
+operations have different gains: some initialization and input measurements
+improve by less than 2×. The 2× target applies to coupled execution and live
+phone throughput, not every endpoint independently.
+
+The improvements preserve the board's instruction budgets, processor clock
+ratios, reset ordering, key settling and 128-instruction SPI service interval:
+
+- Native replies carry private pin/empty-queue snapshots, avoiding redundant
+  worker queries. Every actual command invalidates those snapshots.
+- Independent AVR and modem runs overlap inside the same synchronization quantum;
+  link exchanges still bracket that work. Outstanding replies are invalidated
+  on transport failures so later requests cannot consume stale responses.
+- Pipe writes wait only when blocked. Runner pacing includes execution time
+  instead of adding an unconditional 20 ms after an already slow batch.
+- Native memory access avoids repeated backing scans. AVR timer/GPIO/UART and
+  modem interrupt paths skip work that cannot change state.
+- When tracing is disabled, classified bus accesses skip discarded log records;
+  guest accesses and unclassified diagnostics still execute normally.
+
+Both models match all 11 deterministic baseline checkpoints: complete returned
+CPU state, BC5/AVR RAM, modem SDRAM/on-chip RAM, full decoded LCD state, keys and
+processor links. Each journey verifies original startup dialogs, home captions,
+and Menu/down/up/back against known screen hashes. Live tests run afterward;
+wall-time-dependent endpoints are checked for faults but are not compared as
+identical instruction checkpoints. This establishes the tested model's behavior,
+not physical clock calibration or the excluded DSP/RF behavior.
+
+The final build passes `./test`, all 61 native protocol tests with both original
+firmware sets, and all 17 original-firmware integration tests. These cover
+trace toggling, memory boundaries, timer/IRQ behavior, transport failures,
+startup, animation, menu navigation and rejection of deliberately patched images.
+The broader factory-journey suite was not run in full.
+
+Reproduce with a baseline source directory and its separately built executable:
+
+```sh
+zig build -j2
+python3 tools/benchmark-coupled.py --model 9555 --firmware /path/to/9555 \
+  --baseline-source /path/to/baseline --baseline-engine /path/to/baseline/zig-out/bin/iridium-core \
+  --samples 5 --steps 2000000 --full-home --live --output /tmp/coupled-9555.json
+# Repeat with --model 9575 and its firmware directory.
+```
+
+## Earlier microbenchmarks
+
 Six optimizations reduce repeated display work and native execution overhead.
 On this machine, constructing and serializing a BC5 session with an unchanged
 live display is **8.3× faster**, the JavaScript framebuffer paint workload is

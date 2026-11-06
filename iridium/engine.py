@@ -1,6 +1,7 @@
 """Bounded JSON-lines transport to the original-instruction Zig executor."""
 
 import json
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import selectors
@@ -24,6 +25,7 @@ class Engine:
         self._selector = selectors.DefaultSelector()
         self._process = None
         self._state = {}
+        self._link_snapshot = None
         try:
             self._process = subprocess.Popen(
                 [str(executable), "--image", image, "--firmware", str(firmware), "--model", model],
@@ -31,6 +33,7 @@ class Engine:
             os.set_blocking(self._process.stdin.fileno(), False)
             self._selector.register(self._process.stdout, selectors.EVENT_READ)
             self._state = self._receive(time.monotonic() + self._timeout)
+            self._link_snapshot = self._state.pop("_links", None)
             if self._state.get("error"):
                 raise EngineError(str(self._state["error"]))
         except BaseException:
@@ -51,31 +54,108 @@ class Engine:
 
     def request(self, op: str, **arguments) -> dict:
         with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                self._fail("CPU worker is no longer running")
-                raise EngineError("CPU worker is no longer running")
-            data = json.dumps({"op": op, **arguments}, separators=(",", ":")).encode() + b"\n"
-            if len(data) > 65536:
-                raise EngineError("CPU request exceeds 64 KiB")
-            deadline = time.monotonic() + self._timeout
+            self._require_alive()
+            cached = self._link_response(op, arguments)
+            if cached is not None:
+                return cached
+            deadline = self._begin_request(self._encode_request(op, arguments))
+            return self._finish_request(deadline)
+
+    @staticmethod
+    def run_group(workers, steps):
+        """Advance independent workers within one board quantum, retaining response order."""
+        if len(set(workers)) != len(workers):
+            raise ValueError("A worker cannot run twice in one group")
+        data = Engine._encode_request("run", {"steps": steps})
+        with ExitStack() as locks:
+            for worker in sorted(workers, key=id):
+                locks.enter_context(worker._lock)
+            for worker in workers:
+                worker._require_alive()
+            pending, deadlines, responses = [], [], []
             try:
-                self._send(data, deadline)
-                response = self._receive(deadline)
-            except OSError as error:
-                message = f"CPU worker disconnected: {error}"
-                self._fail(message)
-                raise EngineError(message) from error
-            except EngineError as error:
-                # No request IDs: a broken exchange makes all later replies ambiguous.
-                self._fail(str(error))
+                for worker in workers:
+                    pending.append(worker)
+                    deadlines.append(worker._begin_request(data))
+                for worker, deadline in zip(workers, deadlines):
+                    try:
+                        responses.append(worker._finish_request(deadline))
+                    except EngineError:
+                        # The failed reply was consumed, or its transport was closed.
+                        pending.pop(0)
+                        raise
+                    pending.pop(0)
+            except BaseException:
+                # No request IDs: never leave a later worker's reply for another caller.
+                for worker in pending:
+                    if worker._process is not None:
+                        worker._fail("Coupled execution interrupted with an outstanding response")
                 raise
-            if response.get("error"):
-                if response.get("fatal"):
-                    self._fail(str(response["error"]))
-                raise EngineError(str(response["error"]))
-            if "registers" in response:
-                self._state = response
-            return response
+            return responses
+
+    def _require_alive(self):
+        if self._process is None or self._process.poll() is not None:
+            self._fail("CPU worker is no longer running")
+            raise EngineError("CPU worker is no longer running")
+
+    @staticmethod
+    def _encode_request(op, arguments):
+        data = json.dumps({"op": op, **arguments}, separators=(",", ":")).encode() + b"\n"
+        if len(data) > 65536:
+            raise EngineError("CPU request exceeds 64 KiB")
+        return data
+
+    def _begin_request(self, data):
+        deadline = time.monotonic() + self._timeout
+        # Any real command may change a device, including a failed partial transfer.
+        self._link_snapshot = None
+        try:
+            self._send(data, deadline)
+        except (OSError, EngineError) as error:
+            self._transport_failure(error)
+        return deadline
+
+    def _finish_request(self, deadline):
+        try:
+            response = self._receive(deadline)
+        except (OSError, EngineError) as error:
+            self._transport_failure(error)
+        if response.get("error"):
+            if response.get("fatal"):
+                self._fail(str(response["error"]))
+            raise EngineError(str(response["error"]))
+        if "registers" in response:
+            self._link_snapshot = response.pop("_links", None)
+            self._state = response
+        return response
+
+    def _transport_failure(self, error):
+        message = f"CPU worker disconnected: {error}" if isinstance(error, OSError) else str(error)
+        self._fail(message)
+        raise EngineError(message) from error
+
+    def _link_response(self, op, arguments):
+        snapshot = self._link_snapshot
+        if snapshot is None:
+            return None
+        if op == "pin_state" and not arguments and snapshot.get("pins") is not None:
+            return {"pins": list(snapshot["pins"]), "inputs": list(snapshot["inputs"])}
+        if op == "serial" and not arguments and snapshot.get("serial") is not None:
+            serial = snapshot["serial"]
+            return {**serial, "gpio": dict(serial["gpio"])}
+        if op == "uart_io" and arguments.keys() == {"port"}:
+            port = arguments["port"]
+            empty = snapshot.get("uart_empty")
+            if type(port) is int and empty is not None and 0 <= port < len(empty) and empty[port]:
+                return {"accepted": 0, "values": [], "dropped": self._state["uart_tx_dropped"][port]}
+        if op == "pins" and self._state.get("image") == "bc5" and arguments.keys() == {"mask", "value"}:
+            mask, value = arguments["mask"], arguments["value"]
+            if (type(mask) is int and type(value) is int and 0 <= mask <= 65535 and 0 <= value <= 65535
+                    and not (self._state["gpio"]["inputs"] ^ value) & mask):
+                # State replies drain the LCD capture; do not replay a previous frame fragment.
+                self._state = {**self._state, "lcd_bytes": []}
+                return self._state
+        return None
 
     def _wait(self, selector, deadline: float) -> None:
         remaining = deadline - time.monotonic()
@@ -86,14 +166,14 @@ class Engine:
 
     def _send(self, data: bytes, deadline: float) -> None:
         pending = memoryview(data)
-        with selectors.DefaultSelector() as selector:
-            selector.register(self._process.stdin, selectors.EVENT_WRITE)
-            while pending:
-                self._wait(selector, deadline)
-                try:
-                    written = os.write(self._process.stdin.fileno(), pending)
-                except BlockingIOError:
-                    continue
+        while pending:
+            try:
+                written = os.write(self._process.stdin.fileno(), pending)
+            except BlockingIOError:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(self._process.stdin, selectors.EVENT_WRITE)
+                    self._wait(selector, deadline)
+            else:
                 pending = pending[written:]
 
     def _receive(self, deadline: float) -> dict:
@@ -137,6 +217,7 @@ class Engine:
         self._selector.close()
         self._stderr.close()
         self._buffer.clear()
+        self._link_snapshot = None
 
     def __enter__(self):
         return self

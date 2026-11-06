@@ -62,6 +62,7 @@ pub fn Bus(comptime cfg: Config) type {
         dev: ?Device = null,
         cpu: ?Device = null,
         log: std.ArrayList(Access) = .empty,
+        log_classified: bool = true,
         fuel: u64 = std.math.maxInt(u64),
         stop: ?Stop = null,
         strict_unclassified: bool = false,
@@ -180,7 +181,7 @@ pub fn Bus(comptime cfg: Config) type {
                     else
                         self.tapeRead(addr) & mask(bits);
                     if (self.stop != null) return 0;
-                    self.log.append(self.gpa, .{
+                    if (self.log_classified or kind == .unclassified) self.log.append(self.gpa, .{
                         .addr = addr,
                         .bits = bits,
                         .write = is_write,
@@ -193,6 +194,26 @@ pub fn Bus(comptime cfg: Config) type {
 
         fn mem(self: *Self, addr: u32, bits: u8, is_write: bool, value: u64) u64 {
             const n = bits / unit_bits;
+            if (Unit == u8 and (bits == 16 or bits == 32)) {
+                for (self.backing) |b| {
+                    if (addr < b.base) continue;
+                    const offset = addr - b.base;
+                    if (offset >= b.mem.len) continue;
+                    if (b.mem.len - offset >= n and addr <= std.math.maxInt(u32) - @as(u32, n - 1)) {
+                        switch (bits) {
+                            inline 16, 32 => |width| {
+                                const T = @Int(.unsigned, width);
+                                const bytes = b.mem[offset..][0 .. width / 8];
+                                if (!is_write) return std.mem.readInt(T, bytes, cfg.endian);
+                                std.mem.writeInt(T, bytes, @truncate(value), cfg.endian);
+                                return 0;
+                            },
+                            else => unreachable,
+                        }
+                    }
+                    break;
+                }
+            }
             var out: u64 = 0;
             for (0..n) |i| {
                 const p = self.unitPtr(addr + @as(u32, @intCast(i))) orelse {
@@ -381,6 +402,41 @@ test "strict log keeps order; ram and scratch are not logged; mmio reads come fr
     try testing.expectEqual(n, b.log.items.len);
 }
 
+test "disabled classified logging preserves accesses, diagnostics and fuel" {
+    var data: [0x10000]u16 = @splat(0);
+    const map = [_]Range{
+        .{ .lo = 0x00A0, .hi = 0x00A0, .kind = .shared },
+        .{ .lo = 0xFF00, .hi = 0xFFDF, .kind = .mmio },
+    };
+    var b = try testBus16(&data, &map);
+    defer b.deinit();
+    var t = try Tape.init(testing.allocator, &.{
+        .{ .addr = 0xFF18, .value = 0x8000 },
+        .{ .addr = 0xFF18, .value = 7 },
+    });
+    defer t.deinit(testing.allocator);
+    b.tape = &t;
+    b.log_classified = false;
+    b.resetRun(5);
+    b.write(0x00A0, 16, 5);
+    try testing.expectEqual(@as(u16, 5), data[0x00A0]);
+    try testing.expectEqual(@as(u64, 0x8000), b.read(0xFF18, 16));
+    try testing.expectEqual(@as(usize, 0), b.log.items.len);
+    b.write(0x0050, 16, 9);
+    try testing.expectEqualSlices(Access, &.{.{ .addr = 0x0050, .bits = 16, .write = true, .value = 9 }}, b.log.items);
+    try testing.expectEqual(@as(u16, 9), data[0x0050]);
+    b.log_classified = true;
+    try testing.expectEqual(@as(u64, 7), b.read(0xFF18, 16));
+    try testing.expectEqual(@as(usize, 2), b.log.items.len);
+    try testing.expectEqual(@as(u32, 0xFF18), b.log.items[1].addr);
+    try testing.expectEqual(@as(u64, 1), b.fuel);
+    b.log_classified = false;
+    b.write(0x00A0, 16, 6);
+    b.write(0x00A0, 16, 7);
+    try testing.expectEqual(Stop.fuel_exhausted, b.stop.?);
+    try testing.expectEqual(@as(u16, 6), data[0x00A0]);
+}
+
 test "rom write faults, fuel runs out" {
     var data: [0x10000]u16 = @splat(0);
     data[0x0100] = 0xCAFE;
@@ -449,6 +505,34 @@ test "wide accesses: BC5 u32 is two word accesses, high word first; SPARC is one
     try testing.expectEqual(@as(u8, 32), s.log.items[0].bits);
     _ = s.read(0x40000100, 8); // ram class but no backing: fault
     try testing.expectEqual(Stop{ .fault = 0x40000100 }, s.stop.?);
+}
+
+test "byte-bus wide memory accesses preserve endian order, split backing and partial faults" {
+    inline for ([_]Config{ sparc, x86 }) |cfg| {
+        var bytes: [10]u8 = @splat(0);
+        const backing = [_]Backing(u8){
+            .{ .base = 0, .mem = bytes[0..4] },
+            .{ .base = 8, .mem = bytes[4..6] },
+            .{ .base = 10, .mem = bytes[6..8] },
+            .{ .base = 16, .mem = bytes[8..10] },
+        };
+        const map = [_]Range{.{ .lo = 0, .hi = 31, .kind = .ram }};
+        var b = try Bus(cfg).init(testing.allocator, &map, &backing);
+        defer b.deinit();
+        b.write(0, 32, 0x11223344);
+        b.write(8, 32, 0x11223344);
+        try testing.expectEqualSlices(u8, bytes[0..4], bytes[4..8]);
+        try testing.expectEqual(@as(u64, 0x11223344), b.read(0, 32));
+        try testing.expectEqual(@as(u64, 0x11223344), b.read(8, 32));
+        const half: u64 = if (cfg.endian == .big) 0x1122 else 0x3344;
+        try testing.expectEqual(half, b.read(0, 16));
+        try testing.expectEqual(half, b.read(8, 16));
+        b.resetRun(9);
+        b.write(16, 32, 0x11223344);
+        try testing.expectEqual(Stop{ .fault = 16 }, b.stop.?);
+        try testing.expectEqualSlices(u8, bytes[0..2], bytes[8..10]);
+        try testing.expectEqual(@as(u64, 8), b.fuel);
+    }
 }
 
 test "devices serve mmio and cpu_alias" {

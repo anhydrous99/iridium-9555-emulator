@@ -159,15 +159,18 @@ class Session:
                 self._thread.start()
 
     def _loop(self) -> None:
-        while not self._stop.wait(0.02):
+        delay = 0.02
+        while not self._stop.wait(delay):
+            started = time.monotonic()
             with self._lock:
-                if not self.running:
-                    continue
-                try:
-                    self._step(200000)
-                except (EngineError, ValueError) as error:
-                    self.running = False
-                    self.log("error", str(error))
+                if self.running:
+                    try:
+                        self._step(200000)
+                    except (EngineError, ValueError) as error:
+                        self.running = False
+                        self.log("error", str(error))
+            # Execution time counts toward pacing; yield briefly when already behind.
+            delay = max(0.001, 0.02 - (time.monotonic() - started))
 
     def _step(self, steps: int) -> None:
         remaining = steps
@@ -257,18 +260,35 @@ class Session:
         while steps:
             quantum = self._board_quantum(steps)
             self._clock_reset(quantum)
-            for worker in self._active_processors():
-                if worker is not primary:
-                    newly_halted = self._step_processor(worker, quantum) or newly_halted
+            workers = [worker for worker in self._active_processors() if worker is not primary]
+            newly_halted = self._step_processor_group(workers, quantum) or newly_halted
             self._exchange_links()
             steps -= quantum
         return newly_halted
+
+    def _step_processor_group(self, workers, steps):
+        if (len(workers) < 2 or self.engines.get("bc5") in workers
+                or not all(type(worker) is Engine and "request" not in worker.__dict__ for worker in workers)):
+            halted = False
+            for worker in workers:
+                halted = self._step_processor(worker, steps) or halted
+            return halted
+        active = [(worker, worker.state.get("halt")) for worker in workers]
+        active = [(worker, halt) for worker, halt in active if halt in (None, "steps", "running", "ready")]
+        results = Engine.run_group([worker for worker, _ in active], steps)
+        halted = False
+        for (_, previous), result in zip(active, results):
+            halted = self._record_processor_halt(result, previous) or halted
+        return halted
 
     def _step_processor(self, worker, steps):
         previous = worker.state.get("halt")
         if previous not in (None, "steps", "running", "ready"):
             return False
         result = self._request(worker, "run", steps=steps)
+        return self._record_processor_halt(result, previous)
+
+    def _record_processor_halt(self, result, previous):
         halt = result.get("halt")
         if halt not in (None, "steps", "running", "ready") and halt != previous:
             self.log("cpu", f"{result.get('image')}: {halt} at {result.get('pc')}")

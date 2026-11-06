@@ -805,6 +805,7 @@ pub const Devices = struct {
 
     pub fn pin(d: *const Devices, p: u4) u8 {
         const ddr = d.st.io[port_bases[p] + 1];
+        if (ddr == 0) return d.st.pins_in[p];
         var port = d.st.io[port_bases[p] + 2];
         for ([_]u2{ 0, 2 }) |n| for (0..2) |c| {
             const out = d.output8Pin(n, c);
@@ -1235,12 +1236,18 @@ pub const Devices = struct {
     }
 
     fn extPending(d: *const Devices) ?u8 {
-        const levels = d.extLevels();
-        for (0..d.extCount()) |n| {
-            const bit = @as(u8, 1) << @intCast(n);
-            if (d.st.io[EIMSK] & bit == 0) continue;
-            if (if (d.extMode(n) == 0) levels & bit == 0 else d.st.io[EIFR] & bit != 0)
-                return @intCast(n + 1);
+        var enabled = d.st.io[EIMSK] & (if (d.mega) @as(u8, 0xFF) else 7);
+        var levels: ?u8 = null;
+        while (enabled != 0) {
+            const n: u3 = @intCast(@ctz(enabled));
+            const bit = @as(u8, 1) << n;
+            enabled &= enabled - 1;
+            const asserted = if (d.extMode(n) == 0) blk: {
+                if (levels == null) levels = d.extLevels();
+                break :blk levels.? & bit == 0;
+            } else d.st.io[EIFR] & bit != 0;
+            if (asserted)
+                return @as(u8, n) + 1;
         }
         return null;
     }
@@ -1796,6 +1803,8 @@ pub const Devices = struct {
             }
         }
         for (0..d.uartCount()) |k| {
+            const uart = &d.st.usart[k];
+            if (uart.tx_busy == 0 and uart.rx_busy == 0 and uart.in_head == uart.in_tail) continue;
             const mask: u8 = if (k == 0) PRUSART0 else if (d.mega) @as(u8, 1) << @intCast(k - 1) else PRUSART1;
             if (d.ioRunning() and io[if (d.mega and k > 0) 0x65 else PRR] & mask == 0) d.uartTick(@intCast(k), cycles);
         }
@@ -1847,7 +1856,10 @@ pub const Devices = struct {
 
     fn ticks(old: u64, new: u64, div: u64) u64 {
         if (div == 0) return 0;
-        return new / div - old / div;
+        // All AVR timer prescalers are powers of two.
+        std.debug.assert(std.math.isPowerOfTwo(div));
+        const shift: u6 = @intCast(@ctz(div));
+        return (new >> shift) - (old >> shift);
     }
 
     fn uartTick(d: *Devices, n: u2, cycles: u32) void {
@@ -1888,6 +1900,7 @@ pub const Devices = struct {
 
     /// One count of Timer0 (`n` = 0) or Timer2 (`n` = 2), `k` times.
     fn timer8(d: *Devices, comptime n: u2, k: u64) void {
+        if (k == 0) return;
         const io = &d.st.io;
         const ra: u16 = if (n == 0) TCCR0A else TCCR2A;
         const rb: u16 = if (n == 0) TCCR0B else TCCR2B;
@@ -2050,6 +2063,7 @@ pub const Devices = struct {
     }
 
     fn timer16(d: *Devices, n: usize, k: u64) void {
+        if (k == 0) return;
         const io = &d.st.io;
         const t = &d.st.timer[n];
         const base = timer16_bases[n];
@@ -2336,6 +2350,37 @@ fn fresh() Devices {
     var d: Devices = .{};
     d.reset();
     return d;
+}
+
+test "timer prescalers count exact crossings at small and wide counters" {
+    for ([_]u64{ 0, 1, 8, 32, 64, 128, 256, 1024 }) |div| {
+        for ([_]u64{ 0, 0xFFFF_FFFF, 0x1_FFFF_FFFF, 0xFFFF_FFFF_FFFF_E000 }) |base| {
+            for (0..2048) |offset| {
+                const old = base + offset;
+                for ([_]u64{ 0, 1, 2, 4, 31, 1024 }) |elapsed| {
+                    const expected = if (div == 0) 0 else (old + elapsed) / div - old / div;
+                    try testing.expectEqual(expected, Devices.ticks(old, old + elapsed, div));
+                }
+            }
+        }
+    }
+}
+
+test "input-only GPIO keeps external levels with timer outputs enabled and IRQs masked" {
+    for ([_]bool{ false, true }) |mega| {
+        var d: Devices = .{ .mega = mega };
+        d.reset();
+        d.st.io[TCCR0A] = 0xF3;
+        d.st.io[TCCR2A] = 0xF3;
+        for (timer16_bases[0..d.timerCount()]) |base| d.st.io[base] = 0xFC;
+        for (0..d.portCount()) |port| {
+            for ([_]u8{ 0, 0x55, 0xAA, 0xFF }) |input| {
+                d.st.pins_in[port] = input;
+                try testing.expectEqual(input, d.pin(@intCast(port)));
+                try testing.expectEqual(@as(?u8, null), d.extPending());
+            }
+        }
+    }
 }
 
 test "external reset retains fixtures, seeds input history and preserves sticky reset causes" {

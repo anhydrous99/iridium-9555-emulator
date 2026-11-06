@@ -98,6 +98,112 @@ class EngineTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assert_closed()
 
+    def test_link_snapshot_reads_are_isolated_and_invalidated_by_device_commands(self):
+        engine = self.start('''
+            print(json.dumps({'registers': [0], 'uart_tx_dropped': [3], '_links': {
+                'pins': [1], 'inputs': [2], 'uart_empty': [True]}}), flush=True)
+            assert json.loads(sys.stdin.readline()) == {'op': 'spi', 'value': 7}
+            print('{"value":17}', flush=True)
+            assert json.loads(sys.stdin.readline()) == {'op': 'pin_state'}
+            print('{"pins":[9],"inputs":[2]}', flush=True)
+        ''')
+        self.assertNotIn('_links', engine.state)
+        pins = engine.request('pin_state')
+        pins['pins'][0] = 255
+        self.assertEqual(engine.request('pin_state'), {'pins': [1], 'inputs': [2]})
+        self.assertEqual(engine.request('uart_io', port=0), {'accepted': 0, 'values': [], 'dropped': 3})
+        self.assertEqual(engine.request('spi', value=7), {'value': 17})
+        self.assertEqual(engine.request('pin_state'), {'pins': [9], 'inputs': [2]})
+
+    def test_group_sends_both_runs_before_waiting_and_updates_snapshots(self):
+        marker = self.directory / 'second-started'
+        first = self.start(f'''
+            print('{{"registers":[0]}}', flush=True)
+            request = json.loads(sys.stdin.readline())
+            assert request == {{'op': 'run', 'steps': 7}}
+            while not os.path.exists({str(marker)!r}):
+                time.sleep(.005)
+            print(json.dumps({{'registers': [11], 'steps': 7, '_links': {{
+                'pins': [7], 'inputs': [9]}}}}), flush=True)
+            for line in sys.stdin:
+                print('{{"registers":[12],"steps":8}}', flush=True)
+        ''')
+        second = self.start(f'''
+            print('{{"registers":[0]}}', flush=True)
+            request = json.loads(sys.stdin.readline())
+            assert request == {{'op': 'run', 'steps': 7}}
+            open({str(marker)!r}, 'w').close()
+            print('{{"registers":[21],"steps":7}}', flush=True)
+            for line in sys.stdin:
+                print('{{"registers":[22],"steps":8}}', flush=True)
+        ''')
+        replies = Engine.run_group([first, second], 7)
+        self.assertEqual([reply['registers'] for reply in replies], [[11], [21]])
+        self.assertEqual(first.request('pin_state'), {'pins': [7], 'inputs': [9]})
+        self.assertEqual(first.request('run', steps=1)['steps'], 8)
+        self.assertEqual(second.request('run', steps=1)['steps'], 8)
+
+    def test_group_closes_outstanding_peer_when_first_reply_fails(self):
+        for reply in ('{', '{"error":"StepLimit","fatal":false}'):
+            with self.subTest(reply=reply):
+                first = self.start(f'''
+                    print('{{"registers":[0]}}', flush=True)
+                    sys.stdin.readline()
+                    print({reply!r}, flush=True)
+                    for line in sys.stdin:
+                        print('{{"registers":[9]}}', flush=True)
+                ''')
+                second = self.start('''
+                    print('{"registers":[0]}', flush=True)
+                    sys.stdin.readline()
+                    print('{"registers":[7]}', flush=True)
+                    time.sleep(10)
+                ''')
+                with self.assertRaises(EngineError):
+                    Engine.run_group([first, second], 7)
+                self.assertIsNone(second._process)
+                with self.assertRaisesRegex(EngineError, 'no longer running'):
+                    second.request('state')
+                if reply == '{':
+                    self.assertIsNone(first._process)
+                else:
+                    self.assertEqual(first.request('state'), {'registers': [9]})
+                first.close()
+
+    def test_group_send_failure_closes_already_dispatched_worker(self):
+        source = '''
+            print('{"registers":[0]}', flush=True)
+            sys.stdin.readline()
+            time.sleep(10)
+        '''
+        first, second = self.start(source), self.start(source)
+        with patch.object(second, '_send', side_effect=BrokenPipeError('fixture send failure')):
+            with self.assertRaisesRegex(EngineError, 'fixture send failure'):
+                Engine.run_group([first, second], 7)
+        self.assertIsNone(first._process)
+        self.assertIsNone(second._process)
+
+    def test_unchanged_pins_do_not_replay_lcd_and_invalid_arguments_reach_worker(self):
+        engine = self.start('''
+            print(json.dumps({'registers': [0], 'image': 'bc5', 'lcd_bytes': [175],
+                'gpio': {'inputs': 4096}, '_links': {'serial': {
+                    'value': None, 'sequence': 4, 'active': False, 'remaining': 0,
+                    'gpio': {'output': 1, 'direction': 2, 'reset_count': 3}}}}), flush=True)
+            assert json.loads(sys.stdin.readline()) == {'op': 'pins', 'mask': True, 'value': 4096}
+            print('{"error":"ExpectedInteger","fatal":false}', flush=True)
+            assert json.loads(sys.stdin.readline()) == {'op': 'serial'}
+            print('{"value":7}', flush=True)
+        ''')
+        serial = engine.request('serial')
+        serial['gpio']['reset_count'] = 999
+        self.assertEqual(engine.request('serial')['gpio']['reset_count'], 3)
+        before = engine.state
+        self.assertEqual(engine.request('pins', mask=0x5000, value=0x1000)['lcd_bytes'], [])
+        self.assertEqual(before['lcd_bytes'], [175])
+        with self.assertRaisesRegex(EngineError, 'ExpectedInteger'):
+            engine.request('pins', mask=True, value=0x1000)
+        self.assertEqual(engine.request('serial'), {'value': 7})
+
     def test_launch_failure_closes_resources(self):
         engine = Engine.__new__(Engine)
         with self.assertRaises(FileNotFoundError):
