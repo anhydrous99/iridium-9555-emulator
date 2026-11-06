@@ -77,22 +77,21 @@ class Session:
         return PROFILES[self.model]
 
     def _start_worker(self, firmware: Firmware):
-        with tempfile.NamedTemporaryFile(dir=self._temporary.name, suffix=".bin", delete=False) as out:
-            out.write(firmware.data)
-            path = Path(out.name)
+        worker = None
         try:
-            worker = self._engine_factory(self._executable, firmware.image, path, model=firmware.model)
-            if self.strict_hardware:
-                try:
+            with tempfile.NamedTemporaryFile(dir=self._temporary.name, suffix=".bin") as out:
+                out.write(firmware.data)
+                out.flush()
+                worker = self._engine_factory(self._executable, firmware.image, Path(out.name), model=firmware.model)
+                if self.strict_hardware:
                     worker.request("hardware", strict=True)
-                except BaseException:
-                    worker.close()
-                    raise
             return worker
-        except OSError as error:
-            raise EngineError(f"Cannot start {firmware.image} worker: {error}") from error
-        finally:
-            path.unlink(missing_ok=True)
+        except BaseException as error:
+            if worker is not None:
+                worker.close()
+            if isinstance(error, OSError):
+                raise EngineError(f"Cannot start {firmware.image} worker: {error}") from error
+            raise
 
     def load(self, firmware: Firmware) -> None:
         with self._lock:
