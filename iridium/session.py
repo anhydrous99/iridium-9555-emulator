@@ -76,25 +76,31 @@ class Session:
     def profile(self):
         return PROFILES[self.model]
 
+    def _start_worker(self, firmware: Firmware):
+        with tempfile.NamedTemporaryFile(dir=self._temporary.name, suffix=".bin", delete=False) as out:
+            out.write(firmware.data)
+            path = Path(out.name)
+        try:
+            worker = self._engine_factory(self._executable, firmware.image, path, model=firmware.model)
+            if self.strict_hardware:
+                try:
+                    worker.request("hardware", strict=True)
+                except BaseException:
+                    worker.close()
+                    raise
+            return worker
+        except OSError as error:
+            raise EngineError(f"Cannot start {firmware.image} worker: {error}") from error
+        finally:
+            path.unlink(missing_ok=True)
+
     def load(self, firmware: Firmware) -> None:
         with self._lock:
             self._ensure_open()
             if firmware.model != self.model and firmware.image != "bc5":
                 raise ValueError("Load the new handset's BC5 image before its auxiliary processors")
             # A replacement worker is ready before the previous experiment is discarded.
-            with tempfile.NamedTemporaryFile(dir=self._temporary.name, suffix=".bin", delete=False) as out:
-                out.write(firmware.data)
-                path = Path(out.name)
-            try:
-                worker = self._engine_factory(self._executable, firmware.image, path, model=firmware.model)
-                if self.strict_hardware:
-                    try:
-                        worker.request("hardware", strict=True)
-                    except BaseException:
-                        worker.close()
-                        raise
-            finally:
-                path.unlink(missing_ok=True)
+            worker = self._start_worker(firmware)
             restart_board = firmware.image == "avr" and "bc5" in self.engines
             clear_inputs = firmware.image == "bc5" or restart_board
             if firmware.model == self.model and clear_inputs:
@@ -290,9 +296,15 @@ class Session:
                 self.modem_link = None
                 self.spi_link = None
                 reset_error = None
-                for worker in self.engines.values():
+                for image, worker in self.engines.items():
                     try:
-                        worker.request("reset")
+                        try:
+                            worker.request("reset")
+                        except EngineError:
+                            if worker.state.get("halt") != "worker-failed":
+                                raise
+                            self.engines[image] = self._start_worker(self.firmware[image])
+                            worker.close()
                     except EngineError as error:
                         if reset_error is None:
                             reset_error = error
@@ -469,9 +481,12 @@ class Session:
             limitations = list(LIMITATIONS)
             if self.model == "9575":
                 limitations.append("9575 GPS receiver, location reports and SOS service transport are not connected.")
+            processors = [dict(worker.state) for worker in self.engines.values()]
+            if any(processor.get("halt") == "worker-failed" for processor in processors):
+                self.running = False
             return {"handset": self.profile.describe(),
                     "firmware": primary.describe(), "images": [item.describe() for item in self.firmware.values()],
-                    "processors": [dict(worker.state) for worker in self.engines.values()],
+                    "processors": processors,
                     "running": self.running, "keys": sorted(self.keys),
                     "key_generations": dict(self.key_generations),
                     "key_epoch": self.key_epoch,

@@ -648,21 +648,23 @@ class ProbeTests(unittest.TestCase):
                         with self.assertRaisesRegex(EngineError, "MachineHalted"):
                             engine.request("call", entry=0x100)
 
-    def test_failed_reset_clears_surviving_contacts_before_recovery(self):
+    def test_reset_recovers_failed_worker_and_clears_surviving_contacts(self):
         for model in ("9555", "9575"):
             bc5, avr = images(model)
             with self.subTest(model=model), Session(EXECUTABLE, [avr, bc5]) as session:
                 session.key("1", True, client_id="tab-a", sequence=1, epoch=session.key_epoch)
                 primary = session.engines["bc5"]
                 self.assertEqual(primary.request("state")["gpio"]["key_contacts"], 32)
-                process = session.engines["avr"]._process
+                epoch = session.key_epoch
+                old = session.engines["avr"]
+                process = old._process
                 process.kill()
                 process.wait()
-                with self.assertRaises(EngineError):
-                    session.control("reset")
+                session.control("reset")
+                self.assertIsNot(session.engines["avr"], old)
+                self.assertIsNone(old._process)
                 self.assertEqual(primary.request("state")["gpio"]["key_contacts"], 0)
-                session.load(avr)
-                session.key("1", False, client_id="tab-a", sequence=2, epoch=session.key_epoch)
+                self.assertFalse(session.key("1", False, client_id="tab-a", sequence=2, epoch=epoch)["delivered"])
                 self.assertEqual(primary.request("state")["gpio"]["key_contacts"], 0)
                 self.assertEqual(session.keys, set())
 

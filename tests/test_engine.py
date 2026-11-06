@@ -124,7 +124,9 @@ class EngineTests(unittest.TestCase):
                     engine.request("run", steps=1)
                 with self.assertRaisesRegex(EngineError, "no longer running"):
                     engine.request("state")
-                self.assertEqual(engine.state, {"registers": [0]})
+                self.assertEqual(engine.state["registers"], [0])
+                self.assertEqual(engine.state["halt"], "worker-failed")
+                self.assertRegex(engine.state["worker_error"], message)
                 self.assert_closed()
 
     def test_request_timeout_includes_a_worker_that_does_not_read_stdin(self):
@@ -139,6 +141,8 @@ class EngineTests(unittest.TestCase):
                 with self.assertRaisesRegex(EngineError, "timed out"):
                     engine.request("run", padding="x" * 60000)
                 self.assertLess(time.monotonic() - started, 5)
+                self.assertEqual(engine.state["halt"], "worker-failed")
+                self.assertIn("timed out", engine.state["worker_error"])
                 self.assert_closed()
                 with self.assertRaisesRegex(EngineError, "no longer running"):
                     engine.request("state")
@@ -188,6 +192,21 @@ class EngineTests(unittest.TestCase):
         """)
         with self.assertRaisesRegex(EngineError, "WorkerFailure"):
             engine.request("run", steps=1)
+        self.assertEqual(engine.state["halt"], "worker-failed")
+        self.assertEqual(engine.state["worker_error"], "WorkerFailure")
+        self.assert_closed()
+
+    def test_state_reports_an_exited_worker_without_another_request(self):
+        engine = self.start("""
+            print('{"registers":[7],"steps":42,"halt":null}', flush=True)
+            time.sleep(10)
+        """)
+        self.process.kill()
+        self.process.wait()
+        self.assertEqual(engine.state["halt"], "worker-failed")
+        self.assertIn("no longer running", engine.state["worker_error"])
+        self.assertEqual(engine.state["registers"], [7])
+        self.assertEqual(engine.state["steps"], 42)
         self.assert_closed()
 
     def test_close_kills_a_worker_that_ignores_termination(self):

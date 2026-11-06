@@ -13,6 +13,20 @@ class SatelliteTests(unittest.TestCase):
         self.assertTrue(satellite.registered)
         self.assertFalse(satellite.state()["firmware_connected"])
 
+    def test_register_preserves_service_during_ringing_and_active_calls(self):
+        satellite = Satellite(latency_ms=800)
+        satellite.register()
+        satellite.advance(800)
+        satellite.incoming_call("123")
+        satellite.register()
+        self.assertTrue(satellite.registered)
+        self.assertFalse(satellite.state()["registering"])
+        satellite.answer()
+        satellite.register()
+        self.assertTrue(satellite.registered)
+        self.assertEqual(satellite.call_state, "active")
+        self.assertEqual(satellite.number, "123")
+
     def test_loss_of_coverage_cancels_registration_and_active_call(self):
         satellite = Satellite(latency_ms=0)
         satellite.register()

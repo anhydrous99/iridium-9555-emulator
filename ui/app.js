@@ -80,7 +80,8 @@ function renderProcessors(processors) {
     steps.append(node("span", "processor-label", "INSTRUCTIONS"), node("span", "processor-value", numberFormat.format(processor.steps || 0)));
     row.append(name, pc, steps);
     if (processor.halt && processor.halt !== "steps" && processor.halt !== "running") {
-      row.append(node("p", "processor-note processor-halt", `Stop: ${displayText(processor.halt)}`));
+      const message = processor.worker_error ? `${processor.worker_error}. Reset to restart.` : processor.halt;
+      row.append(node("p", "processor-note processor-halt", `Stop: ${displayText(message)}`));
     }
     if (processor.milestones) {
       const milestones = Array.isArray(processor.milestones)

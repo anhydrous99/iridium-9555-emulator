@@ -102,6 +102,10 @@ The Python transport applies one 30-second deadline to sending a request and
 receiving its reply. Timeouts, disconnects, malformed replies and oversized replies
 close the worker so a later command cannot consume an earlier command's response.
 Explicit native request errors with `fatal: false` leave the worker available.
+State reports terminal transport failures and exited workers as `halt: "worker-failed"`
+with a `worker_error` message, and pauses the session. Reset recreates failed workers
+from the retained source payload, reapplies strict-hardware settings, resets surviving
+workers and reconnects the board links; guest changes are discarded as with any cold reset.
 
 The worker reports `halt: "firmware-reset-requested"` when the original reset
 routine reaches byte `0x184F0` with its watchdog armed (`0x76 == 1` and bit 0 of
