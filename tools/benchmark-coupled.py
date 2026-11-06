@@ -31,6 +31,13 @@ def digest(value):
     return sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def tap_key(session, key):
+    for pressed in (True, False):
+        response = session.key(key, pressed)
+        if not response["delivered"]:
+            raise RuntimeError(f"Key event was not delivered: {response}")
+
+
 def live_workload(session, args, measure):
     from iridium.server import Server
 
@@ -236,10 +243,7 @@ def worker(args):
                 ("up", MAIN_MENU[0][1], 16, 97),
                 ("soft_right", HOME_CAPTIONS, 113, 128),
             ]):
-                def tap():
-                    assert session.key(key, True)["delivered"]
-                    assert session.key(key, False)["delivered"]
-                measure("key_pair", tap)
+                measure("key_pair", lambda: tap_key(session, key))
                 measure("key_settle", lambda: advance(2_000_000))
                 if screen(first, last) != expected:
                     raise RuntimeError(f"Menu assertion failed after {key}: {screen(first, last)} != {expected}")

@@ -23,8 +23,10 @@ The worker emits an initial JSON state, then one response for each newline-delim
 State replies also include private `_links` snapshots of AVR pins, empty UART
 captures and inactive BC5 serial state. The host uses these to answer redundant
 link queries until another native command invalidates the snapshot. They do not
-clock devices or drain output. The host can dispatch independent AVR/modem runs
-concurrently within one existing board quantum; link exchanges, reset ordering
+clock devices or drain output. Public replies cannot modify the cached values.
+The board's `drive_pins` operation skips unchanged BC5 input levels; explicit
+`pins` requests always obtain fresh native state. The host can dispatch independent
+AVR/modem runs concurrently within one existing board quantum; link exchanges, reset ordering
 and the 128-instruction SPI service interval remain unchanged.
 
 | Request | Response / effect |

@@ -32,8 +32,7 @@ class Engine:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
             os.set_blocking(self._process.stdin.fileno(), False)
             self._selector.register(self._process.stdout, selectors.EVENT_READ)
-            self._state = self._receive(time.monotonic() + self._timeout)
-            self._link_snapshot = self._state.pop("_links", None)
+            self._accept_state(self._receive(time.monotonic() + self._timeout))
             if self._state.get("error"):
                 raise EngineError(str(self._state["error"]))
         except BaseException:
@@ -60,6 +59,19 @@ class Engine:
                 return cached
             deadline = self._begin_request(self._encode_request(op, arguments))
             return self._finish_request(deadline)
+
+    def drive_pins(self, *, mask, value) -> None:
+        """Update board inputs without requesting a state reply for unchanged levels."""
+        if type(self) is Engine and "request" not in self.__dict__:
+            with self._lock:
+                self._require_alive()
+                snapshot = self._link_snapshot
+                if (snapshot is not None and snapshot.get("bc5_inputs") is not None
+                        and type(mask) is int and type(value) is int
+                        and 0 <= mask <= 65535 and 0 <= value <= 65535
+                        and (snapshot["bc5_inputs"] ^ value) & mask == 0):
+                    return
+        self.request("pins", mask=mask, value=value)
 
     @staticmethod
     def run_group(workers, steps):
@@ -125,9 +137,17 @@ class Engine:
                 self._fail(str(response["error"]))
             raise EngineError(str(response["error"]))
         if "registers" in response:
-            self._link_snapshot = response.pop("_links", None)
-            self._state = response
+            self._accept_state(response)
         return response
+
+    def _accept_state(self, response):
+        self._link_snapshot = response.pop("_links", None)
+        if self._link_snapshot is not None:
+            # Public replies are mutable; cached replies must retain the native values.
+            self._link_snapshot["uart_dropped"] = tuple(response.get("uart_tx_dropped") or ())
+            if response.get("image") == "bc5":
+                self._link_snapshot["bc5_inputs"] = response["gpio"]["inputs"]
+        self._state = response
 
     def _transport_failure(self, error):
         message = f"CPU worker disconnected: {error}" if isinstance(error, OSError) else str(error)
@@ -147,14 +167,7 @@ class Engine:
             port = arguments["port"]
             empty = snapshot.get("uart_empty")
             if type(port) is int and empty is not None and 0 <= port < len(empty) and empty[port]:
-                return {"accepted": 0, "values": [], "dropped": self._state["uart_tx_dropped"][port]}
-        if op == "pins" and self._state.get("image") == "bc5" and arguments.keys() == {"mask", "value"}:
-            mask, value = arguments["mask"], arguments["value"]
-            if (type(mask) is int and type(value) is int and 0 <= mask <= 65535 and 0 <= value <= 65535
-                    and not (self._state["gpio"]["inputs"] ^ value) & mask):
-                # State replies drain the LCD capture; do not replay a previous frame fragment.
-                self._state = {**self._state, "lcd_bytes": []}
-                return self._state
+                return {"accepted": 0, "values": [], "dropped": snapshot["uart_dropped"][port]}
         return None
 
     def _wait(self, selector, deadline: float) -> None:

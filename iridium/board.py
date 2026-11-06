@@ -161,8 +161,12 @@ class SpiLink:
             # Original SPI ISRs toggle PB0/PA7; irq_set drives PA3/PC2.
             handshake = pins[1] & 1 if self.model == "9555" else pins[0] & 0x80
             attention = pins[0] & 8 if self.model == "9555" else pins[2] & 4
-            self.bc5.request("pins", mask=0x5000,
-                             value=(0x1000 if handshake else 0) | (0x4000 if attention else 0))
+            inputs = (0x1000 if handshake else 0) | (0x4000 if attention else 0)
+            drive_pins = getattr(self.bc5, "drive_pins", None)
+            if drive_pins is None:
+                self.bc5.request("pins", mask=0x5000, value=inputs)
+            else:
+                drive_pins(mask=0x5000, value=inputs)
 
             selected = bool(gpio["direction"] & 0x10 and not gpio["output"] & 0x10)
             self._selected = selected and not held
