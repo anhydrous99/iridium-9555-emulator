@@ -46,6 +46,27 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_link_snapshots_match_live_device_queries_after_execution_and_reset(self):
+        for model, size in (("9555", 8678), ("9575", 14296)):
+            code = b"\xff\xcf" + b"\xff" * (size - 2)
+            states = exchange("avr", code, [
+                {"op": "pins", "port": 0, "value": 0xA5},
+                {"op": "run", "steps": 1000}, {"op": "pin_state"},
+                {"op": "uart_io", "port": 0},
+                {"op": "warm_reset"}, {"op": "pin_state"},
+            ], model=model)
+            for state_index, pins_index in ((2, 3), (5, 6)):
+                self.assertEqual(states[state_index]["_links"]["pins"], states[pins_index]["pins"])
+                self.assertEqual(states[state_index]["_links"]["inputs"], states[pins_index]["inputs"])
+            self.assertTrue(states[2]["_links"]["uart_empty"][0])
+            self.assertEqual(states[4], {"accepted": 0, "values": [], "dropped": 0})
+        states = exchange("bc5", bytes(0x310FBA), [
+            {"op": "pins", "mask": 0x5000, "value": 0x4000}, {"op": "serial"},
+            {"op": "warm_reset"}, {"op": "serial"},
+        ])
+        self.assertEqual(states[1]["_links"]["serial"], states[2])
+        self.assertEqual(states[3]["_links"]["serial"], states[4])
+
     def test_sim_pin_protocol_rejects_wrong_images_and_invalid_arguments_without_mutation(self):
         for image, size in (("ptt", 0xA7BF8), ("bc5", 0x310FBA), ("avr", 0x4000)):
             with self.subTest(image=image):
@@ -335,6 +356,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(states[5]["accesses"], [])
         self.assertEqual(states[5]["dropped"], trace["dropped"])
         self.assertEqual(states[7], {"enabled": True, "accesses": [], "dropped": 0})
+
+    def test_trace_toggle_applies_to_pending_call_without_refilling_fuel(self):
+        for model, size in (("9555", 0x310FBA), ("9575", 0x36BB22)):
+            firmware = bytearray(size)
+            # ld AL,#1; st AL,@0xFF91; rts.
+            firmware[0x100:0x106] = b"\x14\x01\x25\x91\xe2\x00"
+            for enabled in (False, True):
+                with self.subTest(model=model, enabled=enabled):
+                    states = exchange("bc5", firmware, [
+                        {"op": "trace", "enabled": not enabled},
+                        {"op": "call", "entry": 0x100, "steps": 10, "quantum": 1},
+                        {"op": "trace", "enabled": enabled},
+                        {"op": "call_resume", "steps": 10}, {"op": "trace"},
+                    ], model=model)
+                    self.assertTrue(states[2]["last_call"]["pending"])
+                    self.assertTrue(states[4]["last_call"]["returned"])
+                    self.assertEqual(states[5]["accesses"], [
+                        {"addr": 0xFF91, "bits": 16, "write": True, "value": 1}
+                    ] if enabled else [])
 
     def test_adc_stimulus_reaches_guest_conversion_on_both_models(self):
         for model, size, channel in (("9555", 8678, 7), ("9575", 14296, 15)):

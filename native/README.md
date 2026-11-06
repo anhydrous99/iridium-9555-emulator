@@ -20,6 +20,15 @@ evidence are in [inferred hardware](../docs/inferred-hardware.md).
 
 The worker emits an initial JSON state, then one response for each newline-delimited JSON request. EOF exits. Request errors are `{ "error": "...", "fatal": false }`; loading and stream errors use `fatal: true` and exit code 2. An interpreter trap is a non-null `halt` in the state. It stays stopped until reset.
 
+State replies also include private `_links` snapshots of AVR pins, empty UART
+captures and inactive BC5 serial state. The host uses these to answer redundant
+link queries until another native command invalidates the snapshot. They do not
+clock devices or drain output. Public replies cannot modify the cached values.
+The board's `drive_pins` operation skips unchanged BC5 input levels; explicit
+`pins` requests always obtain fresh native state. The host can dispatch independent
+AVR/modem runs concurrently within one existing board quantum; link exchanges, reset ordering
+and the 128-instruction SPI service interval remain unchanged.
+
 | Request | Response / effect |
 |---|---|
 | `{"op":"run","steps":100000}` | Advance at most 10,000,000 interpreter steps; return state. AVR steps can include IRQ entry or idle cycles. |

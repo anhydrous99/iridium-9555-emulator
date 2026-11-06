@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 from iridium.board import SpiLink
 from iridium.engine import EngineError
@@ -231,6 +232,14 @@ class SpiLinkTests(unittest.TestCase):
                 avr.pins = [0x77, 0xFE, 0xFB]
                 link.exchange()
                 self.assertEqual(bc5.calls[-1], ("pins", {"mask": 0x5000, "value": 0}))
+
+    def test_pin_updates_use_optional_drive_capability(self):
+        bc5 = Bc5(serial())
+        bc5.drive_pins = Mock()
+        link = SpiLink(bc5, Avr(pins=(8, 1, 0)), "9555")
+        link.exchange()
+        bc5.drive_pins.assert_called_once_with(mask=0x5000, value=0x5000)
+        self.assertEqual(bc5.calls, [("serial", {})])
 
     def test_reset_assertion_resets_once_and_byte_waits_until_release(self):
         bc5 = Bc5(serial(0x80, sequence=4, active=True, output=0, reset_count=1),

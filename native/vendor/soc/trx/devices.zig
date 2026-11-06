@@ -303,11 +303,12 @@ pub const Model = struct {
             const source: u4 = @intCast(4 + port);
             if (m.uarts[port].pending() != 0) pending |= @as(u16, 1) << source;
         }
-        for (0..16) |line| {
-            const source: u4 = @intCast(line);
+        while (pending != 0) {
+            const source: u4 = @intCast(@ctz(pending));
+            pending &= pending - 1;
             const cfg = m.irq_config[source];
             const level: u4 = @truncate(cfg);
-            if (cfg & 0x40 != 0 and level > highest and pending & (@as(u16, 1) << source) != 0) {
+            if (cfg & 0x40 != 0 and level > highest) {
                 selected = source;
                 highest = level;
             }
@@ -820,6 +821,25 @@ test "UART IRQ configuration selects source and level, and drain/mask acknowledg
     try std.testing.expectEqual(@as(u4, 2), m.irqLevel());
     d.write(d.ctx, 0x8000_0204, 32, 0); // original 0x33BD4 masks TX-ready to acknowledge
     try std.testing.expectEqual(@as(u4, 0), m.irqLevel());
+}
+
+test "equal interrupt priorities select the lowest pending enabled source" {
+    var m: Model = .{ .gpa = std.testing.allocator, .nwin = 8 };
+    defer m.deinit();
+    m.timers[0].pending = true;
+    m.uarts[0].config = 0xC00;
+    m.uarts[1].config = 0xC00;
+    m.irq_config[4] = 0x48;
+    m.irq_config[5] = 0x48;
+    m.irq_config[12] = 0x48;
+    m.irq_config[3] = 0x4F; // An inactive source cannot win.
+    try std.testing.expectEqual(@as(?u4, 4), m.interruptSource());
+    m.irq_config[4] = 8;
+    try std.testing.expectEqual(@as(?u4, 5), m.interruptSource());
+    m.uarts[1].config = 0;
+    try std.testing.expectEqual(@as(?u4, 12), m.interruptSource());
+    m.timers[0].pending = false;
+    try std.testing.expectEqual(@as(?u4, null), m.interruptSource());
 }
 
 test "PTT logical UART mapping and external UART status follow each image's table" {
