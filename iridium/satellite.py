@@ -55,7 +55,8 @@ class Satellite:
     def register(self) -> None:
         if not self.available:
             raise ValueError("No satellite visibility or signal")
-        self.registered = False
+        if self.registered:
+            return
         self._registration_due = self.time_ms + self.latency_ms
         self.advance(0)
 

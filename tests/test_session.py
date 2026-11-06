@@ -2,7 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from iridium.engine import EngineError
 from iridium.firmware import parse_firmware
@@ -474,6 +474,50 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(state["ui_initialized"])
         self.assertEqual(state["keys"], [])
         self.assertIsNone(state["lcd"])
+
+    def test_failed_worker_restart_still_resets_surviving_processors(self):
+        self.session.load(parse_firmware(bytes(0x310FBA), "bc5_main.bin"))
+        failed, survivor = self.session.engines["avr"], self.session.engines["bc5"]
+        failed.state["halt"] = "worker-failed"
+        failed.request = Mock(side_effect=EngineError("CPU worker is no longer running"))
+        self.session._engine_factory = Mock(side_effect=OSError("cannot launch worker"))
+        survivor.state["steps"] = 42
+        with self.assertRaisesRegex(EngineError, "cannot launch worker"):
+            self.session.control("reset")
+        self.assertEqual(survivor.state["steps"], 0)
+        self.assertIs(self.session.engines["bc5"], survivor)
+        self.assertIs(self.session.engines["avr"], failed)
+        self.assertFalse(self.session.running)
+        self.assertIsNone(self.session.spi_link)
+        self.assertIsNone(self.session.modem_link)
+
+    def test_worker_restart_reapplies_model_and_strict_hardware(self):
+        with Session(Path("unused"), [parse_firmware(bytes(14296), "avr.bin")],
+                     FakeEngine, strict_hardware=True) as session:
+            old = session.engines["avr"]
+            old.state["halt"] = "worker-failed"
+            old.request = Mock(side_effect=EngineError("CPU worker is no longer running"))
+            session.control("reset")
+            replacement = session.engines["avr"]
+            self.assertIsNot(replacement, old)
+            self.assertTrue(old.closed)
+            self.assertEqual(replacement.state["handset"], "9575")
+            self.assertEqual(replacement.data, session.firmware["avr"].data)
+            self.assertEqual(replacement.calls, [("hardware", {"strict": True})])
+
+    def test_firmware_staging_failure_still_resets_surviving_processors(self):
+        self.session.load(parse_firmware(bytes(0x310FBA), "bc5_main.bin"))
+        failed, survivor = self.session.engines["avr"], self.session.engines["bc5"]
+        failed.state["halt"] = "worker-failed"
+        failed.request = Mock(side_effect=EngineError("CPU worker is no longer running"))
+        survivor.state["steps"] = 42
+        with patch("iridium.session.tempfile.NamedTemporaryFile", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(EngineError, "Cannot start avr worker: disk full"):
+                self.session.control("reset")
+        self.assertEqual(survivor.state["steps"], 0)
+        self.assertIs(self.session.engines["bc5"], survivor)
+        self.assertIs(self.session.engines["avr"], failed)
+        self.assertFalse(self.session.running)
 
     def test_rejects_noninteger_and_out_of_range_budgets(self):
         for steps in (0, -1, True, 1.5, 10000001):

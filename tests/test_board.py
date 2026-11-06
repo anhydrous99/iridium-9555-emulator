@@ -355,6 +355,41 @@ class ExecutingModemLinkTests(unittest.TestCase):
 
 
 class ExecutingBoardReloadTests(unittest.TestCase):
+    def test_reset_recovers_a_dead_processor_and_reconnects_the_board(self):
+        executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
+        if not executable.is_file():
+            self.skipTest("Build the native executor first")
+        for model, bc5_size, avr_size in (("9555", 0x310FBA, 8678), ("9575", 0x36BB22, 14296)):
+            bc5 = parse_firmware(b"\xe0\0".ljust(bc5_size, b"\0"), "bc5.bin", "bc5", model=model)
+            avr = parse_firmware(b"\xff\xcf".ljust(avr_size, b"\xff"), "avr.bin", "avr", model=model)
+            for image in ("bc5", "avr"):
+                with self.subTest(model=model, image=image), Session(executable, [bc5, avr]) as session:
+                    old = session.engines[image]
+                    survivor_image = "avr" if image == "bc5" else "bc5"
+                    survivor = session.engines[survivor_image]
+                    old_link = session.spi_link
+                    old._process.kill()
+                    old._process.wait()
+                    session.running = True
+                    state = session.state()
+                    self.assertFalse(state["running"])
+                    failed = next(cpu for cpu in state["processors"] if cpu["image"] == image)
+                    self.assertEqual(failed["halt"], "worker-failed")
+
+                    session.control("reset")
+
+                    replacement = session.engines[image]
+                    self.assertIsNot(replacement, old)
+                    self.assertIsNone(old._process)
+                    self.assertIs(session.engines[survivor_image], survivor)
+                    self.assertIsNot(session.spi_link, old_link)
+                    self.assertIs(session.spi_link.bc5, session.engines["bc5"])
+                    self.assertIs(session.spi_link.avr, session.engines["avr"])
+                    self.assertEqual(replacement.request("read", address=0x100, count=1)["values"], [0])
+                    session.control("step", 128)
+                    self.assertTrue(all(cpu["halt"] is None for cpu in session.state()["processors"]))
+                    self.assertGreater(replacement.state["steps"], 0)
+
     def test_primary_replacement_releases_buttons_on_the_retained_avr(self):
         executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
         if not executable.is_file():

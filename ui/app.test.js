@@ -557,3 +557,10 @@ test("key feedback reports the backend's actual delivery result", async () => {
   await app.run("keyQueue");
   assert.match(app.elements.get("key-feedback").textContent, /Not delivered to firmware/);
 });
+
+test("worker failures explain how to recover in the processor row", async () => {
+  const app = await fixture();
+  app.run("renderProcessors([{image:'avr',halt:'worker-failed',worker_error:'CPU worker timed out and was stopped'}])");
+  const row = app.elements.get("processors").children[0];
+  assert.ok(row.children.some((child) => child.textContent === "Stop: CPU worker timed out and was stopped. Reset to restart."));
+});

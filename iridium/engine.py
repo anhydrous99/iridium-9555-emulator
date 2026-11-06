@@ -23,23 +23,36 @@ class Engine:
         self._stderr = tempfile.TemporaryFile()
         self._selector = selectors.DefaultSelector()
         self._process = None
+        self._state = {}
         try:
             self._process = subprocess.Popen(
                 [str(executable), "--image", image, "--firmware", str(firmware), "--model", model],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
             os.set_blocking(self._process.stdin.fileno(), False)
             self._selector.register(self._process.stdout, selectors.EVENT_READ)
-            self.state = self._receive(time.monotonic() + self._timeout)
-            if self.state.get("error"):
-                raise EngineError(str(self.state["error"]))
+            self._state = self._receive(time.monotonic() + self._timeout)
+            if self._state.get("error"):
+                raise EngineError(str(self._state["error"]))
         except BaseException:
             self.close()
             raise
 
+    @property
+    def state(self) -> dict:
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                self._fail("CPU worker is no longer running")
+            return self._state
+
+    def _fail(self, message: str) -> None:
+        if self._state.get("halt") != "worker-failed":
+            self._state = {**self._state, "halt": "worker-failed", "worker_error": message}
+        self.close()
+
     def request(self, op: str, **arguments) -> dict:
         with self._lock:
             if self._process is None or self._process.poll() is not None:
-                self.close()
+                self._fail("CPU worker is no longer running")
                 raise EngineError("CPU worker is no longer running")
             data = json.dumps({"op": op, **arguments}, separators=(",", ":")).encode() + b"\n"
             if len(data) > 65536:
@@ -49,18 +62,19 @@ class Engine:
                 self._send(data, deadline)
                 response = self._receive(deadline)
             except OSError as error:
-                self.close()
-                raise EngineError(f"CPU worker disconnected: {error}") from error
-            except EngineError:
+                message = f"CPU worker disconnected: {error}"
+                self._fail(message)
+                raise EngineError(message) from error
+            except EngineError as error:
                 # No request IDs: a broken exchange makes all later replies ambiguous.
-                self.close()
+                self._fail(str(error))
                 raise
             if response.get("error"):
                 if response.get("fatal"):
-                    self.close()
+                    self._fail(str(response["error"]))
                 raise EngineError(str(response["error"]))
             if "registers" in response:
-                self.state = response
+                self._state = response
             return response
 
     def _wait(self, selector, deadline: float) -> None:
