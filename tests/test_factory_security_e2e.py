@@ -49,7 +49,7 @@ class SharedSecurityChecks:
         def boot_with_known_modem_alerts():
             handset.control("initialize_ui")
             handset.control("pause")
-            alerts = {STARTUP_SIM_ERROR: "absent-sim", FIRMWARE_IDENTITY_WARNING: "firmware-identity"}
+            alerts = {STARTUP_SIM_ERROR: "absent-sim"}
             required_alert = "absent-sim"
             if self.model == "9575":
                 alerts[IERCC_NOT_CONFIGURED] = "iercc-not-configured"
@@ -61,21 +61,19 @@ class SharedSecurityChecks:
             while elapsed <= 120000000:
                 state = handset.state()
                 body = handset.screen_hash(state=state)
+                self.assertNotEqual(body, FIRMWARE_IDENTITY_WARNING, "Factory release metadata was rejected")
                 if body in alerts:
                     self.assertNotIn(alerts[body], seen, "Modem startup repeated a recognized alert")
                     seen.add(alerts[body])
                     handset.save_artifacts(f"modem-startup-{dismissed}-{alerts[body]}", state)
-                    # SIM/identity dialogs label this OK; IERCC labels it Cancel.
+                    # SIM dialogs label this OK; IERCC labels it Cancel.
                     press("soft_right")
                     dismissed += 1
                 elif (required_alert in seen and
                       handset.screen_hash(113, 128, state) == HOME_CAPTIONS):
                     self.assertEqual({cpu["image"] for cpu in state["processors"]}, {"bc5", "avr", "trx"})
                     self.assertTrue(state["processor_link"]["connected"])
-                    # Missing boot-ROM identity is still a model gap, including
-                    # when this boot's visible alert sequence omits its warning.
-                    identity = "with" if "firmware-identity" in seen else "without"
-                    handset.save_artifacts(f"modem-home-{identity}-identity-warning", state)
+                    handset.save_artifacts("modem-home", state)
                     return state
                 else:
                     handset.step(1000000)

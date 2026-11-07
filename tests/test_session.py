@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from iridium.engine import EngineError
 from iridium.firmware import parse_firmware
+from iridium.profiles import PROFILES
 from iridium.session import Session
 
 
@@ -79,6 +80,60 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(old.closed)
         self.assertEqual(self.session.engines["avr"].data, patch.data)
         self.assertEqual(self.session.state()["firmware"]["sha256"], patch.sha256)
+
+    def release_fixture(self):
+        for image in ("bc5", "trx"):
+            self.session.load(replace(self.firmware, image=image))
+        worker = self.session.engines["bc5"]
+        worker.state["halt"] = None
+        profile = replace(self.session.profile, release_hashes=tuple(
+            self.session.firmware[image].payload_sha256 for image in ("bc5", "avr", "trx")))
+        self.session._call = Mock(side_effect=[
+            {"last_call": {"al": 0xA100}}, {"last_call": {"al": 1}}, {},
+        ])
+        return worker, profile
+
+    def test_release_metadata_uses_original_store_and_releases_input_buffer(self):
+        worker, profile = self.release_fixture()
+        with patch.dict(PROFILES, {"9555": profile}):
+            self.session._provision_release_version(worker)
+        self.assertIn(("write", {"address": 0xA100,
+                               "values": [ord(char) for char in profile.release_manifest] + [0]}), worker.calls)
+        self.session._call.assert_any_call(worker, profile.version_store, al=0x2B3, ah=0xA100,
+                                          stack=[len(profile.release_manifest)], steps=1000000)
+        self.session._call.assert_called_with(worker, 0x6DFE, al=0xA100, steps=100000)
+
+    def test_modified_component_payloads_and_ptt_do_not_receive_factory_metadata(self):
+        worker, profile = self.release_fixture()
+        for image in ("bc5", "avr", "trx", "ptt"):
+            with self.subTest(image=image), patch.dict(PROFILES, {"9555": profile}):
+                if image == "ptt":
+                    self.session.modem_image = "ptt"
+                    self.session._provision_release_version(worker)
+                else:
+                    original = self.session.firmware[image]
+                    modified = replace(original, data=b"\x01" + original.data[1:])
+                    with patch.dict(self.session.firmware, {image: modified}):
+                        self.session._provision_release_version(worker)
+                self.session._call.assert_not_called()
+                self.assertFalse(any(op == "write" for op, _ in worker.calls))
+
+    def test_release_store_failure_is_reported_and_frees_its_input(self):
+        worker, profile = self.release_fixture()
+        self.session._call.side_effect = [{"last_call": {"al": 0xA100}}, {"last_call": {"al": 0}}, {}]
+        with patch.dict(PROFILES, {"9555": profile}):
+            with self.assertRaisesRegex(EngineError, "did not store"):
+                self.session._provision_release_version(worker)
+        self.session._call.assert_called_with(worker, 0x6DFE, al=0xA100, steps=100000)
+        self.assertFalse(any("stored HT25003" in event["message"] for event in self.session.events))
+
+    def test_release_allocation_failure_does_not_write_guest_memory(self):
+        worker, profile = self.release_fixture()
+        self.session._call.side_effect = [{"last_call": {"al": 0}}]
+        with patch.dict(PROFILES, {"9555": profile}):
+            with self.assertRaisesRegex(EngineError, "Cannot allocate"):
+                self.session._provision_release_version(worker)
+        self.assertFalse(any(op == "write" for op, _ in worker.calls))
 
     def test_model_switch_retires_old_processors_and_keys(self):
         self.session.key("1", True)

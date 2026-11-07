@@ -175,7 +175,7 @@ class InformationHelpChecks:
         self.expect(INFO_TITLE, 0, 14)
         self.glyphs("Phone Information", 0, 9, 109, 14)
         if hardware:
-            self.glyphs("HW: GRev@-XXXX", 16)
+            self.glyphs("HW: GRev@-XXXX" if self.model == "9575" else "HW: REVJ-XXXX", 16)
         elif local:
             for row, text in zip((16, 31), LOCAL_FW_LINES[self.model]):
                 self.glyphs(text, row)

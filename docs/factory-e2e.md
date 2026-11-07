@@ -257,6 +257,25 @@ checks and `./test` pass: 492 Python cases (205 executed, 287 fixture skips),
 remains skipped. No factory-firmware journeys were rerun for this output-order
 and cleanup change; the targeted results above retain their recorded commit.
 
+## Release identity validation
+
+The two cases in [the release-version journey](../tests/test_factory_firmware_version_e2e.py)
+pass on the original HT25003 and HL25003 payloads. Each boots with the real
+telephony modem, rejects any inconsistent-firmware warning, checks the release
+text on the original Phone Information LCD, completes shutdown and repeats
+startup/readback with retained settings. A separate original-function probe
+then writes an incorrect component checksum and requires the original version
+checker to reject it. The setup uses the explicit board, boot-handoff and CSR
+bank-header fixtures described in [the architecture](architecture.md).
+
+The targeted 2026-11-06 validation passed both release journeys, both existing
+information-page journeys, and all 63 native protocol cases with both factory
+directories supplied. The firmware-free `./test` invocation passed 519 Python
+cases (230 executed, 289 explicit fixture skips), 26 UI cases and 63 native
+protocol cases (45 executed, 18 fixture skips). The separate hardware case was
+skipped in that invocation. These targeted runs do not replace the historical
+236-case aggregate or change the recorded DSP/service limitations.
+
 ## Running the factory suite
 
 The optional factory-firmware suites require Linux with mounted, readable

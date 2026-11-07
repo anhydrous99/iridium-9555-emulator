@@ -20,6 +20,8 @@ ALL_KEYS = set(KEY_CODES) | {"power", "convenience", "sos"}
 LIMITATIONS = [
     "Digital hardware behavior and processor clock ratios are inferred from firmware; physical timing is not calibrated.",
     "Empty upgrade images need factory settings; original factory routines provision these before hardware startup.",
+    "Modem boot-ROM code is absent; a virtual version-4000 handoff selects the supported handset family.",
+    "The CSR bank-header fixture supplies the FFFE revision expected by both original upgrade tools.",
     "Keys use the GPIO matrix; power and 9575 SOS use firmware-derived AVR inputs.",
     "LCD output uses inferred serial/controller models; resource previews remain separate from live output.",
     "Satellite service scenarios are offline and are not connected to the modem firmware.",
@@ -618,6 +620,29 @@ class Session:
             quantum = self._board_quantum(min(remaining, peripheral_budget))
             response = self._request(worker, "call_resume", steps=quantum)
 
+    def _provision_release_version(self, worker) -> None:
+        if self.modem_image == "ptt" or any(
+                self.firmware[image].payload_sha256 != digest
+                for image, digest in zip(("bc5", "avr", "trx"), self.profile.release_hashes)
+                if image in self.firmware):
+            self.log("firmware", "Factory release metadata not provisioned for modified images or PTT")
+            return
+        # Replay the updater's PSK_VERSION input; original firmware owns the flash writes.
+        words = [ord(char) for char in self.profile.release_manifest] + [0]
+        buffer = self._call(worker, 0xFD3A, al=len(words), steps=100000)["last_call"]["al"]
+        if not buffer:
+            raise EngineError("Cannot allocate the firmware release metadata input")
+        try:
+            self._request(worker, "write", address=buffer, values=words)
+            result = self._call(worker, self.profile.version_store, al=0x2B3, ah=buffer,
+                                stack=[len(words) - 1], steps=1000000)
+            if result["last_call"]["al"] != 1:
+                raise EngineError("Original firmware did not store the release metadata")
+        finally:
+            if not worker.state.get("halt"):
+                self._call(worker, 0x6DFE, al=buffer, steps=100000)
+        self.log("firmware", f"Original firmware stored {self.profile.version} upgrade release metadata")
+
     def _initialize_ui(self) -> None:
         if self.ui_initialized:
             return
@@ -644,6 +669,8 @@ class Session:
         try:
             self._request(worker, "warm_reset")
             self._idle(worker)
+            if setup.get("halt") == "firmware-reset-requested":
+                self._provision_release_version(worker)
             self.log("firmware", "Original factory defaults retained across the warm reset")
             for _ in range(200):
                 self._step(200000)

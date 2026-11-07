@@ -46,6 +46,44 @@ def avr_loop() -> bytes:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_csr_bank_header_fixture_is_read_through_the_flash_window(self):
+        words = [0x0014, 0x7325]  # LD AL,#0; ST AL,@0x73 selects the boot bank's page.
+        for offset in range(6):
+            words.extend((0x8100, (offset << 8) | 0x15, 0xA000, (offset << 8) | 0x25))
+        words.append(0x0004)
+        for model, size in (("9555", 0x310FBA), ("9575", 0x36BB22)):
+            code = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\0")
+            states = exchange("bc5", code, [
+                {"op": "run", "steps": 100}, {"op": "read", "address": 0xA000, "count": 6},
+                {"op": "warm_reset"}, {"op": "run", "steps": 100},
+                {"op": "read", "address": 0xA000, "count": 6},
+                {"op": "reset"}, {"op": "run", "steps": 100},
+                {"op": "read", "address": 0xA000, "count": 6},
+            ], model=model)
+            self.assertEqual(states[0]["bank_header_fixture"], {
+                "name": "virtual-csr-bank", "flash_word_address": 0x100, "revision": 0xFFFE})
+            for index in (2, 5, 8):
+                self.assertEqual(states[index]["values"], [0xD397, 0x102, 8, 0x105, 0, 0xFFFE])
+
+    def test_virtual_modem_boot_handoff_is_visible_and_restored_by_reset(self):
+        for model in ("9555", "9575"):
+            with self.subTest(model=model):
+                states = exchange("trx", bytes(0x260760), [
+                    {"op": "read", "address": 0x70000000, "count": 4},
+                    {"op": "write", "address": 0x70000002, "values": [0, 0]},
+                    {"op": "state"}, {"op": "warm_reset"},
+                    {"op": "read", "address": 0x70000000, "count": 4},
+                    {"op": "reset"},
+                    {"op": "read", "address": 0x70000000, "count": 4},
+                ], model=model)
+                self.assertEqual(states[0]["boot_handoff_fixture"], {
+                    "name": "virtual-handset-family", "address": 0x70000002, "version": 4000})
+                self.assertEqual(states[3]["boot_handoff_fixture"]["version"], 0)
+                for index in (1, 5, 7):
+                    self.assertEqual(states[index]["values"], [0, 0, 0x0F, 0xA0])
+        for image, size in (("ptt", 0xA7BF8), ("bc5", 0x310FBA), ("avr", 8678)):
+            self.assertIsNone(exchange(image, bytes(size), [])[0]["boot_handoff_fixture"])
+
     def test_link_snapshots_match_live_device_queries_after_execution_and_reset(self):
         for model, size in (("9555", 8678), ("9575", 14296)):
             code = b"\xff\xcf" + b"\xff" * (size - 2)
