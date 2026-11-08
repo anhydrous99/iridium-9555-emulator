@@ -49,6 +49,10 @@ Additional operations include strict `hardware` mode, bounded `trace`, BC5
 electrical `key`/`pins`, coupled `serial`, AVR `pin_state`/`adc`/`comparator`/
 `async_clock`/`twi`/`fuses`/`program_read`, SPARC external `irq`, and batched
 `uart_io` on AVR or modem ports. See the [protocol examples](../docs/inferred-hardware.md).
+AVR `pin_state` also reports the process-lifetime `modem_power_rises` counter.
+The host uses it to detect enable pulses within one execution chunk. On the
+AVR modem UART, `uart_io` with `modem_link:true` discards the captured output
+prefix preceding the latest power edge; ordinary debugger drains retain it.
 `hardware.enabled` selects the BC5 IRQ/bank/ADC model and performs a warm reset
 when changed; normal execution enables it by default.
 Probe stack placement reserves the interrupt frame and all supplied arguments.

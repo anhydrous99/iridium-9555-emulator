@@ -208,8 +208,7 @@ pub fn Soc(comptime M: type) type {
         /// This is an explicit host action until watchdog timing is established; it does not infer a reset
         /// merely because firmware enables the watchdog or writes its kick register.
         pub fn warmReset() void {
-            const source = laid_at + image.window_base + mem16.window_lo;
-            @memcpy(M.data[mem16.window_lo..image.window_end], flash.words[source..][0 .. image.window_end - mem16.window_lo]);
+            refreshFlashWindow();
             segs[0].words = flash.words[laid_at..][0..image.code_words];
             dev = .{};
             const sel = core.sel;
@@ -226,6 +225,14 @@ pub fn Soc(comptime M: type) type {
             @memcpy(flash.words[at..][0..n], words[0..n]);
             flash.state = .read;
             laid_at = at;
+            refreshFlashWindow();
+        }
+
+        fn refreshFlashWindow() void {
+            const source = laid_at + image.window_base + mem16.window_lo;
+            flash.data_window = M.data[mem16.window_lo..image.window_end];
+            flash.data_window_base = source;
+            @memcpy(flash.data_window, flash.words[source..][0..flash.data_window.len]);
         }
 
         /// System runs serve MMIO from the device stubs; function tests from a tape (`bus.tape`).
@@ -715,6 +722,60 @@ pub fn projectRoot(io: std.Io, explicit: ?[]const u8) !std.Io.Dir {
         if (d.access(io, main_image.file, .{})) |_| return d else |_| d.close(io);
     }
     return error.ProjectRootNotFound;
+}
+
+test "flash programming and erase update the constant window without reset" {
+    const Mem = struct {
+        pub var data: [0x10000]u16 = undefined;
+        pub var bus: Bus = undefined;
+
+        fn flashWrite(address: u32, value: u16) void {
+            bus.write(0x73, 16, address / 0x1000);
+            bus.write(0x8000 + address % 0x1000, 16, value);
+        }
+    };
+    const S = Soc(Mem);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var bytes: [0x208]u8 = @splat(0xFF);
+    std.mem.writeInt(u16, bytes[0x200..][0..2], 0xABCD, .little);
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "synthetic.bin", .data = &bytes });
+    var profile = main_image;
+    profile.file = "synthetic.bin";
+    profile.window_base = 0;
+    profile.window_end = 0x104;
+    profile.code_words = 1;
+    try S.init(std.testing.allocator, std.testing.io, directory.dir, profile);
+    defer S.deinit(std.testing.allocator);
+    S.systemMode(true);
+    Mem.data[0xA100] = 0xCAFE;
+    const target = S.laid_at + 0x100;
+    for ([_][2]u32{ .{ 0x555, 0xAA }, .{ 0x2AA, 0x55 }, .{ 0x555, 0xA0 }, .{ target, 0x0FFF } }) |cycle|
+        Mem.flashWrite(cycle[0], @intCast(cycle[1]));
+    try std.testing.expectEqual(@as(u64, 0x0BCD), Mem.bus.read(0x100, 16));
+    try std.testing.expectEqual(@as(u16, 0x0BCD), Mem.data[0x100]); // debugger/snapshot backing
+    try std.testing.expectEqual(@as(u64, 0xFFFF), Mem.bus.read(0x101, 16));
+    S.warmReset();
+    try std.testing.expectEqual(@as(u64, 0x0BCD), Mem.bus.read(0x100, 16));
+
+    for ([_][2]u32{ .{ 0x555, 0xAA }, .{ 0x2AA, 0x55 }, .{ 0x555, 0x20 }, .{ 0, 0xA0 }, .{ target + 1, 0x1234 }, .{ 0, 0x90 }, .{ 0, 0 } }) |cycle|
+        Mem.flashWrite(cycle[0], @intCast(cycle[1]));
+    try std.testing.expectEqual(@as(u64, 0x1234), Mem.bus.read(0x101, 16));
+    for ([_][2]u32{ .{ 0x555, 0xAA }, .{ 0x2AA, 0x55 }, .{ 0x555, 0x80 }, .{ 0x555, 0xAA }, .{ 0x2AA, 0x55 }, .{ target, 0x30 } }) |cycle|
+        Mem.flashWrite(cycle[0], @intCast(cycle[1]));
+    try std.testing.expectEqual(@as(u64, 0xFFFF), Mem.bus.read(0x100, 16));
+    try std.testing.expectEqual(@as(u64, 0xFFFF), Mem.bus.read(0x101, 16));
+    try std.testing.expectEqual(@as(u16, 0xCAFE), Mem.data[0xA100]);
+    S.reset();
+    try std.testing.expectEqual(@as(u64, 0xABCD), Mem.bus.read(0x100, 16));
+
+    for ([_][2]u32{ .{ 0x555, 0xAA }, .{ 0x2AA, 0x55 }, .{ 0x555, 0x80 }, .{ 0x555, 0xAA }, .{ 0x2AA, 0x55 }, .{ 0x555, 0x10 } }) |cycle|
+        Mem.flashWrite(cycle[0], @intCast(cycle[1]));
+    try std.testing.expectEqual(@as(u64, 0xFFFF), Mem.bus.read(0x100, 16));
+    S.warmReset();
+    try std.testing.expectEqual(@as(u64, 0xFFFF), Mem.bus.read(0x100, 16));
+    S.reset();
+    try std.testing.expectEqual(@as(u64, 0xABCD), Mem.bus.read(0x100, 16));
 }
 
 test "warm reset preserves RAM and programmed flash; fresh reset restores the supplied image" {

@@ -17,6 +17,10 @@ class ModemLink:
         self.power_pin = power_pin
         self.powered = power_pin is None
         self.power_resets = 0
+        snapshot = avr.request("pin_state") if power_pin is not None else {}
+        self.power_rises = snapshot.get("modem_power_rises", 0) if isinstance(snapshot, dict) else 0
+        if type(self.power_rises) is not int or self.power_rises < 0:
+            raise EngineError("Invalid AVR modem power counter")
         self.pending = [bytearray(), bytearray()]
         self.delivered = [0, 0]
         self.error = None
@@ -32,14 +36,20 @@ class ModemLink:
                 if (not isinstance(pins, list) or len(pins) <= port
                         or any(type(value) is not int or not 0 <= value <= 255 for value in pins)):
                     raise EngineError("Invalid AVR pins on modem power link")
+                rises = snapshot.get("modem_power_rises", self.power_rises)
+                if type(rises) is not int or rises < self.power_rises:
+                    raise EngineError("Invalid AVR modem power counter")
                 enabled = bool(pins[port] & (1 << bit)) and not avr_reset
-                if enabled and not self.powered:
+                resets = max(rises - self.power_rises, int(enabled and not self.powered))
+                if resets and not avr_reset:
                     self.endpoints[1][0].request("warm_reset")
-                    self.power_resets += 1
+                    self.power_resets += resets
                     self.pending = [bytearray(), bytearray()]
+                self.power_rises = rises
                 self.powered = enabled
             for direction, (source, port) in enumerate(self.endpoints):
-                response = source.request("uart_io", port=port)
+                arguments = {"modem_link": True} if direction == 0 and self.power_pin is not None else {}
+                response = source.request("uart_io", port=port, **arguments)
                 if not self.powered or direction == 1 and avr_reset:
                     self.pending[direction].clear()
                 else:

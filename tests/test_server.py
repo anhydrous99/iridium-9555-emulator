@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 from pathlib import Path
@@ -134,6 +135,36 @@ class ServerTests(unittest.TestCase):
         self.assertIn("128", json.loads(data)["error"])
         self.assertEqual(self.session.keys, set())
 
+    def test_browser_key_session_rejects_old_instance_events_with_the_same_epoch(self):
+        status, data, _ = self.request("GET", "/api/state")
+        self.assertEqual(status, 200, data)
+        state = json.loads(data)
+        event = {"key": "1", "pressed": True, "client_id": "tab", "sequence": 1,
+                 "epoch": state["key_epoch"], "session_id": state["session_id"]}
+
+        def send(changes):
+            status, data, _ = self.request("POST", "/api/key", json.dumps(event | changes),
+                                           {"Content-Type": "application/json"})
+            self.assertEqual(status, 200, data)
+            result = json.loads(data)
+            self.assertEqual(result["session_id"], state["session_id"])
+            return result
+
+        send({})
+        stale = send({"pressed": False, "sequence": 99, "session_id": "0" * 32})
+        self.assertIn("Stale key session", stale["message"])
+        self.assertEqual(self.session.keys, {"1"})
+        send({"pressed": False, "sequence": 2})
+        self.assertEqual(self.session.keys, set())
+        for session_id in ("", "g" * 32, 1, []):
+            status, _, _ = self.request("POST", "/api/key", json.dumps(event | {"session_id": session_id}),
+                                       {"Content-Type": "application/json"})
+            self.assertEqual(status, 400)
+        status, data, _ = self.request("POST", "/api/control", '{"action":"reset"}',
+                                       {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["session_id"], state["session_id"])
+
     def test_network_binding_and_matching_origin_use_the_connection_destination(self):
         self.assertEqual(arguments([]).host, "0.0.0.0")
         self.assertEqual(arguments(["--host", "127.0.0.1"]).host, "127.0.0.1")
@@ -177,6 +208,7 @@ class ServerTests(unittest.TestCase):
         patch = b"\1\2" + bytes(8676)
         status, data, _ = self.request("POST", "/api/firmware", patch, {"X-Filename": "avr.bin"})
         self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["session_id"], self.session.session_id)
         self.assertEqual(self.session.engines["avr"].data, patch)
         status, _, headers = self.request("GET", "/")
         self.assertEqual(status, 200)
@@ -202,4 +234,3 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-from concurrent.futures import ThreadPoolExecutor

@@ -75,6 +75,8 @@ var serial_sequence: u32 = 0;
 var serial_dma: ?struct { receive: bool, remaining: u16, in_flight: bool = false } = null;
 var gpio_inputs: u16 = 0;
 var gpio_reset_count: u64 = 0;
+var modem_power_rises: u64 = 0;
+var modem_tx_discard: u8 = 0;
 var keypad_model: keypad.Model = .{};
 const Milestones = struct { main: bool = false, scheduler: bool = false, idle: bool = false, panic: ?u16 = null };
 var milestones: Milestones = .{};
@@ -391,7 +393,28 @@ fn avrRead(_: *anyopaque, address: u32, _: u8) u64 {
 fn avrWrite(_: *anyopaque, address: u32, _: u8, value: u64) void {
     if (hardware_strict and !avr_dev.modeledAccess(@intCast(address), true))
         return hardwareFault(&avr_bus, address, true);
+    const base: u32 = if (handset == .@"9575") 0x26 else 0x20;
+    const power_write = address >= base and address <= base + 2;
+    const before = power_write and avrModemPower();
     avr_dev.write(@intCast(address), @truncate(value));
+    if (power_write) observeModemPower(before);
+}
+
+fn avrModemPort() u2 {
+    return if (handset == .@"9575") 3 else 0;
+}
+
+fn avrModemPower() bool {
+    return if (handset == .@"9575") avr_dev.pin(2) & 0x10 != 0 else avr_dev.pin(0) & 0x20 != 0;
+}
+
+fn observeModemPower(before: bool) void {
+    const enabled = avrModemPower();
+    if (before == enabled) return;
+    if (enabled) modem_power_rises += 1;
+    // Keep debugger capture intact; the coupled link discards only this older prefix.
+    const uart = &avr_dev.st.usart[avrModemPort()];
+    modem_tx_discard = uart.out_tail -% uart.out_head;
 }
 
 fn attachTrxDevices() void {
@@ -451,6 +474,7 @@ fn reset(init: std.process.Init) !void {
             attachBc5Devices();
         },
         .avr => {
+            const before = avrModemPower();
             @memset(&avr_data, 0);
             @memset(&avr_prog, 0xFF);
             @memcpy(avr_prog[0..firmware.len], firmware);
@@ -460,6 +484,8 @@ fn reset(init: std.process.Init) !void {
             avr_dev.configureFuses(fuses.low, fuses.high, fuses.extended, fuses.lock);
             avr_dev.reset();
             idleAvrInputs();
+            modem_tx_discard = 0;
+            observeModemPower(before);
             avr_soc.loader.coldReset(&avr_cpu);
             avr_cpu.st.pc = avr_dev.resetVector();
             if (handset == .@"9575") avr_cpu.st.sp = 0x21FF;
@@ -530,6 +556,7 @@ fn state(out: *std.Io.Writer) !void {
         ._links = .{
             .pins = if (current_image == .avr) pins[0..avr_dev.portCount()] else null,
             .inputs = if (current_image == .avr) inputs[0..avr_dev.portCount()] else null,
+            .modem_power_rises = if (current_image == .avr) @as(?u64, modem_power_rises) else null,
             .uart_empty = if (current_image == .avr) uart_empty[0..avr_dev.uartCount()] else if (current_image != .bc5) @as([]bool, &uart_empty) else null,
             .serial = if (current_image == .bc5 and serial_dma == null) .{
                 .value = @as(?u8, null),
@@ -818,7 +845,10 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
             Bc.warmReset();
             attachBc5Devices();
         } else if (current_image == .avr) {
+            const before = avrModemPower();
             avr_dev.resetWithCause(.external);
+            modem_tx_discard = 0;
+            observeModemPower(before);
             avr_bus.resetRun(std.math.maxInt(u64));
             avr_soc.loader.coldReset(&avr_cpu);
             avr_cpu.st.pc = avr_dev.resetVector();
@@ -884,7 +914,9 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
         } else if (current_image == .avr) {
             const port = try number(u4, obj, "port", null);
             if (port >= avr_dev.portCount()) return error.BadPort;
+            const before = avrModemPower();
             avr_dev.setPinsIn(port, try number(u8, obj, "value", null));
+            observeModemPower(before);
         } else return error.PinsUnavailable;
     } else if (std.mem.eql(u8, op.string, "key")) {
         if (current_image != .bc5) return error.Bc5Only;
@@ -899,7 +931,7 @@ fn request(init: std.process.Init, alloc: std.mem.Allocator, out: *std.Io.Writer
         var inputs: [11]u16 = undefined;
         for (pins[0..avr_dev.portCount()], 0..) |*pin, index| pin.* = avr_dev.pin(@intCast(index));
         for (inputs[0..avr_dev.portCount()], 0..) |*pin, index| pin.* = avr_dev.st.pins_in[index];
-        return json(out, .{ .pins = pins[0..avr_dev.portCount()], .inputs = inputs[0..avr_dev.portCount()] });
+        return json(out, .{ .pins = pins[0..avr_dev.portCount()], .inputs = inputs[0..avr_dev.portCount()], .modem_power_rises = modem_power_rises });
     } else if (std.mem.eql(u8, op.string, "uart_rx")) {
         const port = try uartPort(obj);
         if (!uartPush(port, try number(u8, obj, "value", null))) return error.UartFull;
@@ -1032,7 +1064,10 @@ fn uartPush(port: u2, value: u8) bool {
 }
 
 fn uartPop(port: u2) ?u8 {
-    return if (current_image == .avr) avr_dev.uartPop(port) else trx_model.uartPop(port);
+    if (current_image != .avr) return trx_model.uartPop(port);
+    const value = avr_dev.uartPop(port);
+    if (value != null and port == avrModemPort()) modem_tx_discard -|= 1;
+    return value;
 }
 
 fn uartDropped(port: u2) u64 {
@@ -1042,6 +1077,8 @@ fn uartDropped(port: u2) u64 {
 fn uartIo(out: *std.Io.Writer, obj: std.json.ObjectMap) !void {
     const port = try uartPort(obj);
     const tx_limit = try number(u8, obj, "tx_limit", 255);
+    const modem_link = if (obj.contains("modem_link")) try boolean(obj, "modem_link") else false;
+    if (modem_link and (current_image != .avr or port != avrModemPort())) return error.BadPort;
     var rx: [255]u8 = undefined;
     var count: usize = 0;
     if (obj.get("rx")) |value| {
@@ -1052,6 +1089,9 @@ fn uartIo(out: *std.Io.Writer, obj: std.json.ObjectMap) !void {
         }
         count = value.array.items.len;
     }
+    if (modem_link) while (modem_tx_discard != 0) {
+        _ = uartPop(port) orelse break;
+    };
     var accepted: usize = 0;
     for (rx[0..count]) |value| {
         if (!uartPush(port, value)) break;

@@ -63,6 +63,15 @@ fn query(p: u32) u16 {
 pub const Flash = struct {
     words: []u16 = &.{},
     state: State = .read,
+    // The data-space constant window also backs debugger reads and snapshots.
+    data_window: []u16 = &.{},
+    data_window_base: usize = 0,
+
+    fn syncWindow(f: *const Flash, begin: usize, end: usize) void {
+        const first = @max(begin, f.data_window_base);
+        const last = @min(end, f.data_window_base + f.data_window.len);
+        if (first < last) @memcpy(f.data_window[first - f.data_window_base ..][0 .. last - first], f.words[first..last]);
+    }
 
     pub fn read(f: *const Flash, p: u32) u16 {
         if (f.state == .query) return query(p);
@@ -79,7 +88,10 @@ pub const Flash = struct {
         const cmd: u8 = @truncate(v);
         f.state = switch (f.state) {
             .program, .bypass_program => blk: {
-                if (p < f.words.len) f.words[p] &= v; // programming only clears bits
+                if (p < f.words.len) {
+                    f.words[p] &= v; // programming only clears bits
+                    f.syncWindow(p, p + 1);
+                }
                 break :blk if (f.state == .bypass_program) .bypass else .read;
             },
             .read => if (cmd == 0x98 and a == 0x55) .query else if (cmd == 0xAA and a == 0x555) .unlock1 else .read,
@@ -102,11 +114,18 @@ pub const Flash = struct {
             .erase_setup => if (cmd == 0xAA and a == 0x555) .erase_unlock1 else .read,
             .erase_unlock1 => if (cmd == 0x55 and a == 0x2AA) .erase_unlock2 else .read,
             .erase_unlock2 => blk: {
-                if (cmd == 0x10 and a == 0x555) @memset(f.words, 0xFFFF);
+                if (cmd == 0x10 and a == 0x555) {
+                    @memset(f.words, 0xFFFF);
+                    f.syncWindow(0, f.words.len);
+                }
                 if (cmd == 0x30) {
                     const length: u32 = if (p < 0x8000) parameter_sector_words else main_sector_words;
                     const start = p & ~(length - 1);
-                    if (start < f.words.len) @memset(f.words[start..@min(start + length, f.words.len)], 0xFFFF);
+                    if (start < f.words.len) {
+                        const end = @min(start + length, f.words.len);
+                        @memset(f.words[start..end], 0xFFFF);
+                        f.syncWindow(start, end);
+                    }
                 }
                 break :blk .read;
             },

@@ -19,7 +19,7 @@ class Endpoint:
         self.pin_state = {"pins": [0] * 11}
         self.resets = []
 
-    def request(self, op, *, port=None, rx=(), tx_limit=255):
+    def request(self, op, *, port=None, rx=(), tx_limit=255, modem_link=False):
         if op == "pin_state":
             return self.pin_state
         if op in ("warm_reset", "reset"):
@@ -36,6 +36,46 @@ class Endpoint:
 
 
 class ModemLinkTests(unittest.TestCase):
+    def test_power_counter_baselines_history_and_catches_hidden_cycles(self):
+        avr, modem = Endpoint(capacity=0), Endpoint(capacity=0)
+        avr.pin_state.update(modem_power_rises=19)
+        avr.pin_state["pins"][0] = 0x20
+        link = ModemLink(avr, modem, "trx", power_pin=(0, 5))
+        link.exchange()
+        self.assertEqual(link.power_resets, 1)
+        avr.transmit, modem.transmit = [41], [81]
+        link.exchange()
+        self.assertEqual(link.state()["pending"], [1, 1])
+        avr.pin_state["modem_power_rises"] += 2
+        link.exchange()
+        self.assertEqual(link.power_resets, 3)
+        self.assertEqual(modem.resets, ["warm_reset", "warm_reset"])
+        self.assertEqual(link.state()["pending"], [0, 0])
+        link.exchange()
+        self.assertEqual(link.power_resets, 3)
+        avr.pin_state["modem_power_rises"] += 1
+        link.exchange(avr_reset=True)
+        self.assertEqual(link.power_resets, 3)
+        link.exchange()
+        self.assertEqual(link.power_resets, 4)
+        avr.pin_state["modem_power_rises"] += 1
+        avr.pin_state["pins"][0] = 0
+        link.exchange()
+        self.assertEqual(link.power_resets, 5)
+        self.assertFalse(link.powered)
+
+    def test_invalid_power_counters_stop_before_modem_reset_or_delivery(self):
+        for value in (1, -1, True, None, 0.5, "1"):
+            with self.subTest(value=value):
+                avr, modem = Endpoint([41]), Endpoint([81])
+                avr.pin_state["modem_power_rises"] = 2
+                link = ModemLink(avr, modem, "trx", power_pin=(0, 5))
+                avr.pin_state["modem_power_rises"] = value
+                with self.assertRaisesRegex(EngineError, "power counter"):
+                    link.exchange()
+                self.assertEqual((avr.ports, modem.ports, modem.resets), ([], [], []))
+                self.assertIsNotNone(link.error)
+
     def test_managed_power_edges_restart_once_and_discard_offline_traffic(self):
         for avr_port, power_pin in ((0, (0, 5)), (3, (2, 4))):
             with self.subTest(avr_port=avr_port):
@@ -234,6 +274,33 @@ class ModemLinkTests(unittest.TestCase):
 
 
 class ExecutingModemLinkTests(unittest.TestCase):
+    def test_modem_power_pulses_between_exchanges_clear_ram_for_both_step_sizes(self):
+        executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
+        if not executable.is_file():
+            self.skipTest("Build the native executor first")
+        for model, bc5_size, avr_size, ddr, port, mask in (
+                ("9555", 0x310FBA, 8678, 0x21, 0x22, 0x20),
+                ("9575", 0x36BB22, 14296, 0x27, 0x28, 0x10)):
+            load = 0xE000 | ((mask & 0xF0) << 4)
+            words = [load, 0x9300, ddr, 0x9300, port] + [0] * 20
+            words += [0xE000, 0x9300, port, load, 0x9300, port, 0xCFFF]
+            avr = b"".join(word.to_bytes(2, "little") for word in words).ljust(avr_size, b"\xff")
+            for image, size in (("trx", 0x260760), ("ptt", 0xA7BF8)):
+                firmware = [parse_firmware(b"\xe0\0".ljust(bc5_size, b"\0"), "bc5.bin", "bc5", model=model),
+                            parse_firmware(avr, "avr.bin", model=model),
+                            parse_firmware(bytes.fromhex("1080000001000000").ljust(size, b"\xff"),
+                                           image + ".bin", image, model=model)]
+                for chunks in ([100], [1] * 100):
+                    with self.subTest(model=model, image=image, chunks=len(chunks)), Session(
+                            executable, firmware, modem_image=image) as session:
+                        session.control("step", 3)
+                        session.probe(image, "write", {"address": 0x40000100, "values": [42]})
+                        for chunk in chunks:
+                            session.control("step", chunk)
+                        self.assertEqual(session.modem_link.power_resets, 2)
+                        self.assertEqual(session.probe(image, "read", {"address": 0x40000100})["values"], [0])
+                        self.assertEqual(session.engines["avr"].state["pc"], 62)
+
     def test_avr_output_power_cycles_pause_and_restart_the_selected_modem_clock(self):
         executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
         if not executable.is_file():

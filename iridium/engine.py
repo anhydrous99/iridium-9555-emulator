@@ -145,6 +145,8 @@ class Engine:
         if self._link_snapshot is not None:
             # Public replies are mutable; cached replies must retain the native values.
             self._link_snapshot["uart_dropped"] = tuple(response.get("uart_tx_dropped") or ())
+            self._link_snapshot["modem_port"] = ((3 if response.get("handset") == "9575" else 0)
+                                                  if response.get("image") == "avr" else None)
             if response.get("image") == "bc5":
                 self._link_snapshot["bc5_inputs"] = response["gpio"]["inputs"]
         self._state = response
@@ -159,11 +161,16 @@ class Engine:
         if snapshot is None:
             return None
         if op == "pin_state" and not arguments and snapshot.get("pins") is not None:
-            return {"pins": list(snapshot["pins"]), "inputs": list(snapshot["inputs"])}
+            response = {"pins": list(snapshot["pins"]), "inputs": list(snapshot["inputs"])}
+            if "modem_power_rises" in snapshot:
+                response["modem_power_rises"] = snapshot["modem_power_rises"]
+            return response
         if op == "serial" and not arguments and snapshot.get("serial") is not None:
             serial = snapshot["serial"]
             return {**serial, "gpio": dict(serial["gpio"])}
-        if op == "uart_io" and arguments.keys() == {"port"}:
+        if op == "uart_io" and (arguments.keys() == {"port"} or
+                                 arguments.keys() == {"port", "modem_link"} and arguments["modem_link"] is True
+                                 and arguments["port"] == snapshot["modem_port"]):
             port = arguments["port"]
             empty = snapshot.get("uart_empty")
             if type(port) is int and empty is not None and 0 <= port < len(empty) and empty[port]:

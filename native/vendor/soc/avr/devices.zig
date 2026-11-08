@@ -144,7 +144,7 @@ const access: [0x100]Access = blk: {
     for ([_]u8{ TWBR, TWAR, TWAMR, 0x3D, 0x3E, EEDR, EEARL, EEARH, TCCR0A, OCR0A, OCR0B, 0x4A, 0x4B, SPCR, SMCR, PRR, 0x66, PCICR, 0x69, 0x6B, 0x6C, 0x6D, TIMSK0, TIMSK1, TIMSK2, PCMSK3, ADCSRB, ADMUX, 0x7E, 0x7F, TCCR1A, TCCR1B, 0x82, TCCR2A, OCR2A, OCR2B }) |x| a[x] = .store;
     for ([_]u8{ UCSR0A, UCSR1A }) |b| {
         a[b] = .model; // UCSRnA
-        a[b + 1] = .store; // UCSRnB
+        a[b + 1] = .model; // UCSRnB: disabling RX flushes the receiver
         a[b + 2] = .store; // UCSRnC
         a[b + 4] = .store; // UBRRnL
         a[b + 5] = .store; // UBRRnH
@@ -708,7 +708,7 @@ pub const Devices = struct {
     fn registerAccess(d: *const Devices, a: u16) Access {
         if (d.mega) {
             for (uart_bases[2..]) |base| {
-                if (a == base or a == base + 6) return .model;
+                if (a == base or a == base + 1 or a == base + 6) return .model;
                 if (a > base and a < base + 6 and a != base + 3) return .store;
             }
             if (a == RAMPZ) return .model;
@@ -1022,6 +1022,16 @@ pub const Devices = struct {
             UCSR0A, UCSR1A, UCSR2A, UCSR3A => {
                 io[a] = (io[a] & ~@as(u8, 0x03)) | (v & 0x03); // U2X, MPCM
                 if (v & 0x40 != 0) io[a] &= ~@as(u8, 0x40); // TXC is write-one-to-clear
+            },
+            UCSR0A + 1, UCSR1A + 1, UCSR2A + 1, UCSR3A + 1 => {
+                io[a] = v;
+                if (v & 0x10 == 0) {
+                    const u = &d.st.usart[uartIndex(a - 1)];
+                    u.rx_n = 0;
+                    u.rx_busy = 0;
+                    u.dor = 0;
+                    u.in_head = u.in_tail;
+                }
             },
             UCSR0A + 6, UCSR1A + 6, UCSR2A + 6, UCSR3A + 6 => {
                 const n: u2 = uartIndex(a - 6);
@@ -2565,6 +2575,35 @@ test "USART: frame timing from UBRR/U2X, UDRE/TXC, RX FIFO with overrun" {
     try testing.expectEqual(@as(u8, 1), d.read(UCSR0A + 6));
     try testing.expectEqual(@as(u8, 2), d.read(UCSR0A + 6));
     try testing.expectEqual(@as(u8, 0), d.read(UCSR0A) & 0x80);
+}
+
+test "all USARTs: disabling RX discards buffered and unfinished reception only" {
+    for ([_]bool{ false, true }) |mega| {
+        for (uart_bases[0..if (mega) @as(usize, 4) else 2], 0..) |base, port| {
+            var d: Devices = .{ .mega = mega };
+            d.reset();
+            const n: u2 = @intCast(port);
+            d.write(base + 1, 0x98); // RXCIE, RXEN, TXEN
+            d.write(base + 6, 0x55);
+            for ([_]u8{ 1, 2, 3, 4 }) |value| try testing.expect(d.uartPush(n, value));
+            d.tick(3 * 160 + 1);
+            try testing.expectEqual(@as(u8, 0x88), d.read(base) & 0x88); // RXC, DOR
+            try testing.expect(d.st.usart[n].rx_busy != 0);
+            try testing.expect(d.pending() != null);
+            d.write(base + 1, 0x88); // Keep RXCIE and TXEN; disable reception.
+            try testing.expectEqual(@as(u8, 0), d.read(base) & 0x88);
+            try testing.expectEqual(@as(?u8, null), d.pending());
+            try testing.expectEqual(@as(u32, 0), d.st.usart[n].rx_busy);
+            try testing.expectEqual(@as(?u8, 0x55), d.uartPop(n));
+            d.write(base + 1, 0x98);
+            d.tick(160);
+            try testing.expectEqual(@as(u8, 0), d.read(base) & 0x88);
+            try testing.expect(d.uartPush(n, 0x42));
+            d.tick(160);
+            try testing.expect(d.pending() != null);
+            try testing.expectEqual(@as(u8, 0x42), d.read(base + 6));
+        }
+    }
 }
 
 test "all USARTs: TXC survives writing zero and clears only when written one" {

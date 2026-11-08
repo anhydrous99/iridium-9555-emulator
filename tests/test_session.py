@@ -505,6 +505,32 @@ class SessionTests(unittest.TestCase):
         self.browser_key("one-too-many", 1, True)
         self.assertEqual(self.session.keys, {"1"})
 
+    def test_key_session_identity_survives_reset_and_rejects_a_previous_server_instance(self):
+        session_id = self.session.state()["session_id"]
+        reset = self.session.control("reset")
+        self.assertEqual(reset["session_id"], session_id)
+        self.assertRegex(session_id, r"^[0-9a-f]{32}$")
+        with Session(Path("unused"), [self.firmware], FakeEngine) as restarted:
+            self.assertNotEqual(restarted.session_id, session_id)
+            epoch = restarted.key_epoch
+            for pressed in (True, False):
+                response = restarted.key("1", pressed, client_id="tab", sequence=10,
+                                         epoch=epoch, session_id=session_id)
+                self.assertIn("session", response["message"])
+                self.assertEqual(response["session_id"], restarted.session_id)
+                self.assertEqual(restarted.keys, set())
+            self.assertEqual(restarted._key_clients, {})
+            restarted.key("1", True, client_id="tab", sequence=1,
+                          epoch=epoch, session_id=restarted.session_id)
+            self.assertEqual(restarted.keys, {"1"})
+
+    def test_invalid_key_session_identity_is_rejected(self):
+        for session_id in ("", "a" * 31, "g" * 32, "A" * 32, 1, []):
+            with self.subTest(session_id=session_id), self.assertRaisesRegex(ValueError, "session_id"):
+                self.session.key("1", True, client_id="tab", sequence=1,
+                                 epoch=self.session.key_epoch, session_id=session_id)
+        self.assertEqual(self.session.keys, set())
+
     def test_browser_delivery_failure_can_retry_without_repeating_a_delivered_event(self):
         self.initialize_key_handler()
         for sequence, pressed in ((1, True), (2, False)):
