@@ -274,6 +274,40 @@ class ModemLinkTests(unittest.TestCase):
 
 
 class ExecutingModemLinkTests(unittest.TestCase):
+    def test_modem_power_cycle_cancels_pending_avr_line_reception(self):
+        executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
+        if not executable.is_file():
+            self.skipTest("Build the native executor first")
+        # TRX sends RAM[0x40000100]: Q before reset, zero after reset clears RAM.
+        sender = [0x03200000, 0x82106200, 0x07100000, 0xC400E100,
+                  0xC4206000, 0x10800000, 0x01000000]
+        trx = b"".join(word.to_bytes(4, "big") for word in sender).ljust(0x260760, b"\xff")
+        for model, bsz, asz, ddr, port, mask, base in (
+                ("9555", 0x310FBA, 8678, 0x21, 0x22, 0x20, 0xC0),
+                ("9575", 0x36BB22, 14296, 0x27, 0x28, 0x10, 0x130)):
+            load = 0xE000 | ((mask & 0xF0) << 4)
+            words = [load, 0x9300, ddr, 0x9300, port,
+                     0xE100, 0x9300, base + 1, 0xE604, 0x9300, base + 4]  # RXEN; UBRR=100.
+            words += [0x9100, 0x200, 0xFF00, 0xCFFC]  # Wait for the host's RAM flag.
+            words += [0xE000, 0x9300, port, load, 0x9300, port]
+            words += [0x9110, base, 0xFF17, 0xCFFC, 0x9120, base + 6, 0xCFFF]
+            avr = b"".join(word.to_bytes(2, "little") for word in words).ljust(asz, b"\xff")
+            firmware = [parse_firmware(data, image + ".bin", image, model=model) for image, data in (
+                ("bc5", b"\xe0\0".ljust(bsz, b"\0")), ("avr", avr), ("trx", trx))]
+            with self.subTest(model=model), Session(executable, firmware) as session:
+                session.control("step", 100)
+                session.probe("trx", "write", {"address": 0x40000100, "values": [0, 0, 0, 81]})
+                session.control("step", 16)
+                self.assertEqual(session.modem_link.delivered[1], 1)
+                self.assertEqual(session.modem_link.state()["pending"], [0, 0])
+                session.probe("avr", "write", {"address": 0x200, "values": [1]})
+                session.control("step", 32)
+                self.assertEqual(session.modem_link.power_resets, 2)
+                self.assertEqual(session.probe("trx", "read", {"address": 0x40000100, "count": 4})["values"], [0] * 4)
+                session.control("step", 50000)
+                self.assertEqual(session.engines["avr"].state["pc"], (len(words) - 1) * 2)
+                self.assertEqual(session.engines["avr"].state["registers"][18], 0)
+
     def test_modem_power_pulses_between_exchanges_clear_ram_for_both_step_sizes(self):
         executable = Path(__file__).resolve().parents[1] / "zig-out/bin/iridium-core"
         if not executable.is_file():

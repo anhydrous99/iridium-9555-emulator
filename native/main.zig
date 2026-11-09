@@ -76,7 +76,7 @@ var serial_dma: ?struct { receive: bool, remaining: u16, in_flight: bool = false
 var gpio_inputs: u16 = 0;
 var gpio_reset_count: u64 = 0;
 var modem_power_rises: u64 = 0;
-var modem_tx_discard: u8 = 0;
+var modem_tx_discard: u16 = 0;
 var keypad_model: keypad.Model = .{};
 const Milestones = struct { main: bool = false, scheduler: bool = false, idle: bool = false, panic: ?u16 = null };
 var milestones: Milestones = .{};
@@ -412,9 +412,12 @@ fn observeModemPower(before: bool) void {
     const enabled = avrModemPower();
     if (before == enabled) return;
     if (enabled) modem_power_rises += 1;
-    // Keep debugger capture intact; the coupled link discards only this older prefix.
+    // Keep debugger capture intact, including a frame interrupted before it finishes.
     const uart = &avr_dev.st.usart[avrModemPort()];
-    modem_tx_discard = uart.out_tail -% uart.out_head;
+    modem_tx_discard = @as(u16, uart.out_tail -% uart.out_head) + @intFromBool(uart.tx_busy != 0);
+    // Cancel bytes still on the modem RX line; completed AVR receive FIFO bytes remain.
+    uart.rx_busy = 0;
+    uart.in_head = uart.in_tail;
 }
 
 fn attachTrxDevices() void {
