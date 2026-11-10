@@ -2,8 +2,8 @@
 
 Reference: Sitronix ST7541 v1.9 (2007-09-03), pages 1, 20, 32-50.
 Coordinates default to controller outputs SEG0..SEG127 and COM0..COM127.
-The handset profile places SEG0 at the right edge of its panel. Analog contrast,
-PWM brightness and electrical timing are not modeled.
+The handset profile places SEG0 at the right edge of its panel. Contrast is an
+uncalibrated register ratio; PWM brightness and electrical timing are not modeled.
 Unknown DDRAM stays marked unknown until firmware writes both pixel planes.
 """
 
@@ -172,4 +172,8 @@ class ST7541:
             "segment_zero_on_right": self.segment_zero_on_right,
             "coordinates": "SEG127 left, COM0 top" if self.segment_zero_on_right else "SEG0 left, COM0 top",
             "palette": list(self.palette),
+            # EV5..EV0 are the 64 contrast steps (datasheet pages 26-27, 40).
+            # This ratio is UI feedback, not a calibrated optical contrast model.
+            "contrast_ratio": (self.parameters.get(0x81, 32) & 63) / 63,
+            "contrast_approximate": True,
         }

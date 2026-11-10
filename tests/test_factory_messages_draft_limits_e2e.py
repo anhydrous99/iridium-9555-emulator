@@ -257,7 +257,7 @@ class MessagesDraftLimitChecks:
         self.assertEqual(len({value[i:i + 5] for i in range(len(value) - 4)}), len(value) - 4)
         seen = set()
         windows = []
-        for move in range((len(value) + 16) // 17 + 9):
+        for move in range(len(value) + 1):
             state = self.editor(value, f"saved-readback-up-{move}")
             match = self.matched_view(state, value)
             seen.update(range(match["start"], match["end"]))
@@ -267,9 +267,9 @@ class MessagesDraftLimitChecks:
                 self.viewport_coverage.append({"text": value, "covered_indices": sorted(seen),
                     "viewports": windows, "complete": True, "font_sha256": sha256(self.font.data).hexdigest()})
                 return
-            # Original CA/CB handler B798E moves by rendered line. No direct
-            # cursor/buffer manipulation, callback or guest memory write.
-            self.press("up", hold=500000, settle=100000)
+            # Observed original editor navigation moves by character; allow
+            # release/debounce time before the next genuine contact.
+            self.press("up", hold=500000, settle=2000000)
         self.viewport_coverage.append({"text": value, "covered_indices": sorted(seen), "viewports": windows})
         self.fail(f"Saved local draft exposed{len(seen)} of{len(value)} glyph positions")
 

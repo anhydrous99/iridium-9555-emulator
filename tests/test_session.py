@@ -81,6 +81,112 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.session.engines["avr"].data, patch.data)
         self.assertEqual(self.session.state()["firmware"]["sha256"], patch.sha256)
 
+    def test_failed_bundle_start_keeps_every_old_worker(self):
+        old = self.session.engines["avr"]
+        staged = FakeEngine(Path("unused"), "bc5", Path(__file__))
+        self.session._engine_factory = Mock(side_effect=[staged, EngineError("failed")])
+        images = [replace(self.firmware, image="bc5"), self.firmware]
+        with self.assertRaisesRegex(EngineError, "failed"):
+            self.session.load_bundle(images)
+        self.assertTrue(staged.closed)
+        self.assertIs(self.session.engines["avr"], old)
+        self.assertFalse(old.closed)
+        self.assertEqual(set(self.session.engines), {"avr"})
+
+    def test_bundle_switch_installs_all_processors_and_invalidates_old_keys_once(self):
+        old = self.session.engines["avr"]
+        epoch = self.session.key_epoch
+        images = [parse_firmware(bytes(14296), "avr.bin"),
+                  parse_firmware(bytes(0x36BB22), "bc5_main.bin")]
+        self.session.load_bundle(images)
+        self.assertEqual(self.session.model, "9575")
+        self.assertEqual(set(self.session.engines), {"bc5", "avr"})
+        self.assertTrue(old.closed)
+        self.assertEqual(self.session.key_epoch, epoch + 1)
+
+    def test_restart_uses_only_flash_retaining_reset(self):
+        worker = self.session.engines["avr"]
+        epoch = self.session.key_epoch
+        self.session.control("restart")
+        self.assertIn(("warm_reset", {}), worker.calls)
+        self.assertNotIn(("reset", {}), worker.calls)
+        self.assertIs(self.session.engines["avr"], worker)
+        self.assertEqual(self.session.key_epoch, epoch + 1)
+
+    def test_restart_releases_matrix_contacts_owned_by_other_browser_tabs(self):
+        self.session.load(replace(self.firmware, image="bc5"))
+        worker = self.session.engines["bc5"]
+        worker.state["bc5_hardware"] = True
+        self.session._step = Mock()
+        self.session._initialize_ui = Mock()
+        self.session.key("1", True, client_id="another-tab", sequence=1, epoch=self.session.key_epoch)
+        self.session.control("restart")
+        self.assertIn(("key", {"code": self.session.profile.key_codes["1"], "pressed": False}), worker.calls)
+        self.assertEqual(self.session.keys, set())
+
+    def test_training_adapter_follows_board_power_after_staged_bc5_upload(self):
+        self.session.control("mode", mode="training")
+        previous = self.session.modem_link
+        self.assertIsNone(previous.power_pin)
+        previous.phonebook[101] = ("123", 129, "Demo")
+        self.session.load(replace(self.firmware, image="bc5"))
+        self.assertIsNot(self.session.modem_link, previous)
+        self.assertEqual(self.session.modem_link.power_pin, self.session.profile.modem_power_pin)
+        self.assertEqual(self.session.modem_link.phonebook[101], ("123", 129, "Demo"))
+
+    def test_removing_sim_in_training_deasserts_research_card_pin_on_return(self):
+        self.session.load(replace(self.firmware, image="trx"))
+        modem = self.session.engines["trx"]
+        self.session.fixture_action("sim", {"present": True})
+        self.session.control("mode", mode="training")
+        self.session.fixture_action("sim", {"present": False})
+        modem.calls.clear()
+        self.session.control("mode", mode="research")
+        self.assertIn(("uart_pins", {"port": 3, "value": 0, "mask": 1}), modem.calls)
+        self.assertFalse(self.session.sim_present)
+
+    def test_research_ptt_does_not_receive_trx_only_sim_pin_commands(self):
+        with Session(Path("unused"), [self.firmware, replace(self.firmware, image="ptt")],
+                     FakeEngine, modem_image="ptt") as session:
+            self.assertFalse(any(operation == "uart_pins" for operation, _ in session.engines["ptt"].calls))
+            with self.assertRaisesRegex(ValueError, "telephony modem"):
+                session.fixture_action("sim", {"present": True})
+            self.assertFalse(session.sim_present)
+
+    def test_incoming_training_call_cannot_be_silently_lost_before_power_on(self):
+        self.session.control("mode", mode="training")
+        self.session.satellite_action("register", {})
+        self.session.satellite_action("advance", {"milliseconds": 1000})
+        with self.assertRaisesRegex(ValueError, "Power on"):
+            self.session.satellite_action("incoming_call", {"number": "+123"})
+        self.assertEqual(self.session.satellite.call_state, "idle")
+
+    def test_dead_worker_cannot_silently_lose_flash_on_restart(self):
+        worker = self.session.engines["avr"]
+        worker.state["halt"] = "worker-failed"
+        with self.assertRaisesRegex(EngineError, "cannot be recovered"):
+            self.session.control("restart")
+        self.assertFalse(worker.closed)
+        self.assertEqual(worker.calls, [])
+        with self.assertRaisesRegex(EngineError, "Clear the experiment"):
+            self.session.control("run")
+
+    def test_run_rejects_halted_processors_with_recovery(self):
+        self.session.engines["avr"].state["halt"] = "firmware-reset-requested"
+        with self.assertRaisesRegex(ValueError, "restart"):
+            self.session.control("run")
+        self.assertFalse(self.session.running)
+
+    def test_browser_release_settles_guest_without_turning_on_continuous_run(self):
+        self.initialize_key_handler()
+        self.session._step = Mock()
+        self.session.key("1", True, settle=True)
+        self.session.key("1", False, settle=True)
+        self.session._step.assert_called_once_with(2000000)
+        self.assertFalse(self.session.running)
+        with self.assertRaisesRegex(ValueError, "settle"):
+            self.session.key("1", False, settle="yes")
+
     def release_fixture(self):
         for image in ("bc5", "trx"):
             self.session.load(replace(self.firmware, image=image))

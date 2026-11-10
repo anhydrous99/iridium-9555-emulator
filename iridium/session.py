@@ -11,8 +11,11 @@ from uuid import uuid4
 from .assets import AssetError, BC5Assets
 from .board import ModemLink, SpiLink
 from .engine import Engine, EngineError
+from .display_text import DisplayText
 from .firmware import Firmware
+from .fixtures import GPSPeer, SIMPeer, SyntheticSIM
 from .lcd import ST7541
+from .offline_modem import OfflineModem
 from .profiles import KEY_CODES, PROFILES
 from .satellite import Satellite
 
@@ -26,7 +29,7 @@ LIMITATIONS = [
     "Keys use the GPIO matrix; power and 9575 SOS use firmware-derived AVR inputs.",
     "LCD output uses inferred serial/controller models; resource previews remain separate from live output.",
     "Satellite service scenarios are offline and are not connected to the modem firmware.",
-    "The modem boot ROM is unshipped; DSP execution, RF behavior and SIM/provisioning are outside the modeled scope.",
+    "The modem boot ROM is unshipped; DSP execution, RF behavior and real subscriber authentication are outside the modeled scope.",
 ]
 
 
@@ -39,6 +42,13 @@ class Session:
         if modem_image not in ("trx", "ptt", "none"):
             raise ValueError("modem_image must be trx, ptt or none")
         self.modem_image = modem_image
+        self.mode = "research"
+        self.sim_present = False
+        self.sim_card = SyntheticSIM()
+        self.sim_peer = None
+        self.gps_peer = None
+        self.gps_configuration = None
+        self.training_storage = {}
         self.modem_link = None
         self.spi_link = None
         self.strict_hardware = strict_hardware
@@ -61,6 +71,7 @@ class Session:
         self.satellite = Satellite()
         self.running = False
         self.asset = None
+        self.display_text = None
         self.ui_initialized = False
         self.ui_attempted = False
         self.lcd = ST7541(segment_zero_on_right=True)
@@ -98,50 +109,68 @@ class Session:
             raise
 
     def load(self, firmware: Firmware) -> None:
+        self.load_bundle([firmware])
+
+    def load_bundle(self, images: list[Firmware]) -> None:
+        """Validate and start every replacement before retiring any current worker."""
         with self._lock:
             self._ensure_open()
-            if firmware.model != self.model and firmware.image != "bc5":
+            if not images or len(images) > 4 or len({item.image for item in images}) != len(images):
+                raise ValueError("Choose one to four different processor images")
+            if len({item.model for item in images}) != 1:
+                raise ValueError("All images must belong to the same handset model")
+            model = images[0].model
+            replacements = {item.image: item for item in images}
+            if model != self.model and "bc5" not in replacements:
                 raise ValueError("Load the new handset's BC5 image before its auxiliary processors")
-            # A replacement worker is ready before the previous experiment is discarded.
-            worker = self._start_worker(firmware)
-            restart_board = firmware.image == "avr" and "bc5" in self.engines
-            clear_inputs = firmware.image == "bc5" or restart_board
-            if firmware.model == self.model and clear_inputs:
-                try:
+            workers = {}
+            restart_board = "avr" in replacements and "bc5" in self.engines
+            clear_inputs = "bc5" in replacements or restart_board
+            try:
+                for item in images:
+                    workers[item.image] = self._start_worker(item)
+                if model == self.model and clear_inputs:
                     primary = self.engines.get("bc5")
                     for key in self.keys:
                         code = self.profile.key_codes.get(key)
                         if primary and primary.state.get("bc5_hardware") and code is not None and key != "sos":
-                            if firmware.image != "bc5":
+                            if "bc5" not in replacements:
                                 self._request(primary, "key", code=code, pressed=False)
-                        elif key in self.profile.button_pins and self.spi_link and firmware.image != "avr":
+                        elif key in self.profile.button_pins and self.spi_link and "avr" not in replacements:
                             self._button_input(key, False)
                     # A new AVR starts a new board boot. Reset the retained primary
                     # so no native DMA byte remains owned by the retired SPI link.
-                    if restart_board:
+                    if restart_board and "bc5" not in replacements:
                         self._request(primary, "warm_reset")
                         self._reset_display()
-                except BaseException:
+            except BaseException:
+                for worker in workers.values():
                     worker.close()
-                    raise
-            if firmware.model != self.model:
+                raise
+            if model != self.model:
                 # The new primary image starts a separate board experiment.
                 for old in self.engines.values():
                     old.close()
                 self.engines.clear()
                 self.firmware.clear()
-                self.model = firmware.model
+                self.model = model
                 self.satellite = Satellite()
-            old = self.engines.get(firmware.image)
-            self.engines[firmware.image] = worker
-            self.firmware[firmware.image] = firmware
-            if old:
-                old.close()
+                self.sim_card = SyntheticSIM()
+                self.training_storage = {}
+                self.gps_configuration = None
+            for name, worker in workers.items():
+                old = self.engines.get(name)
+                self.engines[name] = worker
+                self.firmware[name] = replacements[name]
+                if old:
+                    old.close()
             self._connect_modem()
             self.running = False
             if clear_inputs:
                 self._clear_keys()
-            if firmware.image == "bc5":
+            if "bc5" in replacements:
+                firmware = replacements["bc5"]
+                self.display_text = DisplayText(firmware)
                 self._reset_display()
                 self.asset = None
                 try:
@@ -153,7 +182,8 @@ class Session:
                                   "live": False}
                 except AssetError as error:
                     self.log("asset", str(error))
-            self.log("firmware", f"Loaded {firmware.name} ({firmware.image}), SHA-256 {firmware.sha256}")
+            for firmware in images:
+                self.log("firmware", f"Loaded {firmware.name} ({firmware.image}), SHA-256 {firmware.sha256}")
 
     def start(self) -> None:
         with self._lock:
@@ -194,7 +224,8 @@ class Session:
 
     def _active_processors(self):
         return [worker for image, worker in self.engines.items()
-                if (not self.modem_link or image not in ("trx", "ptt")
+                if not (self.mode == "training" and image in ("trx", "ptt"))
+                and (not self.modem_link or image not in ("trx", "ptt")
                     or image == self.modem_image and self.modem_link.powered)
                 and not (image == "avr" and self.spi_link and self.spi_link.hold_reset)]
 
@@ -203,7 +234,15 @@ class Session:
                    self.modem_link.quantum if self.modem_link else limit)
 
     def _connect_modem(self):
-        if "avr" in self.engines and self.modem_image in self.engines:
+        if self.mode == "training" and "avr" in self.engines:
+            avr = self.engines["avr"]
+            power_pin = self.profile.modem_power_pin if "bc5" in self.engines else None
+            if (not isinstance(self.modem_link, OfflineModem) or self.modem_link.avr is not avr
+                    or self.modem_link.power_pin != power_pin):
+                self.modem_link = OfflineModem(avr, self.satellite, avr_port=self.profile.modem_uart,
+                                              power_pin=power_pin,
+                                              sim_present=self.sim_present, storage=self.training_storage)
+        elif "avr" in self.engines and self.modem_image in self.engines:
             endpoints = ((self.engines["avr"], self.profile.modem_uart), (self.engines[self.modem_image], 1))
             power_pin = self.profile.modem_power_pin if "bc5" in self.engines else None
             if (not self.modem_link or self.modem_link.endpoints != endpoints
@@ -219,6 +258,25 @@ class Session:
                 self.spi_link = SpiLink(bc5, avr, self.model, reset_count=state["gpio"]["reset_count"])
         else:
             self.spi_link = None
+        self._connect_fixtures()
+
+    def _connect_fixtures(self):
+        modem = self.engines.get(self.modem_image)
+        if self.mode == "research" and self.modem_image == "trx" and modem:
+            if self.sim_present:
+                if not self.sim_peer or self.sim_peer.modem is not modem or self.sim_peer.card is not self.sim_card:
+                    self.sim_peer = SIMPeer(modem, self.sim_card)
+            else:
+                modem.request("uart_pins", port=3, value=0, mask=1)
+                self.sim_peer = None
+        else:
+            self.sim_peer = None
+        avr = self.engines.get("avr")
+        if self.model == "9575" and avr and self.gps_configuration:
+            if not self.gps_peer or self.gps_peer.avr is not avr:
+                self.gps_peer = GPSPeer(avr, **self.gps_configuration)
+        else:
+            self.gps_peer = None
 
     def _service_board(self, steps):
         self._clock_reset(steps)
@@ -250,6 +308,10 @@ class Session:
             avr_reset = self.spi_link.hold_reset or self.spi_link.resets != before
         if self.modem_link:
             self.modem_link.exchange(avr_reset=avr_reset)
+        if self.sim_peer and (not self.modem_link or self.modem_link.powered):
+            self.sim_peer.exchange()
+        if self.gps_peer:
+            self.gps_peer.exchange(avr_reset=avr_reset)
 
     def _step_processors(self, steps: int) -> bool:
         primary = self.engines.get("bc5") if self.spi_link else None
@@ -299,12 +361,18 @@ class Session:
             return True
         return False
 
-    def control(self, action: str, steps: int = 10000) -> dict:
+    def control(self, action: str, steps: int = 10000, *, mode: str | None = None) -> dict:
         if type(steps) is not int or not 1 <= steps <= 10000000:
             raise ValueError("steps must be an integer from 1 to 10000000")
         with self._lock:
             self._ensure_open()
             if action == "run":
+                halted = [worker.state.get("halt") for worker in self._active_processors()
+                          if worker.state.get("halt") not in (None, "steps", "running", "ready")]
+                if halted:
+                    self.running = False
+                    self._check_restartable(self.mode)
+                    raise ValueError("A processor has halted; restart the handset to continue: " + ", ".join(halted))
                 self.running = True
             elif action == "pause":
                 self.running = False
@@ -315,6 +383,9 @@ class Session:
                 self.running = False
                 self._clear_keys()
                 self.satellite = Satellite()
+                self.sim_card = SyntheticSIM()
+                self.training_storage = {}
+                self.sim_peer = self.gps_peer = None
                 self._reset_display()
                 self.modem_link = None
                 self.spi_link = None
@@ -334,6 +405,18 @@ class Session:
                 if reset_error is not None:
                     raise reset_error
                 self._connect_modem()
+            elif action == "restart":
+                self._restart()
+            elif action == "mode":
+                if mode not in ("research", "training"):
+                    raise ValueError("mode must be research or training")
+                if mode != self.mode:
+                    self._check_restartable(mode)
+                    initialize = self.ui_initialized or self.ui_attempted
+                    self.mode = mode
+                    if mode == "training":
+                        self.sim_present = True
+                    self._restart(initialize=initialize)
             elif action == "initialize_ui":
                 self.running = False
                 self._initialize_ui()
@@ -343,6 +426,67 @@ class Session:
             self.log("control", action)
             return {"ok": True, "message": action, "key_epoch": self.key_epoch,
                     "session_id": self.session_id}
+
+    def _restart(self, *, initialize=True):
+        """Restart the board without replacing its programmed flash or EEPROM."""
+        self.running = False
+        self._check_restartable(self.mode)
+        for key in self.keys:
+            if key in self.profile.button_pins and self.spi_link:
+                self._button_input(key, False)
+            elif "bc5" in self.engines and self.engines["bc5"].state.get("bc5_hardware"):
+                code = self.profile.key_codes.get(key)
+                if code is not None and key != "sos":
+                    self._request(self.engines["bc5"], "key", code=code, pressed=False)
+        self._clear_keys()
+        self._reset_display()
+        self.satellite = Satellite()
+        self.modem_link = self.spi_link = None
+        self.sim_card.controls(0, 0)
+        if self.gps_peer:
+            self.gps_peer.reset()
+        for image, worker in self.engines.items():
+            if not (self.mode == "training" and image in ("trx", "ptt")):
+                self._request(worker, "warm_reset")
+        self._connect_modem()
+        if self.spi_link and initialize:
+            self._initialize_ui()
+            self.running = self.lcd_capture_error is None
+
+    def _check_restartable(self, mode):
+        if any(worker.state.get("halt") == "worker-failed" for image, worker in self.engines.items()
+               if not (mode == "training" and image in ("trx", "ptt"))):
+            raise EngineError("A worker exited; its in-memory changes cannot be recovered. Clear the experiment to reload the input images.")
+
+    def fixture_action(self, action, arguments):
+        with self._lock:
+            self._ensure_open()
+            if action == "sim":
+                present = arguments.get("present")
+                if type(present) is not bool:
+                    raise ValueError("present must be a boolean")
+                if present and self.mode == "research" and self.modem_image != "trx":
+                    raise ValueError("The synthetic SIM requires the telephony modem or offline training mode")
+                if present != self.sim_present:
+                    self._check_restartable(self.mode)
+                    initialized = self.ui_initialized or self.ui_attempted
+                    self.sim_present = present
+                    self._restart(initialize=initialized)
+            elif action == "gps":
+                if self.model != "9575" or "avr" not in self.engines:
+                    raise ValueError("The synthetic GPS receiver requires the 9575 AVR image")
+                enabled = arguments.get("enabled")
+                if type(enabled) is not bool:
+                    raise ValueError("enabled must be a boolean")
+                configuration = {key: arguments.get(key, default) for key, default in
+                                 (("latitude", 37.7749), ("longitude", -122.4194), ("altitude", 30))}
+                peer = GPSPeer(self.engines["avr"], **configuration) if enabled else None
+                self.gps_configuration = configuration if enabled else None
+                self.gps_peer = peer
+            else:
+                raise ValueError("Unknown synthetic peripheral")
+            self.log("fixture", f"Synthetic {action} updated")
+            return self.state()
 
     def _clear_keys(self) -> None:
         self.keys.clear()
@@ -355,7 +499,9 @@ class Session:
 
     def key(self, key: str, pressed: bool, generation: int | None = None, *,
             client_id: str | None = None, sequence: int | None = None,
-            epoch: int | None = None, session_id: str | None = None) -> dict:
+            epoch: int | None = None, session_id: str | None = None, settle: bool = False) -> dict:
+        if type(settle) is not bool:
+            raise ValueError("settle must be a boolean")
         if not isinstance(key, str) or type(pressed) is not bool:
             raise ValueError("Unknown key or invalid pressed state")
         if generation is not None and (type(generation) is not int or generation < 0):
@@ -438,6 +584,10 @@ class Session:
                         self._step(5200000 if key == "power" and down else 150000)
                     else:
                         self._idle(worker)
+                    if settle and not pressed and self.ui_initialized:
+                        # Browser taps include bounded guest time even while paused.
+                        # Debugger/key-matrix clients retain exact stepping by default.
+                        self._step(2000000)
             except EngineError:
                 self.running = False
                 raise
@@ -488,18 +638,34 @@ class Session:
             elif action == "advance":
                 self.satellite.advance(arguments.get("milliseconds", 1000))
             elif action == "incoming_call":
+                if self.mode == "training" and not (self.ui_initialized and
+                        isinstance(self.modem_link, OfflineModem) and self.modem_link.powered):
+                    raise ValueError("Power on the handset before starting an incoming training call")
                 self.satellite.incoming_call(arguments.get("number", "+881612345678"))
             elif action == "incoming_sms":
+                if isinstance(self.modem_link, OfflineModem):
+                    self.modem_link.validate_incoming_sms(arguments.get("number", "+881612345678"),
+                                                          arguments.get("text", "Test message"))
                 self.satellite.incoming_sms(arguments.get("number", "+881612345678"),
                                             arguments.get("text", "Test message"))
+                if isinstance(self.modem_link, OfflineModem):
+                    self.modem_link.incoming_sms(arguments.get("number", "+881612345678"),
+                                                 arguments.get("text", "Test message"))
             elif action == "answer":
                 self.satellite.answer()
             elif action == "hangup":
                 self.satellite.hangup()
             else:
                 raise ValueError("Unknown satellite action")
-            self.log("satellite", f"Scenario {action}; firmware transport not connected")
-            return {"ok": True, "delivered": False, "message": "Scenario updated; firmware transport not connected"}
+            connected = isinstance(self.modem_link, OfflineModem)
+            if connected:
+                self.modem_link.notify_scenario()
+                if self.ui_initialized:
+                    self._step(2000000)
+            message = ("Offline training scenario queued for the handset" if connected else
+                       "Scenario updated; select offline training mode to connect it to the handset")
+            self.log("satellite", f"Scenario {action}; {message}")
+            return {"ok": True, "delivered": connected, "message": message}
 
     def state(self) -> dict:
         with self._lock:
@@ -508,24 +674,55 @@ class Session:
             lcd = self.lcd.state() if self.lcd_seen else None
             if lcd and self.lcd_capture_error:
                 lcd["error"] = self.lcd_capture_error
+            if lcd and self.display_text:
+                lcd["accessibility"] = self.display_text.read(lcd)
+            if lcd:
+                avr = self.engines.get("avr")
+                if avr and avr.state.get("halt") != "worker-failed":
+                    try:
+                        pins = avr.request("pin_state").get("pins", [])
+                        if len(pins) >= 4:
+                            lcd["backlight_on"] = bool((pins[0] & 0x18) if self.model == "9575"
+                                                       else (pins[1] & 8 or pins[3] & 0x20))
+                            lcd["backlight_approximate"] = True
+                    except EngineError:
+                        # State must still explain a disconnected worker's recovery.
+                        pass
             limitations = list(LIMITATIONS)
+            training = self.mode == "training"
+            if training:
+                limitations = [line for line in limitations if not line.startswith("Satellite service")]
+                limitations.append("Offline training replaces TRX/DSP execution with a finite simulated modem; calls have no voice audio or RF service.")
+            elif self.spi_link and not self.modem_link:
+                limitations.append("Without a modem startup peer, saved phonebook entries may not appear after restart. Offline training lets the original firmware rebuild its index.")
             if self.model == "9575":
-                limitations.append("9575 GPS receiver, location reports and SOS service transport are not connected.")
-            processors = [dict(worker.state) for worker in self.engines.values()]
-            if any(processor.get("halt") == "worker-failed" for processor in processors):
+                if not self.gps_peer:
+                    limitations.append("9575 GPS needs the optional synthetic receiver or external UART input.")
+                limitations.append("9575 location-report and SOS network service transport are not implemented.")
+            active = self._active_processors()
+            processors = [dict(worker.state, active=worker in active) for worker in self.engines.values()]
+            if any(processor.get("active") and processor.get("halt") == "worker-failed" for processor in processors):
                 self.running = False
-            return {"handset": self.profile.describe(),
+            satellite = self.satellite.state()
+            satellite["firmware_connected"] = training and bool(self.spi_link and self.modem_link)
+            satellite["mode"] = "offline training" if training else "offline service scenario"
+            return {"handset": self.profile.describe(), "mode": self.mode,
+                    "capabilities": {"calls": training, "sms": training, "voice_audio": False,
+                                     "backlight": bool(lcd and "backlight_on" in lcd), "contrast": "approximate", "gps": bool(self.gps_peer),
+                                     "sim": self.sim_present and (training or self.modem_image == "trx")},
+                    "fixtures": {"sim": {"present": self.sim_present, "synthetic": True},
+                                 "gps": self.gps_peer.state() if self.gps_peer else {"enabled": False}},
                     "firmware": primary.describe(), "images": [item.describe() for item in self.firmware.values()],
                     "processors": processors,
                     "running": self.running, "keys": sorted(self.keys),
                     "key_generations": dict(self.key_generations),
                     "key_epoch": self.key_epoch,
                     "session_id": self.session_id,
-                    "satellite": self.satellite.state(), "events": list(self.events),
+                    "satellite": satellite, "events": list(self.events),
                     "asset": self.asset, "lcd": lcd, "ui_initialized": self.ui_initialized,
                     "processor_link": self.modem_link.state() if self.modem_link else {"connected": False},
                     "spi_link": self.spi_link.state() if self.spi_link else {"connected": False},
-                    "fidelity": {"complete": False, "scope": "firmware-derived",
+                    "fidelity": {"complete": False, "scope": "offline-training" if training else "firmware-derived",
                                  "board_coupled": bool(self.spi_link and self.modem_link), "limitations": limitations}}
 
     def _reset_display(self) -> None:

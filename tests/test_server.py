@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import http.client
 import json
 from pathlib import Path
@@ -74,6 +75,22 @@ class ServerTests(unittest.TestCase):
         body.update(pressed=False, sequence=2, session_id=old_id)
         self.request("POST", "/api/key", json.dumps(body), {"Content-Type": "application/json"})
         self.assertEqual(replacement.keys, {"1"})
+
+    def test_bundle_upload_validates_all_images_before_loading(self):
+        old = self.session.engines["avr"]
+        good = {"name": "avr.bin", "data": base64.b64encode(bytes(8678)).decode()}
+        for images in ([], [good, good], [good, {"name": "bad", "data": "%%%"}],
+                       [good, {"name": "bad", "data": "YQ=="}],
+                       [good, {"name": [], "data": "YQ=="}]):
+            status, data, _ = self.request("POST", "/api/firmware-bundle", json.dumps({"images": images}),
+                                           {"Content-Type": "application/json"})
+            self.assertEqual(status, 400, data)
+            self.assertIs(self.session.engines["avr"], old)
+            self.assertFalse(old.closed)
+        status, data, _ = self.request("POST", "/api/firmware-bundle", json.dumps({"images": [good]}),
+                                       {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(old.closed)
 
     def test_key_release_cancels_an_older_press_over_http(self):
         generation = self.session.state()["key_generations"]["1"]

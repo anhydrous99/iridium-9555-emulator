@@ -19,8 +19,13 @@ let feedbackTimer;
 let pollTimer;
 let pollVersion = 0;
 let satelliteDirty = false;
+let gpsDirty = false;
+let simDirty = false;
 let lastEventSignature = "";
 let lastDisplaySignature = "";
+let lastTranscriptSignature = "";
+let lastScenarioSignature = "";
+let keyProcessing = false;
 let closed = false;
 
 function displayText(value) {
@@ -67,6 +72,34 @@ function address(value) {
   return displayText(value);
 }
 
+function haltedProcessors(state) {
+  return (state?.processors || []).filter((processor) => processor.active !== false && processor.halt && !["steps", "running", "ready"].includes(processor.halt));
+}
+
+function handsetImagesLoaded(state) {
+  return ["bc5", "avr"].every((image) => state?.processors?.some((processor) => processor.image === image));
+}
+
+function renderTranscript(state, preview) {
+  const lcd = state?.lcd;
+  const captureValid = lcd?.live === true && lcd.display_on === true && !lcd.error && lcd.width === 128 && lcd.height === 128
+    && Array.isArray(lcd.pixels) && lcd.pixels.length === 128 * 128 && lcd.pixels.every((pixel) => Number.isInteger(pixel) && pixel >= 0 && pixel <= 3)
+    && lcd.known_pixels === 128 * 128 && !state?.processors?.some((cpu) => cpu.image === "bc5" && cpu.lcd_dropped > 0);
+  const transcript = !preview && captureValid ? lcd.accessibility : null;
+  const lines = Array.isArray(transcript?.lines) ? transcript.lines.filter((line) => typeof line.text === "string" && line.text) : [];
+  const status = preview ? "Embedded asset preview. This is not the handset's current screen."
+    : !captureValid ? "Screen text unavailable: no complete, active firmware LCD capture."
+    : !lines.length ? "Screen text unknown: no text could be recognized from this firmware frame."
+    : transcript.complete === true ? "Recognized screen text." : "Partial screen text: unrecognized content may be missing.";
+  const detail = transcript?.status ? ` ${displayText(transcript.status)}` : "";
+  const signature = JSON.stringify([status, detail, lines]);
+  if (signature === lastTranscriptSignature) return;
+  lastTranscriptSignature = signature;
+  element("lcd-transcript-status").textContent = status + detail;
+  element("lcd-transcript-lines").replaceChildren(...lines.map((line) => node("li", line.selected ? "selected" : null, `${line.selected ? "Selected: " : ""}${line.text}`)));
+  element("lcd-announcement").textContent = [status + detail, ...lines.map((line) => `${line.selected ? "Selected: " : ""}${line.text}`)].join("\n");
+}
+
 function renderProcessors(processors) {
   const container = element("processors");
   if (!Array.isArray(processors) || processors.length === 0) {
@@ -82,8 +115,11 @@ function renderProcessors(processors) {
     const steps = node("div");
     steps.append(node("span", "processor-label", "INSTRUCTIONS"), node("span", "processor-value", numberFormat.format(processor.steps || 0)));
     row.append(name, pc, steps);
-    if (processor.halt && processor.halt !== "steps" && processor.halt !== "running") {
-      const message = processor.worker_error ? `${processor.worker_error}. Reset to restart.` : processor.halt;
+    if (processor.active === false) row.append(node("p", "processor-note", "Not executing in this mode."));
+    if (haltedProcessors({ processors: [processor] }).length) {
+      const message = processor.halt === "worker-failed"
+        ? `${processor.worker_error || "Worker exited"}. Its in-memory data is unavailable. Use Clear experiment to reload the supplied images.`
+        : processor.halt;
       row.append(node("p", "processor-note processor-halt", `Stop: ${displayText(message)}`));
     }
     if (processor.milestones) {
@@ -104,6 +140,7 @@ function renderProcessors(processors) {
 
 function drawDisplay(state) {
   const preview = element("asset-toggle").checked;
+  renderTranscript(state, preview);
   const image = preview ? state?.asset : state?.lcd;
   const dropped = !preview && state?.processors?.some((processor) => processor.image === "bc5" && processor.lcd_dropped > 0);
   const signature = JSON.stringify([preview, state?.handset?.model, state?.firmware?.sha256, state?.ui_initialized, image, dropped]);
@@ -151,7 +188,11 @@ function drawDisplay(state) {
     describe("Firmware LCD is off");
     return;
   }
-  const palette = [[169, 184, 145], [123, 140, 102], [77, 94, 60], [33, 48, 21]];
+  const contrast = !preview && Number.isFinite(image.contrast_ratio) ? Math.max(0, Math.min(1, image.contrast_ratio)) : null;
+  const brightness = !preview && image.backlight_on === false ? 0.72 : 1;
+  const palette = [[169, 184, 145], [123, 140, 102], [77, 94, 60], [33, 48, 21]].map((color) =>
+    color.map((channel, index) => Math.round((contrast === null ? channel
+      : [169, 184, 145][index] + (channel - [169, 184, 145][index]) * contrast) * brightness)));
   const buffer = document.createElement("canvas");
   buffer.width = width;
   buffer.height = height;
@@ -176,30 +217,55 @@ function drawDisplay(state) {
       ? `${state?.handset?.model === "9575" ? "9575" : "9555"} panel mapping · SEG127 left, COM0 top`
       : `Controller mapping · ${displayText(image.coordinates || "unspecified")}`;
   }
-  describe(preview ? "Firmware asset preview — not live LCD" : "Live original firmware LCD · emulated serial controller");
+  describe(preview ? "Firmware asset preview — not live LCD" : `Live original firmware LCD · emulated serial controller${contrast === null ? "" : ` · approximate contrast ${Math.round(contrast * 100)}% (not physically calibrated)`}${typeof image.backlight_on === "boolean" ? ` · backlight ${image.backlight_on ? "on" : "off"} (approximate brightness)` : ""}`);
 }
 
 function renderApplicationStatus(state) {
   const button = element("initialize-button");
   const initialized = state?.ui_initialized === true;
   const busy = pendingActions.has(button);
-  const loaded = ["bc5", "avr"].every((image) => state?.processors?.some((processor) => processor.image === image));
+  const loaded = handsetImagesLoaded(state);
+  const halted = haltedProcessors(state);
+  const workerFailed = halted.some((cpu) => cpu.halt === "worker-failed");
   button.disabled = busy || initialized || !loaded;
-  button.textContent = busy ? "Powering on…" : initialized ? "Handset powered on" : "Power on handset";
+  button.textContent = busy ? "Powering on…" : initialized ? halted.length ? "Handset halted" : "Handset powered on" : "Power on handset";
   const status = element("application-status");
-  status.textContent = busy ? "POWERING ON" : initialized ? "POWERED ON" : "NOT POWERED ON";
-  status.classList.toggle("initialized", initialized);
-  element("key-mode").textContent = initialized
+  status.textContent = busy ? "POWERING ON" : halted.length ? "FIRMWARE HALTED" : initialized ? "POWERED ON" : "NOT POWERED ON";
+  status.classList.toggle("initialized", initialized && !halted.length);
+  const alert = element("halt-alert");
+  alert.hidden = !halted.length;
+  const recovery = workerFailed ? "A worker exited and its in-memory changes cannot be recovered. Clear experiment reloads the supplied images."
+    : "Restart handset keeps saved flash data; unsaved edits may be lost. If this happens again, this firmware path may not be supported by the emulator.";
+  const haltMessage = halted.length ? `Firmware stopped: ${halted.map((cpu) => `${displayText(cpu.image).toUpperCase()} · ${displayText(cpu.worker_error || cpu.halt)}`).join("; ")}. The handset may not respond. ${recovery}` : "";
+  if (alert.textContent !== haltMessage) alert.textContent = haltMessage;
+  element("key-mode").textContent = keyProcessing && !state?.running ? "Processing key in paused firmware…" : halted.length ? workerFailed ? "Worker exited · clear the experiment to reload" : "Firmware halted · restart the handset to continue" : initialized
     ? "GPIO keypad matrix · AVR power input"
-    : loaded ? "Electrical controls active · handset is off" : "Load BC5 and AVR firmware to power on";
+    : loaded ? "Press Power or Power on handset to start" : "Load BC5 and AVR firmware to power on";
 }
 
 function renderSatellite(satellite) {
   if (!satellite) return;
   const status = element("satellite-status");
-  status.textContent = satellite.registered ? "REGISTERED" : satellite.visible ? "VISIBLE / UNREGISTERED" : "NO COVERAGE";
+  const connected = satellite.firmware_connected === true;
+  status.textContent = `${connected ? "" : "SANDBOX · "}${satellite.registered ? "REGISTERED" : satellite.registering ? "REGISTERING" : satellite.visible ? "UNREGISTERED" : "NO COVERAGE"}`;
   status.classList.toggle("online", Boolean(satellite.registered));
-  element("call-state").textContent = displayText(satellite.call_state || "idle").replaceAll("_", " ");
+  element("scenario-disclosure").textContent = connected ? "Local satellite scenario connected to the emulated firmware. No live satellite transmission."
+    : "Offline network sandbox. Registration, calls and SMS below affect this panel only; they are not delivered to the handset firmware.";
+  element("call-state").textContent = `${displayText(satellite.call_state || "idle").replaceAll("_", " ")}${satellite.number ? ` · ${satellite.number}` : ""}`;
+  element("scenario-progress").textContent = satellite.registering
+    ? `Registration pending · configured delay ${numberFormat.format(satellite.latency_ms || 0)} ms. Use Advance 1 s until the scenario clock reaches delivery time.`
+    : `Registration delay: ${numberFormat.format(satellite.latency_ms || 0)} ms. Choose Register, then Advance 1 s while registration is pending. Calls and SMS appear below when received.`;
+  const messages = Array.isArray(satellite.messages) ? satellite.messages : [];
+  const signature = JSON.stringify([satellite.number, satellite.call_state, messages]);
+  if (signature !== lastScenarioSignature) {
+    lastScenarioSignature = signature;
+    element("scenario-callers").replaceChildren(node("li", null, satellite.number ? `${satellite.number} · ${displayText(satellite.call_state)}` : "No active caller."));
+    element("scenario-messages").replaceChildren(...(messages.length ? messages.map((message) => {
+      const item = node("li");
+      item.append(node("strong", null, `${displayText(message.number)} · ${numberFormat.format(message.time_ms || 0)} ms`), node("p", null, message.text));
+      return item;
+    }) : [node("li", "empty-history", "No SMS received in the scenario.")]));
+  }
   element("scenario-time").textContent = `${numberFormat.format(satellite.time_ms || 0)} ms`;
   if (!satelliteDirty && !element("satellite-form").contains(document.activeElement)) {
     element("sat-visible").checked = Boolean(satellite.visible);
@@ -282,6 +348,7 @@ function renderState(state) {
   updateKeyEpoch(state.key_epoch);
   latestState = state;
   renderHandset(state.handset);
+  renderFixtures(state);
   const firmware = state.firmware;
   element("firmware-name").textContent = firmware?.name || "No firmware loaded";
   element("firmware-format").textContent = firmware?.format || "Load a supported original firmware image";
@@ -297,7 +364,7 @@ function renderState(state) {
   runButton.dataset.action = running ? "pause" : "run";
   runButton.replaceChildren(node("span", null, running ? "Ⅱ" : "▶"), document.createTextNode(running ? " Pause" : " Run"));
   const runtime = element("runtime-status");
-  runtime.textContent = running ? "RUNNING" : "PAUSED";
+  runtime.textContent = haltedProcessors(state).length ? "HALTED" : running ? "RUNNING" : keyProcessing ? "PROCESSING KEY" : "PAUSED";
   runtime.classList.toggle("running", running);
   renderApplicationStatus(state);
   renderProcessors(state.processors);
@@ -306,6 +373,43 @@ function renderState(state) {
   drawDisplay(state);
   if (Array.isArray(state.fidelity?.limitations)) {
     element("limitations").replaceChildren(...state.fidelity.limitations.map((limit) => node("li", null, limit)));
+  }
+}
+
+function renderFixtures(state) {
+  const mode = state.mode === "training" ? "training" : "research";
+  const selector = element("emulation-mode");
+  if (!pendingActions.has(selector)) selector.value = mode;
+  element("mode-description").textContent = pendingActions.has(selector) ? "Switching mode and restarting the handset… Saved flash data is retained."
+    : mode === "training"
+    ? "Offline training supplies synthetic calls and messages. No real network or voice audio. Switching modes restarts the handset; saved data is kept, unsaved edits may be lost."
+    : "Firmware research runs the original modem. Unsupported hardware paths can halt. Switching modes restarts the handset; saved data is kept, unsaved edits may be lost.";
+  const capabilities = state.capabilities;
+  const capabilityLabels = { calls: "Offline calls", sms: "Offline SMS", voice_audio: "Audio", backlight: "Backlight", gps: "Synthetic GPS", sim: "Synthetic SIM" };
+  const entries = Array.isArray(capabilities) ? capabilities : capabilities && typeof capabilities === "object"
+    ? Object.entries(capabilities).map(([name, value]) => name === "contrast" ? "Approximate display contrast"
+      : `${capabilityLabels[name] || name.replaceAll("_", " ")}: ${value === true ? "available" : value === false ? "unavailable" : displayText(value)}`) : capabilities ? [capabilities] : [];
+  element("mode-capabilities").replaceChildren(...entries.map((entry) => node("li", null, displayText(entry))));
+  element("output-capabilities").textContent = `${capabilities?.voice_audio === true ? "Audio output is available." : "Audio output is unavailable in this browser."} ${capabilities?.backlight === true ? "Approximate backlight brightness follows the handset's output." : "Backlight output is unavailable."}`;
+  if (!simDirty && !pendingActions.has(element("sim-apply"))) element("sim-present").checked = state.fixtures?.sim?.present !== false;
+  element("sim-description").textContent = (mode === "training"
+    ? "The training SIM supports local demo calls, messages and contacts. "
+    : "Research SIM supplies storage only and can show a blocked-card status. Use Offline training for a ready demo SIM and calls. ")
+    + "Applying SIM state restarts the handset; saved flash data is retained, unsaved edits may be lost.";
+  const gps = state.fixtures?.gps;
+  element("gps-form").hidden = state.handset?.model !== "9575";
+  if (!gpsDirty && gps && !element("gps-form").contains(document.activeElement)) {
+    element("gps-enabled").checked = gps.enabled === true;
+    for (const name of ["latitude", "longitude", "altitude"]) if (gps[name] !== undefined) element(`gps-${name}`).value = gps[name];
+  }
+  updateGpsInputs();
+}
+
+function updateGpsInputs() {
+  const enabled = element("gps-enabled").checked;
+  for (const name of ["latitude", "longitude", "altitude"]) {
+    element(`gps-${name}`).disabled = !enabled;
+    element(`gps-${name}`).required = enabled;
   }
 }
 
@@ -359,11 +463,12 @@ async function action(button, callback) {
     pendingActions.delete(button);
     button.disabled = false;
     renderApplicationStatus(latestState);
+    renderFixtures(latestState || {});
   }
 }
 
 function queueKey(key, pressed) {
-  const event = { key, pressed, client_id: clientId, sequence: ++keySequence, epoch: keyEpoch, session_id: sessionId };
+  const event = { key, pressed, ...(!pressed ? { settle: true } : {}), client_id: clientId, sequence: ++keySequence, epoch: keyEpoch, session_id: sessionId };
   if (pressed) pendingReleases.delete(key);
   else pendingReleases.set(key, { event, retry: false });
   submitKey(event);
@@ -375,6 +480,9 @@ function submitKey(event, retry = false) {
   keyQueue = keyQueue.then(async () => {
     if (closed || version !== keyQueueVersion || (retry && pendingReleases.get(key)?.event !== event)) return;
     if (pressed) submittedKeys.set(key, event);
+    keyProcessing = true;
+    renderApplicationStatus(latestState);
+    if (!latestState?.running) element("runtime-status").textContent = "PROCESSING KEY";
     try {
       const result = await post("/api/key", event, { keepalive: true });
       if (version !== keyQueueVersion) return;
@@ -390,18 +498,37 @@ function submitKey(event, retry = false) {
       if (pendingReleases.get(key)?.event === event) pendingReleases.delete(key);
       const delivery = result.delivered === true ? "Original firmware handler" : "Not delivered to firmware";
       element("key-feedback").textContent = `${key} ${pressed ? "↓" : "↑"} · ${delivery} · ${resultMessage(result, "Input recorded.")}`;
+      return true;
     } catch (error) {
       if (version !== keyQueueVersion) return;
       const pending = pendingReleases.get(key);
       if (pending?.event === event) pending.retry = true;
       element("key-feedback").textContent = `${key}: ${error.message}`;
+      return false;
+    } finally {
+      if (version === keyQueueVersion) {
+        keyProcessing = false;
+        renderApplicationStatus(latestState);
+        element("runtime-status").textContent = haltedProcessors(latestState).length ? "HALTED" : latestState?.running ? "RUNNING" : "PAUSED";
+      }
     }
+  });
+  const queued = keyQueue;
+  // Refresh after settled releases, without delaying queued key delivery on a GET.
+  void queued.then((delivered) => {
+    if (!pressed && delivered && queued === keyQueue && !closed && version === keyQueueVersion) return refreshState(true);
   });
 }
 
 function pressKey(key, source) {
   const button = keyButtons.get(key);
   if (closed || keyEpoch === null || !button || button.disabled || button.hidden || heldSources.has(source)) return;
+  if (key === "power" && latestState?.ui_initialized !== true && handsetImagesLoaded(latestState)) {
+    return action(element("initialize-button"), async () => {
+      await releaseAllKeys();
+      return post("/api/control", { action: "initialize_ui" });
+    });
+  }
   const wasHeld = [...heldSources.values()].includes(key);
   heldSources.set(source, key);
   keyButtons.get(key).classList.add("held");
@@ -425,6 +552,7 @@ function releaseAllKeys() {
 
 function cancelLocalKeys() {
   keyQueueVersion += 1;
+  keyProcessing = false;
   keyQueue = Promise.resolve();
   for (const key of heldSources.values()) keyButtons.get(key).classList.remove("held");
   heldSources.clear();
@@ -477,12 +605,15 @@ window.addEventListener("blur", releaseAllKeys);
 document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAllKeys(); });
 
 document.querySelectorAll("[data-action]").forEach((button) => {
-  button.addEventListener("click", () => action(button, async () => {
-    const payload = { action: button.dataset.action };
-    if (payload.action === "reset" || payload.action === "initialize_ui") await releaseAllKeys();
-    if (payload.action === "step") payload.steps = 10000;
-    return post("/api/control", payload);
-  }));
+  button.addEventListener("click", () => {
+    if (button.dataset.action === "reset" && !window.confirm("Clear this experiment? This reloads the original firmware and erases saved contacts, changed settings, message drafts, and other changes made in this session. Use Restart handset to keep saved flash data.")) return;
+    return action(button, async () => {
+      const payload = { action: button.dataset.action };
+      if (["reset", "restart", "initialize_ui"].includes(payload.action)) await releaseAllKeys();
+      if (payload.action === "step") payload.steps = 10000;
+      return post("/api/control", payload);
+    });
+  });
 });
 
 element("asset-toggle").addEventListener("change", () => {
@@ -490,21 +621,66 @@ element("asset-toggle").addEventListener("change", () => {
   drawDisplay(latestState);
 });
 
+element("emulation-mode").addEventListener("change", () => action(element("emulation-mode"), async () => {
+  const mode = element("emulation-mode").value;
+  await releaseAllKeys();
+  return post("/api/control", { action: "mode", mode });
+}));
+
+element("sim-present").addEventListener("change", () => { simDirty = true; });
+element("sim-apply").addEventListener("click", () => action(element("sim-apply"), async () => {
+  await releaseAllKeys();
+  const result = await post("/api/fixtures", { action: "sim", present: element("sim-present").checked });
+  simDirty = false;
+  return result;
+}));
+
+element("gps-form").addEventListener("input", () => { gpsDirty = true; updateGpsInputs(); });
+element("gps-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  return action(element("gps-apply"), async () => {
+    const payload = { action: "gps", enabled: element("gps-enabled").checked };
+    if (payload.enabled) {
+      for (const name of ["latitude", "longitude", "altitude"]) {
+        const value = String(element(`gps-${name}`).value).trim();
+        payload[name] = value === "" ? NaN : Number(value);
+        if (!Number.isFinite(payload[name])) throw new Error(`Enter a finite GPS ${name}.`);
+      }
+      if (Math.abs(payload.latitude) > 90 || Math.abs(payload.longitude) > 180) throw new Error("GPS latitude must be between −90 and 90; longitude between −180 and 180.");
+    }
+    const result = await post("/api/fixtures", payload);
+    gpsDirty = false;
+    return result;
+  });
+});
+
+async function firmwareBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  return btoa(binary);
+}
+
 element("firmware-input").addEventListener("change", async (event) => {
   const input = event.currentTarget;
-  const file = input.files[0];
-  if (!file) return;
-  if (file.size === 0 || file.size > 8 * 1024 * 1024) {
-    feedback("Choose a non-empty firmware image no larger than 8 MiB.", true);
+  const files = Array.from(input.files || []);
+  if (!files.length) return;
+  if (files.length > 4 || files.some((file) => file.size === 0 || file.size > 8 * 1024 * 1024)) {
+    feedback("Choose one to four non-empty firmware images, each no larger than 8 MiB, with one image per processor.", true);
+    input.value = "";
+    return;
+  }
+  if (latestState?.processors?.some((processor) => processor.image === "bc5") && !window.confirm("Replace firmware? A BC5 image or handset model change clears saved contacts, changed settings, and message drafts from this experiment. Auxiliary images preserve BC5 flash. Continue with the selected images?")) {
     input.value = "";
     return;
   }
   await action(input, async () => {
-    const result = await request("/api/firmware", {
+    const file = files[0];
+    const result = files.length === 1 ? await request("/api/firmware", {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream", "X-Filename": encodeURIComponent(file.name) },
       body: file,
-    });
+    }) : await post("/api/firmware-bundle", { images: await Promise.all(files.map(async (image) => ({ name: image.name, data: await firmwareBase64(image) }))) });
     feedback(resultMessage(result, "Firmware image loaded."));
     lastDisplaySignature = "";
     return result;
@@ -529,7 +705,10 @@ element("satellite-form").addEventListener("submit", (event) => {
 document.querySelectorAll("[data-satellite]").forEach((button) => {
   button.addEventListener("click", () => action(button, () => {
     const payload = { action: button.dataset.satellite };
-    if (payload.action === "incoming_call" || payload.action === "incoming_sms") payload.number = element("remote-number").value;
+    if (payload.action === "incoming_call" || payload.action === "incoming_sms") {
+      payload.number = element("remote-number").value.trim();
+      if (!payload.number || payload.number.length > 24) throw new Error("Enter a remote number between 1 and 24 characters.");
+    }
     if (payload.action === "incoming_sms") payload.text = element("sms-text").value;
     if (payload.action === "advance") payload.milliseconds = 1000;
     return post("/api/satellite", payload);
@@ -545,7 +724,7 @@ window.addEventListener("pagehide", () => {
   cancelLocalKeys();
   for (const [key, previous] of releases) {
     // The server cancels older presses even if this keepalive release arrives first.
-    const event = { key, pressed: false, client_id: clientId, sequence: ++keySequence, epoch: previous.epoch, session_id: previous.session_id };
+    const event = { key, pressed: false, settle: true, client_id: clientId, sequence: ++keySequence, epoch: previous.epoch, session_id: previous.session_id };
     const pending = { event, retry: true };
     pendingReleases.set(key, pending);
     post("/api/key", event, { keepalive: true }).then((result) => {

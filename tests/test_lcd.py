@@ -11,6 +11,20 @@ INIT = bytes.fromhex(
 
 
 class LCDTest(unittest.TestCase):
+    def test_contrast_feedback_tracks_six_bit_volume_without_changing_pixels(self):
+        lcd = ST7541()
+        self.assertAlmostEqual(lcd.state()["contrast_ratio"], 32 / 63)
+        lcd.feed(bytes.fromhex("AF E8 01 01 01"))
+        original = lcd.state()["pixels"]
+        for value, expected in ((0, 0), (39, 39 / 63), (63, 1), (255, 1)):
+            lcd.feed(bytes((0x81, value)))
+            state = lcd.state()
+            self.assertEqual(state["contrast_ratio"], expected)
+            self.assertTrue(state["contrast_approximate"])
+            self.assertEqual(state["pixels"], original)
+        lcd.feed(bytes((0xE2,)))
+        self.assertEqual(lcd.state()["contrast_ratio"], 32 / 63)
+
     def test_original_controller_initialization_preserves_undefined_ddram(self):
         lcd = ST7541()
         for value in INIT:

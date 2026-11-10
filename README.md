@@ -13,8 +13,11 @@ See [implemented hardware and evidence](docs/inferred-hardware.md).
 The scope is behavior recoverable from the supplied firmware and component
 specifications. The unshipped boot ROM, unimplemented DSP execution and unestablished RF/service behavior
 are excluded. The 9575 SOS input uses the original firmware's AVR PK0 mapping.
-Physical board wiring remains unmeasured. Offline satellite scenarios are
-separate from the executing modem's transport.
+Physical board wiring remains unmeasured. **Firmware research** executes the
+original modem and keeps offline scenarios separate. **Offline training** runs
+the original BC5/AVR handset with an explicitly synthetic modem serial peer;
+loaded TRX/PTT images remain inactive in that mode. It does not implement the
+missing DSP instruction set or provide real satellite service.
 
 ## Run
 
@@ -72,7 +75,8 @@ identify measured physical hardware or provide the missing boot ROM.
 A virtual CSR flash-bank header supplies the `FFFE` revision expected by the
 original upgrade tools; processor state identifies both metadata fixtures.
 Without the flag,
-the interface starts paused; **Power on handset** invokes the same scenario.
+the interface starts paused; **Power on handset**, or the handset's power key,
+invokes the same scenario.
 
 Supply a directory to load BC5, AVR, telephony and PTT images. Telephony and PTT
 are alternative modem images, not two simultaneously active processors in a
@@ -104,8 +108,14 @@ HEX are not accepted; use the extracted binaries in the supplied project.
 AVR inputs may also be complete 16 KiB (9555) or 128 KiB (9575 profile) flash
 images, including synthetic boot sections for self-programming tests.
 The source firmware is read-only. Validated payloads are staged temporarily for
-the workers; firmware bytes are not included in this repository. Reset reloads
-the supplied image and discards the experiment's RAM and flash changes.
+the workers; firmware bytes are not included in this repository. **Restart
+handset** retains programmed flash, EEPROM and synthetic SIM records. **Clear
+experiment** reloads the supplied images and discards local contacts, drafts
+and settings, after a browser confirmation. Closing the process also ends this
+in-memory experiment; restart does not provide persistence across server exits.
+Select all processor files together to replace a handset in one upload. Every
+image is validated and every replacement worker starts before old workers are
+retired; replacing loaded firmware requires confirmation.
 
 ## Current behavior
 
@@ -134,8 +144,29 @@ the supplied image and discards the experiment's RAM and flash changes.
   Original filesystem bitmaps are also available in a separate **asset preview**.
 - Offline scenarios model signal/visibility, registration delay, incoming calls,
   answering, loss of coverage, and incoming SMS. Use **Advance 1 s** while paused.
-  These scenarios are **not connected to the executing modem** and perform no
-  radio transmission, audio transport, network authentication, or real calls.
+  In **Offline training**, a finite serial modem connects these scenarios to
+  the original handset. In **Firmware research**, they remain a separate panel.
+  Neither mode provides radio transmission, voice audio, network authentication,
+  or real calls. The research modem can still halt at its missing DSP consumer;
+  use training mode for supported calls/messages, or retain research mode to
+  inspect that hardware boundary.
+
+Browser key releases include bounded guest time so paused handset menus can
+respond without pressing Run. Debugger key requests retain exact stepping
+unless `settle:true` is requested. The display includes a text transcript derived
+from the original font bitmaps and live pixels; unsupported or obscured glyphs
+are marked unreadable. LCD contrast is approximate rather than optically
+calibrated. Approximate backlight brightness follows the original AVR outputs,
+including timeout and key wake. The UI identifies unavailable audio output.
+See [display feedback and text recognition](docs/display-feedback.md).
+
+The synthetic-peripherals panel supplies a writable demo SIM (no subscriber
+identity/authentication) and, on 9575, a receiver at chosen GPS coordinates.
+SIM changes restart an initialized handset while retaining flash. GPS data is
+delivered through the original AVR UART and configuration protocol, so the
+handset still needs GPS enabled. Stopping the receiver leaves any last known
+position in the handset. These fixtures and all scenario calls/messages are
+local to this emulator.
 
 External GPS receiver bytes can be supplied through the 9575 AVR USART0 probe;
 factory tests verify their propagation to coordinates on the original LCD.
@@ -167,6 +198,19 @@ navigation and the original missing-SIM error. Deliberate opcode changes must
 change execution, including an altered application initializer that must fail
 visibly. The original-image suites run separately for each supplied handset
 directory and are explicitly skipped when their environment variable is unset.
+
+The repaired browser, peripheral and offline-training workflows have separate
+original-handset regressions. With both firmware environment variables set,
+run these without including research tests that deliberately expose missing DSP
+execution or defects in the supplied firmware:
+
+```sh
+PYTHONPATH=tests:. python3 -m unittest test_browser_workflows_e2e test_fixture_controls_e2e test_training_persistence_e2e test_training_workflows_e2e
+```
+
+These cover paused keys, GPS, research SIM storage, retained contacts,
+201-character draft save/readback, incoming SMS, call answer/end/decline and
+the training clock. See [offline modem scope](docs/offline-modem.md).
 
 `./test-factory` builds the native worker, verifies pinned HT25003/HL25003 BC5,
 AVR and telephony TRX payload hashes, and drives real HTTP controls through original firmware

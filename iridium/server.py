@@ -1,6 +1,7 @@
 """Network web controls; all firmware execution stays in native workers."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
 import json
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -90,7 +91,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Transfer-Encoding"):
                 raise ValueError("Transfer encoding is unsupported")
             length = int(self.headers.get("Content-Length", "-1"))
-            limit = MAX_IMAGE_BYTES if self.path == "/api/firmware" else 65536
+            limit = (4 * ((MAX_IMAGE_BYTES + 2) // 3 * 4 + 1024)
+                     if self.path == "/api/firmware-bundle" else
+                     MAX_IMAGE_BYTES if self.path == "/api/firmware" else 65536)
             if not 0 < length <= limit:
                 raise ValueError(f"Request body must contain 1 to {limit} bytes")
             body = self.rfile.read(length)
@@ -124,15 +127,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def _control(self, data: dict) -> dict:
         session = self.server.session
+        if self.path == "/api/firmware-bundle":
+            entries = data.get("images")
+            if not isinstance(entries, list) or not 1 <= len(entries) <= 4:
+                raise ValueError("Choose one to four processor images")
+            images = []
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not isinstance(entry.get("data"), str):
+                    raise ValueError("Each image needs a filename and base64 data")
+                raw = base64.b64decode(entry["data"], validate=True)
+                images.append(parse_firmware(raw, Path(entry["name"]).name,
+                                             allow_invalid_crc=self.server.allow_invalid_crc))
+            models = {image.model for image in images if image.image not in ("trx", "ptt")}
+            if len(models) > 1:
+                raise ValueError("All images must belong to the same handset model")
+            model = next(iter(models), session.model)
+            images = [parse_firmware(image.data, image.name, model=model,
+                                     allow_invalid_crc=self.server.allow_invalid_crc)
+                      if image.image in ("trx", "ptt") else image for image in images]
+            session.load_bundle(images)
+            return {"ok": True, "message": f"Loaded {len(images)} processor images",
+                    "key_epoch": session.key_epoch, "session_id": session.session_id}
         if self.path == "/api/control":
-            return session.control(data.get("action"), data.get("steps", 10000))
+            return session.control(data.get("action"), data.get("steps", 10000), mode=data.get("mode"))
         if self.path == "/api/key":
             return session.key(data.get("key"), data.get("pressed"), data.get("generation"),
                                client_id=data.get("client_id"), sequence=data.get("sequence"),
-                               epoch=data.get("epoch"), session_id=data.get("session_id"))
+                               epoch=data.get("epoch"), session_id=data.get("session_id"),
+                               settle=data.get("settle", False))
         if self.path == "/api/satellite":
             action = data.pop("action", None)
             return session.satellite_action(action, data)
+        if self.path == "/api/fixtures":
+            return session.fixture_action(data.pop("action", None), data)
         if self.path == "/api/probe":
             image, operation = data.pop("image", "bc5"), data.pop("operation", None)
             return session.probe(image, operation, data)
