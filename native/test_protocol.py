@@ -1015,6 +1015,86 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(other[4]["values"], [0xA5])
         self.assertEqual(other[6]["values"], [0])
 
+    def test_bc5_flash_constants_follow_program_and_erase_without_reset(self):
+        def operand(op, value):
+            return [(((value + 0x80) >> 8) & 255) << 8, ((value & 255) << 8) | op]
+
+        for model, size, window_base in (("9555", 0x310FBA, 0x3096BE // 2),
+                                         ("9575", 0x36BB22, 0x363E4A // 2)):
+            with self.subTest(model=model):
+                firmware = bytearray(size)
+                constant = 0x110
+                offset = 2 * (window_base + constant)
+                firmware[offset:offset + 2] = b"\xff\xff"
+                physical = 0x1800C + window_base + constant
+                page, address = physical // 0x1000, 0x8000 + physical % 0x1000
+                words = []
+
+                def store(target, value):
+                    words.extend(operand(0x14, value) + operand(0x25, target))
+
+                def unlock(command):
+                    store(0x73, 0)
+                    for target, value in ((0x8555, 0xAA), (0x82AA, 0x55), (0x8555, command)):
+                        store(target, value)
+
+                def capture(destination):
+                    for source in (constant, address):
+                        words.extend(operand(0x15, source) + operand(0x25, destination))
+                        destination += 1
+
+                unlock(0xA0)
+                store(0x73, page)
+                store(address, 0x12F4)
+                capture(0xA000)
+                unlock(0x20)
+                store(0x73, page)
+                store(address, 0xA0)
+                store(address, 0x1234)
+                store(address, 0x90)
+                store(address, 0)
+                capture(0xA002)
+                unlock(0x80)
+                store(0x8555, 0xAA)
+                store(0x82AA, 0x55)
+                store(0x73, page)
+                store(address, 0x30)
+                capture(0xA004)
+                unlock(0xA0)
+                store(0x73, page)
+                store(address, 0x1234)
+                capture(0xA006)
+                words.append(0x00E2)
+                code = b"".join(word.to_bytes(2, "little") for word in words)
+                firmware[0x100:0x100 + len(code)] = code
+
+                words.clear()
+                unlock(0x80)
+                store(0x8555, 0xAA)
+                store(0x82AA, 0x55)
+                store(0x8555, 0x10)
+                # Stop immediately after chip erase, which also removes this routine.
+                erase_steps = len(words) // 2
+                code = b"".join(word.to_bytes(2, "little") for word in words)
+                firmware[0x800:0x800 + len(code)] = code
+                states = exchange("bc5", firmware, [
+                    {"op": "call", "entry": 0x100, "steps": 200},
+                    {"op": "read", "address": 0xA000, "count": 8},
+                    {"op": "read", "address": constant},
+                    {"op": "warm_reset"}, {"op": "read", "address": constant},
+                    {"op": "call", "entry": 0x800, "steps": erase_steps},
+                    {"op": "read", "address": constant},
+                    {"op": "reset"}, {"op": "read", "address": constant},
+                ], model=model)
+                self.assertTrue(states[1]["last_call"]["returned"])
+                self.assertEqual(states[2]["values"], [0x12F4, 0x12F4, 0x1234, 0x1234,
+                                                       0xFFFF, 0xFFFF, 0x1234, 0x1234])
+                for index in (3, 5):
+                    self.assertEqual(states[index]["values"], [0x1234])
+                self.assertEqual(states[6]["halt"], "probe-did-not-return")
+                for index in (7, 9):
+                    self.assertEqual(states[index]["values"], [0xFFFF])
+
     def test_bc5_call_stack_arguments_do_not_overwrite_paused_stack(self):
         firmware = bytearray(0x310FBA)
         # ld AL,@(0,Y); rts: returns the first stack argument.

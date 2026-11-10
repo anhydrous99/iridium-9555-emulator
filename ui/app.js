@@ -5,7 +5,7 @@ const numberFormat = new Intl.NumberFormat();
 const keyButtons = new Map([...document.querySelectorAll("[data-key]")].map((button) => [button.dataset.key, button]));
 const heldSources = new Map();
 const submittedKeys = new Map();
-const failedReleases = new Map();
+const pendingReleases = new Map();
 const clientId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
 const pendingActions = new Set();
 let latestState = null;
@@ -17,6 +17,7 @@ let sessionId = null;
 let keySequence = 0;
 let feedbackTimer;
 let pollTimer;
+let pollVersion = 0;
 let satelliteDirty = false;
 let lastEventSignature = "";
 let lastDisplaySignature = "";
@@ -317,10 +318,10 @@ async function refreshState(afterMutation = false) {
     element("connection-dot").classList.add("connected");
     element("connection-status").textContent = "Local engine connected";
     renderState(state);
-    if (!closed) {
-      for (const event of failedReleases.values()) {
-        failedReleases.delete(event.key);
-        enqueueKey(event);
+    for (const pending of pendingReleases.values()) {
+      if (!closed && pending.retry) {
+        pending.retry = false;
+        submitKey(pending.event, true);
       }
     }
   }).catch((error) => {
@@ -333,8 +334,9 @@ async function refreshState(afterMutation = false) {
 
 async function poll() {
   if (closed) return;
+  const version = pollVersion;
   await refreshState();
-  if (!closed) pollTimer = setTimeout(poll, latestState?.running ? 50 : 1250);
+  if (!closed && version === pollVersion) pollTimer = setTimeout(poll, latestState?.running ? 50 : 1250);
 }
 
 function resultMessage(result, fallback) {
@@ -348,7 +350,7 @@ async function action(button, callback) {
   renderApplicationStatus(latestState);
   try {
     const result = await callback();
-    updateKeyEpoch(result?.key_epoch, result?.session_id);
+    if (result?.session_id === sessionId) updateKeyEpoch(result?.key_epoch);
     if (result?.message) feedback(displayText(result.message));
     await refreshState(true);
   } catch (error) {
@@ -361,35 +363,40 @@ async function action(button, callback) {
 }
 
 function queueKey(key, pressed) {
-  enqueueKey({ key, pressed, client_id: clientId, sequence: ++keySequence, epoch: keyEpoch, session_id: sessionId });
+  const event = { key, pressed, client_id: clientId, sequence: ++keySequence, epoch: keyEpoch, session_id: sessionId };
+  if (pressed) pendingReleases.delete(key);
+  else pendingReleases.set(key, { event, retry: false });
+  submitKey(event);
 }
 
-function enqueueKey(event) {
-  const version = keyQueueVersion;
-  keyQueue = keyQueue.then(() => {
-    if (closed || version !== keyQueueVersion) return;
-    return sendKey(event, version);
-  });
-}
-
-async function sendKey(event, version) {
+function submitKey(event, retry = false) {
   const { key, pressed } = event;
-  if ((submittedKeys.get(key)?.sequence ?? 0) > event.sequence) return;
-  submittedKeys.set(key, event);
-  failedReleases.delete(key);
-  try {
-    const result = await post("/api/key", event, { keepalive: true });
-    if (version !== keyQueueVersion) return;
-    updateKeyEpoch(result.key_epoch, result.session_id);
-    if (version !== keyQueueVersion) return;
-    if (!pressed && submittedKeys.get(key) === event) submittedKeys.delete(key);
-    const delivery = result.delivered === true ? "Original firmware handler" : "Not delivered to firmware";
-    element("key-feedback").textContent = `${key} ${pressed ? "↓" : "↑"} · ${delivery} · ${resultMessage(result, "Input recorded.")}`;
-  } catch (error) {
-    if (version !== keyQueueVersion) return;
-    if (!pressed && submittedKeys.get(key) === event) failedReleases.set(key, event);
-    element("key-feedback").textContent = `${key}: ${error.message}`;
-  }
+  const version = keyQueueVersion;
+  keyQueue = keyQueue.then(async () => {
+    if (closed || version !== keyQueueVersion || (retry && pendingReleases.get(key)?.event !== event)) return;
+    if (pressed) submittedKeys.set(key, event);
+    try {
+      const result = await post("/api/key", event, { keepalive: true });
+      if (version !== keyQueueVersion) return;
+      if (result.session_id !== sessionId) {
+        cancelLocalKeys();
+        keyEpoch = null;
+        await refreshState(true);
+        return;
+      }
+      updateKeyEpoch(result.key_epoch);
+      if (version !== keyQueueVersion) return;
+      if (!pressed) submittedKeys.delete(key);
+      if (pendingReleases.get(key)?.event === event) pendingReleases.delete(key);
+      const delivery = result.delivered === true ? "Original firmware handler" : "Not delivered to firmware";
+      element("key-feedback").textContent = `${key} ${pressed ? "↓" : "↑"} · ${delivery} · ${resultMessage(result, "Input recorded.")}`;
+    } catch (error) {
+      if (version !== keyQueueVersion) return;
+      const pending = pendingReleases.get(key);
+      if (pending?.event === event) pending.retry = true;
+      element("key-feedback").textContent = `${key}: ${error.message}`;
+    }
+  });
 }
 
 function pressKey(key, source) {
@@ -422,7 +429,7 @@ function cancelLocalKeys() {
   for (const key of heldSources.values()) keyButtons.get(key).classList.remove("held");
   heldSources.clear();
   submittedKeys.clear();
-  failedReleases.clear();
+  pendingReleases.clear();
 }
 
 function updateKeyEpoch(epoch, session = sessionId) {
@@ -531,12 +538,21 @@ document.querySelectorAll("[data-satellite]").forEach((button) => {
 
 window.addEventListener("pagehide", () => {
   closed = true;
+  pollVersion += 1;
   clearTimeout(pollTimer);
-  const releases = [...submittedKeys.values()].map((event) => ({ ...event, pressed: false, sequence: ++keySequence }));
+  const releases = new Map(submittedKeys);
+  for (const [key, pending] of pendingReleases) releases.set(key, pending.event);
   cancelLocalKeys();
-  for (const event of releases) {
+  for (const [key, previous] of releases) {
     // The server cancels older presses even if this keepalive release arrives first.
-    sendKey(event, keyQueueVersion);
+    const event = { key, pressed: false, client_id: clientId, sequence: ++keySequence, epoch: previous.epoch, session_id: previous.session_id };
+    const pending = { event, retry: true };
+    pendingReleases.set(key, pending);
+    post("/api/key", event, { keepalive: true }).then((result) => {
+      if (pendingReleases.get(key) === pending && result.session_id === event.session_id && result.key_epoch === event.epoch) {
+        pendingReleases.delete(key);
+      }
+    }).catch(() => {});
   }
 });
 window.addEventListener("pageshow", (event) => {

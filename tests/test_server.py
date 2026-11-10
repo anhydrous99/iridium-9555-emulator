@@ -45,8 +45,35 @@ class ServerTests(unittest.TestCase):
         status, data, _ = self.request("POST", "/api/control", '{"action":"step","steps":42}',
                                        {"Content-Type": "application/json"})
         self.assertEqual(status, 200, data)
+        self.assertEqual(json.loads(data)["session_id"], self.session.session_id)
         status, data, _ = self.request("GET", "/api/state")
         self.assertEqual(json.loads(data)["processors"][0]["steps"], 42)
+        self.assertEqual(json.loads(data)["session_id"], self.session.session_id)
+
+    def test_restarted_session_rejects_old_keys_even_when_epochs_match(self):
+        old_id = self.session.state()["session_id"]
+        replacement = Session(Path("unused"), [parse_firmware(bytes(8678), "avr.bin")], FakeEngine)
+        self.addCleanup(replacement.close)
+        self.server.session = replacement
+        self.assertEqual(replacement.key_epoch, self.session.key_epoch)
+        self.assertNotEqual(replacement.session_id, old_id)
+        body = {"key": "1", "pressed": True, "client_id": "tab", "sequence": 1,
+                "epoch": replacement.key_epoch, "session_id": old_id}
+        status, data, _ = self.request("POST", "/api/key", json.dumps(body),
+                                       {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        self.assertIn("Stale key session", json.loads(data)["message"])
+        self.assertEqual(json.loads(data)["session_id"], replacement.session_id)
+        self.assertEqual(replacement.keys, set())
+        self.assertEqual(replacement._key_clients, {})
+        body["session_id"] = replacement.session_id
+        status, data, _ = self.request("POST", "/api/key", json.dumps(body),
+                                       {"Content-Type": "application/json"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(replacement.keys, {"1"})
+        body.update(pressed=False, sequence=2, session_id=old_id)
+        self.request("POST", "/api/key", json.dumps(body), {"Content-Type": "application/json"})
+        self.assertEqual(replacement.keys, {"1"})
 
     def test_key_release_cancels_an_older_press_over_http(self):
         generation = self.session.state()["key_generations"]["1"]
@@ -125,6 +152,11 @@ class ServerTests(unittest.TestCase):
                         {"epoch": 2**53}, {"epoch": None}, {"generation": 0}):
             with self.subTest(invalid=invalid):
                 status, data, _ = self.request("POST", "/api/key", json.dumps(valid | invalid),
+                                               {"Content-Type": "application/json"})
+                self.assertEqual(status, 400, data)
+        for session_id in ("", "a" * 31, "A" * 32, [], True, 1):
+            with self.subTest(session_id=session_id):
+                status, data, _ = self.request("POST", "/api/key", json.dumps(valid | {"session_id": session_id}),
                                                {"Content-Type": "application/json"})
                 self.assertEqual(status, 400, data)
         for client in range(128):

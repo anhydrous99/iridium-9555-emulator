@@ -1519,13 +1519,13 @@ pub const Devices = struct {
         return @as(u16, @bitCast(result)) & 0x3FF;
     }
 
-    fn uartFrameCycles(io: *const [0x200]u8, base: u16) u32 {
+    fn uartFrameCycles(io: *const [0x200]u8, base: u16, transmit: bool) u32 {
         const b = io[base + 1];
         const cc = io[base + 2];
         const ubrr: u32 = (@as(u32, io[base + 5] & 0x0F) << 8) | io[base + 4];
         const per_bit: u32 = (if (io[base] & 0x02 != 0) @as(u32, 8) else 16) * (ubrr + 1);
         const data: u32 = 5 + ((cc >> 1) & 3) + @as(u32, if (b & 0x04 != 0) 4 else 0);
-        const bits = 1 + @min(data, 9) + @as(u32, if (cc & 0x20 != 0) 1 else 0) + @as(u32, if (cc & 0x08 != 0) 2 else 1);
+        const bits = 1 + @min(data, 9) + @as(u32, if (cc & 0x20 != 0) 1 else 0) + @as(u32, if (transmit and cc & 0x08 != 0) 2 else 1);
         return bits * per_bit;
     }
 
@@ -1534,7 +1534,7 @@ pub const Devices = struct {
         if (u.tx_busy != 0 or u.tx_full == 0) return;
         u.tx_shift = u.tx_buf;
         u.tx_full = 0;
-        u.tx_busy = uartFrameCycles(&d.st.io, uart_bases[n]);
+        u.tx_busy = uartFrameCycles(&d.st.io, uart_bases[n], true);
     }
 
     // ---- time ------------------------------------------------------------------------------
@@ -1893,7 +1893,7 @@ pub const Devices = struct {
         while (left > 0) {
             if (u.rx_busy == 0) {
                 if (u.in_head == u.in_tail) return;
-                u.rx_busy = uartFrameCycles(io, base);
+                u.rx_busy = uartFrameCycles(io, base, false);
             }
             const step = @min(left, u.rx_busy);
             u.rx_busy -= step;
@@ -2602,6 +2602,40 @@ test "all USARTs: disabling RX discards buffered and unfinished reception only" 
             d.tick(160);
             try testing.expect(d.pending() != null);
             try testing.expectEqual(@as(u8, 0x42), d.read(base + 6));
+        }
+    }
+}
+
+test "all USARTs: receive timing ignores transmit stop bits" {
+    for ([_]bool{ false, true }) |mega| {
+        for (uart_bases[0..if (mega) @as(usize, 4) else 2], 0..) |base, port| {
+            for ([_]bool{ false, true }) |double_speed| {
+                for ([_]bool{ false, true }) |two_stop_bits| {
+                    var d: Devices = .{ .mega = mega };
+                    d.reset();
+                    const n: u2 = @intCast(port);
+                    const bit_cycles: u32 = (if (double_speed) @as(u32, 8) else 16) * 9;
+                    d.write(base, if (double_speed) 2 else 0);
+                    d.write(base + 1, 0x18); // RXEN, TXEN
+                    d.write(base + 2, if (two_stop_bits) 0x0E else 0x06); // 8N2 or 8N1
+                    d.write(base + 4, 8);
+                    try testing.expect(d.uartPush(n, 0x41));
+                    d.write(base + 6, 0x42);
+                    d.tick(10 * bit_cycles - 1);
+                    try testing.expectEqual(@as(u8, 0), d.read(base) & 0x80);
+                    try testing.expectEqual(@as(?u8, null), d.uartPop(n));
+                    d.tick(1);
+                    try testing.expectEqual(@as(u8, 0x80), d.read(base) & 0x80);
+                    try testing.expectEqual(@as(u8, 0x41), d.read(base + 6));
+                    if (two_stop_bits) {
+                        try testing.expectEqual(@as(?u8, null), d.uartPop(n));
+                        d.tick(bit_cycles - 1);
+                        try testing.expectEqual(@as(?u8, null), d.uartPop(n));
+                        d.tick(1);
+                    }
+                    try testing.expectEqual(@as(?u8, 0x42), d.uartPop(n));
+                }
+            }
         }
     }
 }

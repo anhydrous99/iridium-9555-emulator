@@ -596,6 +596,7 @@ class Session:
         arguments = dict(arguments)
         default_budget = 100000 if operation == "call" else (worker.state.get("last_call") or {}).get("remaining_steps", 0)
         budget = arguments.get("steps", default_budget)
+        request_limit = arguments.get("quantum", budget)
         if self.spi_link and type(budget) is int and budget > 0:
             quantum = arguments.get("quantum", self._board_quantum(budget))
             if type(quantum) is int and 1 <= quantum <= 100000000:
@@ -603,6 +604,7 @@ class Session:
         before = (worker.state.get("last_call") or {}).get("steps", 0) if operation == "call_resume" else 0
         # Native validation must run before any peripheral processor advances.
         response = self._request(worker, operation, **arguments)
+        budget = min(budget, request_limit)
         peripheral_budget = budget
         previous = before
         while True:

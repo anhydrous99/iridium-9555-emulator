@@ -54,8 +54,9 @@ function emptyState() {
 
 function deferred() {
   let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 async function fixture(keyResponse, stateResponse) {
@@ -101,7 +102,8 @@ async function fixture(keyResponse, stateResponse) {
       const response = keyResponse ? await keyResponse(body, url) : null;
       const result = response || { message: "Recorded; wiring unresolved", delivered: false };
       return { ok: true, json: async () => url === "/api/key"
-        ? { key_epoch: body.epoch, session_id: body.session_id, ...result } : result };
+        ? { key_epoch: body.epoch, session_id: body.session_id, ...result }
+        : { session_id: "a".repeat(32), ...result } };
     },
   });
   vm.runInContext(source, context);
@@ -109,7 +111,7 @@ async function fixture(keyResponse, stateResponse) {
   return { context, calls, requests, stateCalls, window, document, elements, buttons, run: (code) => vm.runInContext(code, context) };
 }
 
-function keyEvent(app, key, pressed, sequence, epoch = 0, session = "a".repeat(32)) {
+function keyEvent(app, key, pressed, sequence, epoch = 0, session = app.run("sessionId")) {
   return { key, pressed, client_id: app.run("clientId"), sequence, epoch, session_id: session };
 }
 
@@ -226,7 +228,7 @@ test("reconnection retries a failed release once without replaying the press", a
   retry.resolve();
   await app.run("keyQueue");
   assert.equal(held, false);
-  assert.equal(app.run("submittedKeys.size + failedReleases.size"), 0);
+  assert.equal(app.run("submittedKeys.size + pendingReleases.size"), 0);
   await app.run("refreshState()");
   assert.equal(app.calls.length, 3, "An acknowledged release is not retried");
 });
@@ -333,7 +335,7 @@ test("returning from pagehide retries cleanup lost while the page was offline", 
   state = emptyState();
   oldPoll.resolve(state);
   await pending;
-  assert.equal(app.run("failedReleases.size"), 1, "A late hidden-page poll must retain failed cleanup");
+  assert.equal(app.run("pendingReleases.size"), 1, "A late hidden-page poll must retain failed cleanup");
   connected = true;
   app.window.listeners.get("pageshow")({ persisted: true });
   await app.run("refreshState()");
@@ -391,14 +393,14 @@ test("server restart replaces equal or lower epochs without reviving old key req
     assert.equal(app.run("keyEpoch"), 0);
     assert.equal(app.elements.get("firmware-name").textContent, "new session");
     assert.equal(app.elements.get("brand-model").textContent, "9555");
-    assert.equal(app.run("heldSources.size + submittedKeys.size + failedReleases.size"), 0);
+    assert.equal(app.run("heldSources.size + submittedKeys.size + pendingReleases.size"), 0);
     app.run("pressKey('1', 'keyboard:Digit1')");
     await app.run("keyQueue");
     press.resolve({ session_id: "a".repeat(32), key_epoch: 99 });
     await oldQueue;
     assert.equal(app.run("keyEpoch"), 0, "An old response cannot overwrite the new session's epoch");
     assert.deepEqual(app.calls.map((call) => call.body), [
-      keyEvent(app, "1", true, 1, epoch), keyEvent(app, "1", true, 3, 0, state.session_id),
+      keyEvent(app, "1", true, 1, epoch, "a".repeat(32)), keyEvent(app, "1", true, 3, 0, state.session_id),
     ]);
     app.run("releaseKey('keyboard:Digit1')");
     await app.run("keyQueue");
@@ -434,12 +436,12 @@ test("a session change discards failed releases instead of sending them to the r
   }, () => state);
   app.run("pressKey('power', 'keyboard:KeyP'); releaseKey('keyboard:KeyP')");
   await app.run("keyQueue");
-  assert.equal(app.run("failedReleases.size"), 1);
+  assert.equal(app.run("pendingReleases.size"), 1);
   state = { ...emptyState(), session_id: "b".repeat(32) };
   await app.run("refreshState()");
   await app.run("keyQueue");
   assert.equal(app.calls.length, 2);
-  assert.equal(app.run("failedReleases.size"), 0);
+  assert.equal(app.run("pendingReleases.size"), 0);
 });
 
 test("pages have independent IDs and sequences regardless of other clients' generations", async () => {
@@ -709,4 +711,234 @@ test("worker failures explain how to recover in the processor row", async () => 
   app.run("renderProcessors([{image:'avr',halt:'worker-failed',worker_error:'CPU worker timed out and was stopped'}])");
   const row = app.elements.get("processors").children[0];
   assert.ok(row.children.some((child) => child.textContent === "Stop: CPU worker timed out and was stopped. Reset to restart."));
+});
+
+test("failed releases retry after a successful poll without repeating delivered edges", async () => {
+  for (const lostResponse of [false, true]) {
+    let held = false;
+    let sequence = 0;
+    let fail = true;
+    const edges = [];
+    const app = await fixture((body) => {
+      const failed = !body.pressed && fail;
+      if (failed) fail = false;
+      if ((!failed || lostResponse) && body.sequence > sequence) {
+        sequence = body.sequence;
+        if (held !== body.pressed) edges.push(body.pressed);
+        held = body.pressed;
+      }
+      if (failed) throw new Error("Connection lost");
+      return { delivered: true };
+    });
+    app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+    await app.run("keyQueue");
+    assert.equal(app.run("pendingReleases.size"), 1);
+    await app.run("refreshState()");
+    await app.run("keyQueue");
+    await app.run("refreshState()");
+    assert.equal(held, false);
+    assert.deepEqual(edges, [true, false]);
+    assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 2]);
+    assert.equal(app.run("pendingReleases.size + submittedKeys.size"), 0);
+  }
+});
+
+test("a failed old release cannot retry over a newer held press", async () => {
+  const release = deferred();
+  const app = await fixture((body) => body.sequence === 2 ? release.promise : undefined);
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await new Promise(setImmediate);
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  release.reject(new Error("Connection lost"));
+  await app.run("keyQueue");
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 3]);
+  assert.equal(app.run("pendingReleases.size"), 0);
+  assert.equal(app.run("submittedKeys.get('1').sequence"), 3);
+  assert.ok(app.buttons.find((button) => button.dataset.key === "1").classes.has("held"));
+});
+
+test("a queued release retry is cancelled when a newer key event supersedes it", async () => {
+  const otherPress = deferred();
+  const app = await fixture((body) => {
+    if (body.sequence === 2) throw new Error("Connection lost");
+    if (body.sequence === 3) return otherPress.promise;
+  });
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  app.run("pressKey('2', 'keyboard:Digit2')");
+  await app.run("refreshState()");
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  otherPress.resolve();
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 3, 4]);
+  assert.equal(app.run("submittedKeys.get('1').sequence"), 4);
+});
+
+test("server restart accepts a lower epoch and ignores delayed replies from the old session", async () => {
+  let state = { ...emptyState(), key_epoch: 7, handset: { model: "9575" }, running: true };
+  const press = deferred();
+  const app = await fixture((body) => body.sequence === 1 ? press.promise : undefined, () => state);
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await Promise.resolve();
+  const oldQueue = app.run("keyQueue");
+  state = { ...emptyState(), session_id: "b".repeat(32) };
+  await app.run("refreshState()");
+  assert.equal(app.run("keyEpoch"), 0);
+  assert.equal(app.run("pendingReleases.size + submittedKeys.size + heldSources.size"), 0);
+  assert.equal(app.elements.get("brand-model").textContent, "9555");
+  assert.equal(app.elements.get("runtime-status").textContent, "PAUSED");
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("keyQueue");
+  press.resolve({ key_epoch: 99, session_id: "a".repeat(32) });
+  await oldQueue;
+  assert.equal(app.run("keyEpoch"), 0);
+  assert.equal(app.run("sessionId"), "b".repeat(32));
+  assert.equal(app.calls.length, 2, "Old queued releases stay cancelled");
+  assert.deepEqual(app.calls.at(-1).body, keyEvent(app, "1", true, 3));
+  app.window.listeners.get("pagehide")();
+  assert.deepEqual(app.calls.at(-1).body, keyEvent(app, "1", false, 4));
+});
+
+test("server restart with the same epoch cancels failed release retries", async () => {
+  let state = emptyState();
+  const app = await fixture((body) => {
+    if (!body.pressed) throw new Error("Connection lost");
+  }, () => state);
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  state = { ...emptyState(), session_id: "b".repeat(32) };
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  assert.equal(app.calls.length, 2);
+  assert.equal(app.run("pendingReleases.size"), 0);
+  assert.equal(app.run("sessionId"), "b".repeat(32));
+});
+
+test("a response from a restarted server refreshes identity before sending more keys", async () => {
+  let state = { ...emptyState(), key_epoch: 7 };
+  const app = await fixture(() => {
+    state = { ...emptyState(), session_id: "b".repeat(32) };
+    return { session_id: "b".repeat(32), key_epoch: 0 };
+  }, () => state);
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  await app.run("refreshState()");
+  assert.equal(app.run("sessionId"), "b".repeat(32));
+  assert.equal(app.run("keyEpoch"), 0);
+  assert.equal(app.calls.length, 1);
+});
+
+test("an old action response cannot advance the replacement server's epoch", async () => {
+  let state = emptyState();
+  const response = deferred();
+  const app = await fixture(() => response.promise, () => state);
+  const action = app.run("action(element('run-button'), () => post('/api/control', {action:'run'}))");
+  state = { ...emptyState(), session_id: "b".repeat(32) };
+  await app.run("refreshState()");
+  response.resolve({ session_id: "a".repeat(32), key_epoch: 99 });
+  await action;
+  assert.equal(app.run("sessionId"), "b".repeat(32));
+  assert.equal(app.run("keyEpoch"), 0);
+});
+
+test("cached page restoration retries offline cleanup across repeated navigation", async () => {
+  let online = true;
+  let held = false;
+  const app = await fixture((body) => {
+    if (!online) throw new Error("Offline");
+    held = body.pressed;
+    return { delivered: true };
+  });
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("keyQueue");
+  online = false;
+  app.run("releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  app.window.listeners.get("pagehide")();
+  await new Promise(setImmediate);
+  assert.equal(app.run("heldSources.size + submittedKeys.size"), 0);
+  assert.equal(app.run("pendingReleases.size"), 1);
+  app.window.listeners.get("pageshow")({ persisted: true });
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  app.window.listeners.get("pagehide")();
+  await new Promise(setImmediate);
+  assert.equal(held, true);
+  assert.equal(app.run("pendingReleases.size"), 1);
+  online = true;
+  app.window.listeners.get("pageshow")({ persisted: true });
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  assert.equal(held, false);
+  assert.equal(app.run("pendingReleases.size"), 0);
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 3, 3, 4, 4]);
+});
+
+test("late pagehide cleanup acknowledgement cannot remove a newer failed release", async () => {
+  const cleanup = deferred();
+  const app = await fixture((body) => {
+    if (body.sequence === 2) return cleanup.promise;
+    if (body.sequence === 4) throw new Error("Connection lost");
+  });
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("keyQueue");
+  app.window.listeners.get("pagehide")();
+  app.window.listeners.get("pageshow")({ persisted: true });
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  cleanup.resolve({ delivered: true });
+  await new Promise(setImmediate);
+  assert.equal(app.run("pendingReleases.get('1').event.sequence"), 4);
+  assert.equal(app.run("pendingReleases.get('1').retry"), true);
+});
+
+test("restoring a page during an outstanding state request keeps one polling loop", async () => {
+  let nextState;
+  const app = await fixture(undefined, () => nextState || emptyState());
+  const state = deferred();
+  nextState = state.promise;
+  const timers = [];
+  app.context.setTimeout = (callback, delay) => { timers.push({ callback, delay }); return timers.length; };
+  const oldPoll = app.run("poll()");
+  const requests = app.stateCalls.length;
+  app.window.listeners.get("pagehide")();
+  app.window.listeners.get("pageshow")({ persisted: true });
+  state.resolve(emptyState());
+  await oldPoll;
+  await new Promise(setImmediate);
+  assert.equal(app.stateCalls.length, requests, "Restoration shares the outstanding request");
+  assert.equal(timers.length, 1, "Only the restored page schedules a new poll");
+  assert.equal(timers[0].delay, 1250);
+});
+
+test("a state response received while hidden preserves failed cleanup for restoration", async () => {
+  let nextState;
+  let online = true;
+  let held = false;
+  const app = await fixture((body) => {
+    if (!online) throw new Error("Offline");
+    held = body.pressed;
+  }, () => nextState || emptyState());
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("keyQueue");
+  const state = deferred();
+  nextState = state.promise;
+  const polling = app.run("refreshState()");
+  online = false;
+  app.window.listeners.get("pagehide")();
+  await new Promise(setImmediate);
+  state.resolve(emptyState());
+  await polling;
+  await app.run("keyQueue");
+  assert.equal(app.run("pendingReleases.get('1').retry"), true);
+  online = true;
+  nextState = null;
+  app.window.listeners.get("pageshow")({ persisted: true });
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  assert.equal(held, false);
+  assert.equal(app.run("pendingReleases.size"), 0);
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 2]);
 });
