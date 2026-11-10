@@ -477,12 +477,14 @@ class SessionTests(unittest.TestCase):
 
     def test_reset_and_bc5_replacement_reject_old_client_presses_and_releases(self):
         bc5 = replace(self.firmware, image="bc5", name="bc5_main.bin")
+        session_id = self.session.state()["session_id"]
         for reset in (lambda: self.session.control("reset"), lambda: self.session.load(bc5)):
             epoch = self.session.key_epoch
             self.browser_key("tab-a", 10, True)
             self.assertEqual(self.session.keys, {"1"})
             reset()
             self.assertEqual(self.session.key_epoch, epoch + 1)
+            self.assertEqual(self.session.state()["session_id"], session_id)
             self.assertIn("epoch", self.browser_key("tab-a", 2, True, epoch=epoch)["message"])
             self.assertEqual(self.session.keys, set())
             self.browser_key("tab-a", 3, True)

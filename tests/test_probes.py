@@ -589,6 +589,72 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(returned["last_call"]["al"], 2)
                 self.assertEqual(returned["last_call"]["steps"], 3)
 
+    def test_coupled_probe_quantum_yields_before_later_memory_effects(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            words = [0x0114] + operand(0x25, 0xA100) + [0x0214] + operand(0x25, 0xA100) + [0x00E2]
+            code = b"".join(word.to_bytes(2, "little") for word in words)
+            data[0x100:0x100 + len(code)] = code
+            firmware = parse_firmware(bytes(data), "bc5.bin", "bc5", model=model)
+            with self.subTest(model=model), Session(EXECUTABLE, [firmware, avr]) as session:
+                session.probe("bc5", "write", {"address": 0xA100, "values": [0]})
+                for executed, (operation, arguments, value) in enumerate((
+                        ("call", {"entry": 0x100, "steps": 100, "quantum": 1}, 0),
+                        ("call_resume", {"quantum": 1}, 1),
+                        ("call_resume", {"steps": 100, "quantum": 1}, 1),
+                        ("call_resume", {"steps": 1, "quantum": 100}, 2),
+                        ("call_resume", {}, 2)), start=1):
+                    result = session.probe("bc5", operation, arguments)["last_call"]
+                    self.assertEqual(result["steps"], executed)
+                    self.assertEqual(result["remaining_steps"], 100 - executed)
+                    self.assertEqual(result["pending"], executed < 5)
+                    self.assertEqual(result["returned"], executed == 5)
+                    self.assertEqual(session.engines["avr"].state["steps"], executed)
+                    self.assertEqual(session.probe("bc5", "read", {"address": 0xA100})["values"], [value])
+
+    def test_coupled_probe_quantum_spans_multiple_board_chunks(self):
+        for model in ("9555", "9575"):
+            bc5, avr = images(model)
+            data = bytearray(bc5.data)
+            words = [0x0114] * 4100 + [0x00E2]
+            code = b"".join(word.to_bytes(2, "little") for word in words)
+            data[0x100:0x100 + len(code)] = code
+            firmware = parse_firmware(bytes(data), "bc5.bin", "bc5", model=model)
+            with self.subTest(model=model), Session(EXECUTABLE, [firmware, avr]) as session:
+                first = session.probe("bc5", "call", {"entry": 0x100, "steps": 5000, "quantum": 4097})
+                self.assertTrue(first["last_call"]["pending"])
+                self.assertEqual(first["last_call"]["steps"], 4097)
+                self.assertEqual(session.engines["avr"].state["steps"], 4097)
+                second = session.probe("bc5", "call_resume", {"quantum": 3})
+                self.assertTrue(second["last_call"]["pending"])
+                self.assertEqual(second["last_call"]["steps"], 4100)
+                self.assertEqual(session.engines["avr"].state["steps"], 4100)
+                returned = session.probe("bc5", "call_resume", {"quantum": 1})
+                self.assertTrue(returned["last_call"]["returned"])
+                self.assertEqual(returned["last_call"]["remaining_steps"], 899)
+                self.assertEqual(session.engines["avr"].state["steps"], 4101)
+
+    def test_coupled_probe_quantum_bounds_serial_wait_service(self):
+        for model in ("9555", "9575"):
+            with self.subTest(model=model), Session(EXECUTABLE, images(model)) as session:
+                session.control("step", 16)
+                for address, values in ((0xA002, [0x100, 0]), (0xA100, [8])):
+                    session.probe("bc5", "write", {"address": address, "values": values})
+                before = session.engines["avr"].state["steps"]
+                first = session.probe("bc5", "call", {"entry": 0x100, "steps": 1000, "quantum": 14})
+                self.assertTrue(first["last_call"]["pending"])
+                self.assertEqual(first["last_call"]["steps"], 14)
+                self.assertEqual(session.engines["avr"].state["steps"] - before, 14)
+                with self.assertRaisesRegex(EngineError, "Peripheral wait exceeded"):
+                    session.probe("bc5", "call_resume", {"steps": 1000, "quantum": 1})
+                self.assertEqual(session.engines["avr"].state["steps"] - before, 15)
+                self.assertEqual(session.engines["bc5"].state["last_call"]["remaining_steps"], 986)
+                returned = session.probe("bc5", "call_resume", {})
+                self.assertTrue(returned["last_call"]["returned"])
+                self.assertEqual(returned["last_call"]["steps"], 15)
+                self.assertEqual(session.engines["avr"].state["steps"] - before, 129)
+
     def test_public_call_and_continuation_service_spi_without_exceeding_instruction_budget(self):
         for model in ("9555", "9575"):
             with self.subTest(model=model), Session(EXECUTABLE, images(model)) as session:

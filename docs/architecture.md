@@ -276,8 +276,10 @@ Modem image loads preserve keypad state. A page cancels queued events and local 
 without retrying stale events. State polling adopts a new server session and its
 epoch, while delayed replies from the previous session cannot change the current
 input state. Failed releases retry after successful polling with their original
-sequence and epoch; presses are never replayed. Navigation cancels unsent events and immediately
+sequence and epoch; a newer key event or an epoch/session change cancels pending
+retries. Presses are never replayed. Navigation cancels unsent events and immediately
 sends keepalive releases with newer sequences and the submitted presses' epochs.
+Unacknowledged cleanup is retained for retry after a cached page is restored.
 Session IDs contain 32 lowercase hexadecimal digits. Older API callers may omit
 `session_id`, retaining epoch-only sequencing.
 Client IDs contain 1–64 ASCII letters, digits, underscores or hyphens; sequences
@@ -299,9 +301,10 @@ Telephony-only `uart_pins` requires port `3` and separates external inputs from
 firmware outputs; see the [SIM contract](sim-device-contract.md). Pin probes
 do not advance processors or supply a card filesystem.
 BC5 `call` and `call_resume` service the connected board while the function
-waits for SPI. Continuations retain their requested instruction limit. Native
-validation runs before peripheral execution, and serial MMU faults finalize the
-probe and restore its paused CPU/stack while preserving the fault diagnostics.
+waits for SPI. An explicit `quantum` caps the entire coupled request; continuations
+retain their total `steps` limit across requests. Native validation runs before
+peripheral execution, and serial MMU faults finalize the probe and restore its
+paused CPU/stack while preserving the fault diagnostics.
 
 `POST /api/firmware` accepts the raw file body with an `X-Filename` header. It
 validates and starts the replacement worker before disposing of the prior one.
