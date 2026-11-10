@@ -74,13 +74,20 @@ async function fixture(keyResponse, stateResponse) {
     button.dataset.action = operation[1];
     return [button];
   });
+  const satelliteButtons = [...html.matchAll(/data-satellite="([^"]+)"/g)].map((match) => {
+    const button = new Element();
+    button.dataset.satellite = match[1];
+    return button;
+  });
   const window = new Element();
+  const confirmations = [];
+  window.confirm = (message) => { confirmations.push(message); return true; };
   const document = new Element();
   document.getElementById = (id) => {
     assert.ok(elements.has(id), `Missing HTML element ${id}`);
     return elements.get(id);
   };
-  document.querySelectorAll = (selector) => selector === "[data-key]" ? buttons : selector === "[data-action]" ? actions : [];
+  document.querySelectorAll = (selector) => selector === "[data-key]" ? buttons : selector === "[data-action]" ? actions : selector === "[data-satellite]" ? satelliteButtons : [];
   document.createElement = () => new Element();
   document.createTextNode = (textContent) => ({ textContent });
   document.activeElement = null;
@@ -88,7 +95,7 @@ async function fixture(keyResponse, stateResponse) {
   const requests = [];
   const stateCalls = [];
   const context = vm.createContext({
-    document, window, Intl, crypto, AbortSignal: { timeout: () => undefined },
+    document, window, Intl, crypto, btoa, AbortSignal: { timeout: () => undefined },
     setTimeout: () => 1, clearTimeout() {},
     fetch: async (url, options = {}) => {
       if (url === "/api/state") {
@@ -108,11 +115,11 @@ async function fixture(keyResponse, stateResponse) {
   });
   vm.runInContext(source, context);
   await vm.runInContext("refreshState()", context);
-  return { context, calls, requests, stateCalls, window, document, elements, buttons, run: (code) => vm.runInContext(code, context) };
+  return { context, calls, requests, stateCalls, window, document, elements, buttons, actions, satelliteButtons, confirmations, run: (code) => vm.runInContext(code, context) };
 }
 
 function keyEvent(app, key, pressed, sequence, epoch = 0, session = app.run("sessionId")) {
-  return { key, pressed, client_id: app.run("clientId"), sequence, epoch, session_id: session };
+  return { key, pressed, ...(!pressed ? { settle: true } : {}), client_id: app.run("clientId"), sequence, epoch, session_id: session };
 }
 
 test("markup has one of every physical handset control and unique IDs", () => {
@@ -710,7 +717,222 @@ test("worker failures explain how to recover in the processor row", async () => 
   const app = await fixture();
   app.run("renderProcessors([{image:'avr',halt:'worker-failed',worker_error:'CPU worker timed out and was stopped'}])");
   const row = app.elements.get("processors").children[0];
-  assert.ok(row.children.some((child) => child.textContent === "Stop: CPU worker timed out and was stopped. Reset to restart."));
+  assert.ok(row.children.some((child) => /in-memory data is unavailable.*Clear experiment/.test(child.textContent)));
+  app.run("renderApplicationStatus({processors:[{image:'avr',halt:'worker-failed'}],ui_initialized:true})");
+  assert.match(app.elements.get("halt-alert").textContent, /cannot be recovered.*Clear experiment/);
+  assert.doesNotMatch(app.elements.get("halt-alert").textContent, /keeps saved flash/);
+});
+
+test("GPS can be stopped even when edited coordinates are invalid", async () => {
+  const app = await fixture();
+  app.elements.get("gps-enabled").checked = false;
+  app.elements.get("gps-latitude").value = "";
+  app.elements.get("gps-longitude").value = "999";
+  app.elements.get("gps-form").listeners.get("input")();
+  assert.equal(app.elements.get("gps-latitude").disabled, true);
+  assert.equal(app.elements.get("gps-latitude").required, false);
+  await app.elements.get("gps-form").listeners.get("submit")({ preventDefault() {} });
+  assert.deepEqual(app.calls.at(-1), { url: "/api/fixtures", body: { action: "gps", enabled: false } });
+});
+
+test("clearing requires explicit data-loss confirmation while restart preserves its separate action", async () => {
+  const app = await fixture();
+  app.window.confirm = (message) => {
+    assert.match(message, /saved contacts/);
+    assert.match(message, /settings/);
+    assert.match(message, /drafts/);
+    return false;
+  };
+  await app.elements.get("clear-button").listeners.get("click")();
+  assert.equal(app.calls.length, 0);
+  await app.elements.get("restart-button").listeners.get("click")();
+  assert.deepEqual(app.calls, [{ url: "/api/control", body: { action: "restart" } }]);
+  app.window.confirm = () => true;
+  await app.elements.get("clear-button").listeners.get("click")();
+  assert.deepEqual(app.calls.at(-1), { url: "/api/control", body: { action: "reset" } });
+});
+
+test("firmware bundles upload all selected byte arrays once and guard replacement", async () => {
+  const app = await fixture(undefined, () => ({ ...emptyState(), processors: [{ image: "bc5" }] }));
+  const input = app.elements.get("firmware-input");
+  input.files = [
+    { name: "bc5.bin", size: 3, arrayBuffer: async () => Uint8Array.from([0, 127, 255]).buffer },
+    { name: "avr.bin", size: 2, arrayBuffer: async () => Uint8Array.from([17, 32]).buffer },
+  ];
+  app.window.confirm = () => false;
+  await input.listeners.get("change")({ currentTarget: input });
+  assert.equal(app.calls.length, 0, "Cancelling replacement leaves every image untouched");
+  app.window.confirm = () => true;
+  await input.listeners.get("change")({ currentTarget: input });
+  assert.deepEqual(app.calls, [{ url: "/api/firmware-bundle", body: { images: [
+    { name: "bc5.bin", data: "AH//" }, { name: "avr.bin", data: "ESA=" },
+  ] } }]);
+  assert.equal(input.value, "");
+  for (const files of [Array(5).fill({ size: 1 }), [{ size: 0 }], [{ size: 8 * 1024 * 1024 + 1 }]]) {
+    input.files = files;
+    await input.listeners.get("change")({ currentTarget: input });
+    assert.equal(app.calls.length, 1, "Invalid selections must not mutate any firmware");
+    assert.match(app.elements.get("feedback").textContent, /one to four/);
+  }
+});
+
+test("paused taps report processing, settle the release, then request one fresh state", async () => {
+  const release = deferred();
+  const app = await fixture((body) => body.pressed ? undefined : release.promise);
+  const initialGets = app.stateCalls.length;
+  app.run("pressKey('2','pointer:1'); releaseKey('pointer:1')");
+  await new Promise(setImmediate);
+  assert.equal(app.stateCalls.length, initialGets, "The press and queued release coalesce their refresh");
+  assert.equal(app.elements.get("runtime-status").textContent, "PROCESSING KEY");
+  assert.match(app.elements.get("key-mode").textContent, /Processing key in paused firmware/);
+  assert.equal(app.calls.at(-1).body.settle, true);
+  release.resolve({ delivered: true, message: "Firmware advanced after release" });
+  await app.run("keyQueue");
+  await new Promise(setImmediate);
+  assert.equal(app.stateCalls.length, initialGets + 1);
+  assert.equal(app.elements.get("runtime-status").textContent, "PAUSED");
+});
+
+test("physical Power starts an uninitialized handset once and retains electrical power when on", async () => {
+  let state = { ...emptyState(), processors: [{ image: "bc5" }, { image: "avr" }], ui_initialized: false };
+  const startup = deferred();
+  const app = await fixture((body, url) => url === "/api/control" ? startup.promise : undefined, () => state);
+  const power = app.run("pressKey('power','pointer:1')");
+  app.run("releaseKey('pointer:1'); pressKey('power','keyboard:KeyP'); releaseKey('keyboard:KeyP')");
+  await new Promise(setImmediate);
+  assert.deepEqual(app.calls, [{ url: "/api/control", body: { action: "initialize_ui" } }]);
+  assert.equal(app.elements.get("application-status").textContent, "POWERING ON");
+  state = { ...state, ui_initialized: true };
+  startup.resolve({ message: "Handset started" });
+  await power;
+  app.run("pressKey('power','pointer:2'); releaseKey('pointer:2')");
+  await app.run("keyQueue");
+  assert.deepEqual(app.calls.slice(1).map((call) => call.body), [keyEvent(app, "power", true, 1), keyEvent(app, "power", false, 2)]);
+});
+
+test("a CPU halt replaces powered-on status and gives non-destructive recovery guidance", async () => {
+  const app = await fixture();
+  app.run("renderState({ui_initialized:true,processors:[{image:'bc5',halt:'unknown-instruction'},{image:'avr',halt:'steps'}]})");
+  assert.equal(app.elements.get("runtime-status").textContent, "HALTED");
+  assert.equal(app.elements.get("application-status").textContent, "FIRMWARE HALTED");
+  assert.equal(app.elements.get("halt-alert").hidden, false);
+  assert.match(app.elements.get("halt-alert").textContent, /BC5.*unknown-instruction.*Restart handset keeps saved flash/);
+  assert.doesNotMatch(app.elements.get("initialize-button").textContent, /powered on/);
+  app.run("renderState({ui_initialized:true,processors:[{image:'bc5',halt:'ready'}]})");
+  assert.equal(app.elements.get("halt-alert").hidden, true);
+  app.run("renderState({ui_initialized:true,mode:'training',processors:[{image:'bc5',halt:'steps'},{image:'trx',active:false,halt:'unknown-instruction'}]})");
+  assert.equal(app.elements.get("halt-alert").hidden, true, "Dormant training processors cannot report an application halt");
+  assert.equal(app.elements.get("application-status").textContent, "POWERED ON");
+});
+
+test("the offline scenario exposes pending registration, callers and received SMS honestly", async () => {
+  const app = await fixture();
+  app.run("renderSatellite({firmware_connected:false,visible:true,registering:true,latency_ms:1600,number:'+123',call_state:'ringing',messages:[{number:'+456',text:'<b>plain message</b>',time_ms:2000}]})");
+  assert.match(app.elements.get("satellite-status").textContent, /SANDBOX.*REGISTERING/);
+  assert.match(app.elements.get("scenario-disclosure").textContent, /not delivered to the handset/);
+  assert.match(app.elements.get("scenario-progress").textContent, /1,600.*Advance 1 s/);
+  assert.match(app.elements.get("call-state").textContent, /ringing.*\+123/);
+  assert.match(app.elements.get("scenario-callers").children[0].textContent, /\+123/);
+  assert.equal(app.elements.get("scenario-messages").children[0].children[1].textContent, "<b>plain message</b>");
+  app.run("renderSatellite({firmware_connected:true,registered:true,messages:[]})");
+  assert.equal(app.elements.get("satellite-status").textContent, "REGISTERED");
+  assert.match(app.elements.get("scenario-disclosure").textContent, /connected to the emulated firmware/);
+});
+
+test("scenario injection rejects overlong and empty numbers before making requests", async () => {
+  const app = await fixture();
+  const button = app.satelliteButtons.find((candidate) => candidate.dataset.satellite === "incoming_call");
+  for (const value of [" ", "1".repeat(25)]) {
+    app.elements.get("remote-number").value = value;
+    await button.listeners.get("click")();
+    assert.equal(app.calls.length, 0);
+    assert.match(app.elements.get("feedback").textContent, /1 and 24/);
+  }
+  app.elements.get("remote-number").value = "+123";
+  await button.listeners.get("click")();
+  assert.deepEqual(app.calls, [{ url: "/api/satellite", body: { action: "incoming_call", number: "+123" } }]);
+});
+
+test("LCD transcript exposes recognized selections without claiming partial or unknown text is complete", async () => {
+  const app = await fixture();
+  app.context.frame = liveState();
+  app.context.frame.lcd.accessibility = { complete: true, lines: [{ text: "Main Menu" }, { text: "Messages", selected: true }] };
+  app.run("drawDisplay(frame)");
+  assert.equal(app.elements.get("lcd-transcript-status").textContent, "Recognized screen text.");
+  assert.match(app.elements.get("lcd-announcement").textContent, /Main Menu\nSelected: Messages/);
+  const previous = app.elements.get("lcd-transcript-lines").children;
+  app.run("drawDisplay(frame)");
+  assert.equal(app.elements.get("lcd-transcript-lines").children, previous, "Unchanged polling must not rebuild the transcript");
+  app.context.frame.lcd.accessibility.complete = false;
+  app.run("drawDisplay(frame)");
+  assert.match(app.elements.get("lcd-announcement").textContent, /Partial screen text/);
+  app.context.frame.lcd.accessibility.lines = [];
+  app.run("drawDisplay(frame)");
+  assert.match(app.elements.get("lcd-announcement").textContent, /Screen text unknown/);
+  app.context.frame.lcd.accessibility.lines = [{ text: "stale recognized text" }];
+  app.context.frame.lcd.display_on = false;
+  app.run("drawDisplay(frame)");
+  assert.doesNotMatch(app.elements.get("lcd-announcement").textContent, /stale recognized text/);
+  assert.match(app.elements.get("lcd-announcement").textContent, /Screen text unavailable/);
+  app.elements.get("asset-toggle").checked = true;
+  app.run("drawDisplay(frame)");
+  assert.match(app.elements.get("lcd-announcement").textContent, /Embedded asset preview/);
+});
+
+test("contrast changes affect live pixels as an explicitly approximate preview", async () => {
+  const app = await fixture();
+  app.context.frame = liveState();
+  app.context.frame.lcd.pixels[0] = 3;
+  app.context.frame.lcd.contrast_ratio = 0;
+  app.run("drawDisplay(frame)");
+  assert.deepEqual(Array.from(app.elements.get("lcd").frame.data.slice(0, 4)), [169, 184, 145, 255]);
+  assert.match(app.elements.get("display-mode").textContent, /approximate contrast 0%.*not physically calibrated/);
+  app.context.frame.lcd.contrast_ratio = 1;
+  app.run("drawDisplay(frame)");
+  assert.deepEqual(Array.from(app.elements.get("lcd").frame.data.slice(0, 4)), [33, 48, 21, 255]);
+  assert.match(app.elements.get("output-capabilities").textContent, /Audio output is unavailable/);
+  app.context.frame.lcd.backlight_on = false;
+  app.run("drawDisplay(frame)");
+  assert.deepEqual(Array.from(app.elements.get("lcd").frame.data.slice(0, 4)), [24, 35, 15, 255]);
+  assert.match(app.elements.get("display-mode").textContent, /backlight off.*approximate brightness/);
+  app.context.frame.lcd.backlight_on = true;
+  app.run("drawDisplay(frame)");
+  assert.deepEqual(Array.from(app.elements.get("lcd").frame.data.slice(0, 4)), [33, 48, 21, 255]);
+});
+
+test("mode selection and synthetic fixtures send explicit inputs and preserve edited coordinates while polling", async () => {
+  let state = { ...emptyState(), mode: "research", handset: { model: "9575" }, fixtures: { sim: { present: true }, gps: { enabled: false, latitude: 37, longitude: -122, altitude: 30 } } };
+  const app = await fixture((body, url) => {
+    if (url === "/api/control") state = { ...state, mode: body.mode };
+    if (url === "/api/fixtures") state = { ...state, fixtures: { ...state.fixtures,
+      [body.action]: { ...state.fixtures[body.action], ...body } } };
+    return {};
+  }, () => state);
+  const mode = app.elements.get("emulation-mode");
+  mode.value = "training";
+  await mode.listeners.get("change")();
+  assert.deepEqual(app.calls.at(-1), { url: "/api/control", body: { action: "mode", mode: "training" } });
+  assert.match(app.elements.get("mode-description").textContent, /Offline training.*synthetic/);
+  app.elements.get("sim-present").checked = false;
+  await app.elements.get("sim-apply").listeners.get("click")();
+  assert.deepEqual(app.calls.at(-1), { url: "/api/fixtures", body: { action: "sim", present: false } });
+  const gpsForm = app.elements.get("gps-form");
+  assert.equal(gpsForm.hidden, false);
+  gpsForm.listeners.get("input")();
+  app.elements.get("gps-enabled").checked = true;
+  app.elements.get("gps-latitude").value = "51.5";
+  app.elements.get("gps-longitude").value = "-0.12";
+  app.elements.get("gps-altitude").value = "40";
+  await app.run("refreshState()");
+  assert.equal(app.elements.get("gps-latitude").value, "51.5", "Polling cannot erase a fixture being edited");
+  await gpsForm.listeners.get("submit")({ preventDefault() {} });
+  assert.deepEqual(app.calls.at(-1), { url: "/api/fixtures", body: { action: "gps", enabled: true, latitude: 51.5, longitude: -0.12, altitude: 40 } });
+  const count = app.calls.length;
+  app.elements.get("gps-latitude").value = "91";
+  await gpsForm.listeners.get("submit")({ preventDefault() {} });
+  assert.equal(app.calls.length, count);
+  app.run("renderState({handset:{model:'9555'}})");
+  assert.equal(gpsForm.hidden, true);
 });
 
 test("failed releases retry after a successful poll without repeating delivered edges", async () => {
