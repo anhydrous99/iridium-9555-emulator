@@ -101,7 +101,7 @@ class EngineTests(unittest.TestCase):
     def test_link_snapshot_reads_are_isolated_and_invalidated_by_device_commands(self):
         engine = self.start('''
             print(json.dumps({'registers': [0], 'uart_tx_dropped': [3], '_links': {
-                'pins': [1], 'inputs': [2], 'uart_empty': [True]}}), flush=True)
+                'pins': [1], 'inputs': [2], 'modem_power_rises': 7, 'uart_empty': [True]}}), flush=True)
             assert json.loads(sys.stdin.readline()) == {'op': 'spi', 'value': 7}
             print('{"value":17}', flush=True)
             assert json.loads(sys.stdin.readline()) == {'op': 'pin_state'}
@@ -110,7 +110,8 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn('_links', engine.state)
         pins = engine.request('pin_state')
         pins['pins'][0] = 255
-        self.assertEqual(engine.request('pin_state'), {'pins': [1], 'inputs': [2]})
+        pins['modem_power_rises'] = 99
+        self.assertEqual(engine.request('pin_state'), {'pins': [1], 'inputs': [2], 'modem_power_rises': 7})
         self.assertEqual(engine.request('uart_io', port=0), {'accepted': 0, 'values': [], 'dropped': 3})
         self.assertEqual(engine.request('spi', value=7), {'value': 17})
         self.assertEqual(engine.request('pin_state'), {'pins': [9], 'inputs': [2]})
@@ -148,10 +149,23 @@ class EngineTests(unittest.TestCase):
         response = engine.request('state')
         response['uart_tx_dropped'][0] = 123
         response['image'] = 'bc5'
+        response['handset'] = '9575'
         response['gpio'] = {'inputs': 0}
         self.assertEqual(engine.request('uart_io', port=0)['dropped'], 3)
+        self.assertEqual(engine.request('uart_io', port=0, modem_link=True)['dropped'], 3)
         with self.assertRaisesRegex(EngineError, 'MissingField'):
             engine.drive_pins(mask=1, value=0)
+
+    def test_public_modem_state_cannot_enable_avr_managed_capture_cache(self):
+        engine = self.start('''
+            print(json.dumps({'registers': [0], 'image': 'trx', 'uart_tx_dropped': [0],
+                              '_links': {'uart_empty': [True]}}), flush=True)
+            assert json.loads(sys.stdin.readline()) == {'op': 'uart_io', 'port': 0, 'modem_link': True}
+            print('{"error":"BadPort","fatal":false}', flush=True)
+        ''')
+        engine.state['image'] = 'avr'
+        with self.assertRaisesRegex(EngineError, 'BadPort'):
+            engine.request('uart_io', port=0, modem_link=True)
 
     def test_group_sends_both_runs_before_waiting_and_updates_snapshots(self):
         marker = self.directory / 'second-started'

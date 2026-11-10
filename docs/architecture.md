@@ -261,17 +261,25 @@ Mutations use `POST` with `Content-Type: application/json`:
 | `/api/satellite` | `{"action":"incoming_call","number":"+881612345678"}`; also `answer`, `hangup` |
 | `/api/satellite` | `{"action":"incoming_sms","number":"123","text":"Test"}` |
 
-Browser key requests add `client_id`, `sequence` and `epoch`, for example
-`{"key":"1","pressed":true,"client_id":"page-abc","sequence":1,"epoch":0}`.
+Browser key requests add `client_id`, `sequence`, `epoch` and the `session_id`
+reported by state, for example
+`{"key":"1","pressed":true,"client_id":"page-abc","sequence":1,"epoch":0,"session_id":"<current session>"}`.
 Each page generates a unique ID and increasing sequence; each queued event
 captures `key_epoch` from state. The host compares sequences per client and key,
 including releases that arrive before their press. Only the first owner presses
 the guest key and only the last owner's release releases it. State, key, control
-and firmware responses expose `key_epoch`. Reset, loading BC5 or replacing AVR on
+and firmware responses expose `key_epoch` and `session_id`. The session ID changes
+when the server starts a new Session; requests carrying an old ID are ignored,
+even when their epoch happens to match. Reset, loading BC5 or replacing AVR on
 a board with BC5 advances the epoch, clears owners and cancels older requests.
 Modem image loads preserve keypad state. A page cancels queued events and local held sources when the epoch advances,
-without retrying stale events. Navigation cancels unsent events and immediately
+without retrying stale events. State polling adopts a new server session and its
+epoch, while delayed replies from the previous session cannot change the current
+input state. Failed releases retry after successful polling with their original
+sequence and epoch; presses are never replayed. Navigation cancels unsent events and immediately
 sends keepalive releases with newer sequences and the submitted presses' epochs.
+Session IDs contain 32 lowercase hexadecimal digits. Older API callers may omit
+`session_id`, retaining epoch-only sequencing.
 Client IDs contain 1–64 ASCII letters, digits, underscores or hyphens; sequences
 are integers from 1 to 2^53−1 and epochs from 0 to 2^53−1. The host retains at most
 128 clients until reset (or BC5 load), returning an explicit error at that limit.

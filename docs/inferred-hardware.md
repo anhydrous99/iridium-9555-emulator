@@ -98,6 +98,12 @@ The board connection remains an inference from those two firmware contracts.
 With BC5 loaded, logical PA5 (physical PA5 on 9555, PC4 on 9575) gates modem
 execution. A rising enable warm resets the modem, retaining its emulated flash
 and clearing volatile state. Disabled/reset epochs discard queued bytes.
+The AVR worker counts rising enable edges across resets, so a low/high pulse
+within one host execution quantum still resets the modem. The coupled UART
+drain discards output captured before the latest power edge and any interrupted
+transmit frame while retaining later output; standalone debugger capture remains
+available. Power edges also cancel unfinished AVR line reception, retaining bytes
+already received into its hardware FIFO.
 Previously the modem ran before the AVR's final boot reset: its startup retries
 expired and the AVR reset erased the received prefix, leaving the BC5 AT manager
 stopped. Starting the real modem after link enable restores bidirectional AT

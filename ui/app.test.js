@@ -48,7 +48,8 @@ class Element {
 }
 
 function emptyState() {
-  return { firmware: null, images: [], processors: [], satellite: null, events: [], running: false, key_epoch: 0 };
+  return { firmware: null, images: [], processors: [], satellite: null, events: [], running: false,
+    key_epoch: 0, session_id: "a".repeat(32) };
 }
 
 function deferred() {
@@ -100,7 +101,7 @@ async function fixture(keyResponse, stateResponse) {
       const response = keyResponse ? await keyResponse(body, url) : null;
       const result = response || { message: "Recorded; wiring unresolved", delivered: false };
       return { ok: true, json: async () => url === "/api/key"
-        ? { key_epoch: body.epoch, ...result } : result };
+        ? { key_epoch: body.epoch, session_id: body.session_id, ...result } : result };
     },
   });
   vm.runInContext(source, context);
@@ -108,8 +109,8 @@ async function fixture(keyResponse, stateResponse) {
   return { context, calls, requests, stateCalls, window, document, elements, buttons, run: (code) => vm.runInContext(code, context) };
 }
 
-function keyEvent(app, key, pressed, sequence, epoch = 0) {
-  return { key, pressed, client_id: app.run("clientId"), sequence, epoch };
+function keyEvent(app, key, pressed, sequence, epoch = 0, session = "a".repeat(32)) {
+  return { key, pressed, client_id: app.run("clientId"), sequence, epoch, session_id: session };
 }
 
 test("markup has one of every physical handset control and unique IDs", () => {
@@ -203,6 +204,56 @@ test("network key releases cannot overtake a delayed press", async () => {
   assert.deepEqual(app.calls.map((call) => call.body.pressed), [true, false]);
 });
 
+test("reconnection retries a failed release once without replaying the press", async () => {
+  let held = false;
+  let releases = 0;
+  const retry = deferred();
+  const app = await fixture(async (event) => {
+    if (!event.pressed) {
+      if (++releases === 1) throw new Error("Network failure");
+      await retry.promise;
+    }
+    held = event.pressed;
+  });
+  app.run("pressKey('power', 'keyboard:KeyP'); releaseKey('keyboard:KeyP')");
+  await app.run("keyQueue");
+  assert.equal(held, true);
+  assert.equal(app.run("heldSources.size"), 0);
+  await app.run("refreshState()");
+  await app.run("refreshState()");
+  assert.equal(app.calls.length, 3, "Polling cannot enqueue another retry while one is pending");
+  assert.deepEqual(app.calls[2].body, app.calls[1].body, "Retry the same release sequence and session");
+  retry.resolve();
+  await app.run("keyQueue");
+  assert.equal(held, false);
+  assert.equal(app.run("submittedKeys.size + failedReleases.size"), 0);
+  await app.run("refreshState()");
+  assert.equal(app.calls.length, 3, "An acknowledged release is not retried");
+});
+
+test("a failed release retry cannot cancel a newer press of the same key", async () => {
+  let held = false;
+  const nextPress = deferred();
+  const app = await fixture(async (event) => {
+    if (!event.pressed && event.sequence === 2) throw new Error("Network failure");
+    if (event.sequence === 3) await nextPress.promise;
+    held = event.pressed;
+  });
+  app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  // Queue the new press before a poll schedules the retry of the older release.
+  app.run("pressKey('1', 'keyboard:Digit1')");
+  await app.run("refreshState()");
+  nextPress.resolve();
+  await app.run("keyQueue");
+  assert.equal(held, true);
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 3]);
+  assert.equal(app.run("submittedKeys.get('1').sequence"), 3);
+  app.run("releaseKey('keyboard:Digit1')");
+  await app.run("keyQueue");
+  assert.equal(held, false);
+});
+
 test("pagehide cancels queued presses and immediately releases an in-flight press", async () => {
   let finishPress;
   const app = await fixture((body) => body.pressed && !finishPress
@@ -262,6 +313,35 @@ test("pagehide cleanup keeps the submitted epoch and a newer sequence", async ()
   await oldQueue;
 });
 
+test("returning from pagehide retries cleanup lost while the page was offline", async () => {
+  let connected = true;
+  let held = false;
+  let state = emptyState();
+  const app = await fixture((event) => {
+    if (!connected) throw new Error("Network failure");
+    held = event.pressed;
+  }, () => state);
+  app.run("pressKey('power', 'keyboard:KeyP')");
+  await app.run("keyQueue");
+  const oldPoll = deferred();
+  state = oldPoll.promise;
+  const pending = app.run("refreshState()");
+  connected = false;
+  app.window.listeners.get("pagehide")();
+  await new Promise(setImmediate);
+  assert.equal(held, true);
+  state = emptyState();
+  oldPoll.resolve(state);
+  await pending;
+  assert.equal(app.run("failedReleases.size"), 1, "A late hidden-page poll must retain failed cleanup");
+  connected = true;
+  app.window.listeners.get("pageshow")({ persisted: true });
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  assert.equal(held, false);
+  assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 2]);
+});
+
 test("an epoch advance cancels old queued and submitted keys without waiting or reviving them", async () => {
   const press = deferred();
   const app = await fixture((body) => body.sequence === 1 ? press.promise : undefined);
@@ -294,6 +374,72 @@ test("a stale key response advances the epoch and cancels the queued tap without
   assert.equal(app.run("keyEpoch"), 1);
   assert.equal(app.run("heldSources.size + submittedKeys.size"), 0);
   assert.ok(app.buttons.every((button) => !button.classes.has("held")));
+});
+
+test("server restart replaces equal or lower epochs without reviving old key requests", async () => {
+  for (const epoch of [0, 7]) {
+    let state = { ...emptyState(), key_epoch: epoch, handset: { model: "9575" }, firmware: { name: "old session" } };
+    const press = deferred();
+    const app = await fixture((event) => event.sequence === 1 ? press.promise : undefined, () => state);
+    app.run("pressKey('1', 'keyboard:Digit1')");
+    await Promise.resolve();
+    app.run("pressKey('2', 'keyboard:Digit2')");
+    const oldQueue = app.run("keyQueue");
+    state = { ...emptyState(), session_id: "b".repeat(32), handset: { model: "9555" }, firmware: { name: "new session" } };
+    await app.run("refreshState()");
+    assert.equal(app.run("sessionId"), state.session_id);
+    assert.equal(app.run("keyEpoch"), 0);
+    assert.equal(app.elements.get("firmware-name").textContent, "new session");
+    assert.equal(app.elements.get("brand-model").textContent, "9555");
+    assert.equal(app.run("heldSources.size + submittedKeys.size + failedReleases.size"), 0);
+    app.run("pressKey('1', 'keyboard:Digit1')");
+    await app.run("keyQueue");
+    press.resolve({ session_id: "a".repeat(32), key_epoch: 99 });
+    await oldQueue;
+    assert.equal(app.run("keyEpoch"), 0, "An old response cannot overwrite the new session's epoch");
+    assert.deepEqual(app.calls.map((call) => call.body), [
+      keyEvent(app, "1", true, 1, epoch), keyEvent(app, "1", true, 3, 0, state.session_id),
+    ]);
+    app.run("releaseKey('keyboard:Digit1')");
+    await app.run("keyQueue");
+    assert.deepEqual(app.calls.at(-1).body, keyEvent(app, "1", false, 4, 0, state.session_id));
+  }
+});
+
+test("old control and state replies cannot restore a replaced server session", async () => {
+  const mutation = deferred();
+  const oldPoll = deferred();
+  let state = emptyState();
+  const app = await fixture((body, url) => url === "/api/control" ? mutation.promise : undefined, () => state);
+  const action = app.run("action(element('run-button'), () => post('/api/control', {action:'run'}))");
+  state = oldPoll.promise;
+  const pending = app.run("refreshState()");
+  const replacement = { ...emptyState(), session_id: "b".repeat(32), firmware: { name: "new session" } };
+  app.context.replacement = replacement;
+  app.run("renderState(replacement)");
+  state = replacement;
+  oldPoll.resolve({ ...emptyState(), key_epoch: 99, firmware: { name: "old session" } });
+  await pending;
+  mutation.resolve({ session_id: "a".repeat(32), key_epoch: 100 });
+  await action;
+  assert.equal(app.run("sessionId"), replacement.session_id);
+  assert.equal(app.run("keyEpoch"), 0);
+  assert.equal(app.elements.get("firmware-name").textContent, "new session");
+});
+
+test("a session change discards failed releases instead of sending them to the replacement", async () => {
+  let state = emptyState();
+  const app = await fixture((event) => {
+    if (!event.pressed) throw new Error("Network failure");
+  }, () => state);
+  app.run("pressKey('power', 'keyboard:KeyP'); releaseKey('keyboard:KeyP')");
+  await app.run("keyQueue");
+  assert.equal(app.run("failedReleases.size"), 1);
+  state = { ...emptyState(), session_id: "b".repeat(32) };
+  await app.run("refreshState()");
+  await app.run("keyQueue");
+  assert.equal(app.calls.length, 2);
+  assert.equal(app.run("failedReleases.size"), 0);
 });
 
 test("pages have independent IDs and sequences regardless of other clients' generations", async () => {

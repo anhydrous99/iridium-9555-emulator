@@ -6,6 +6,7 @@ import re
 import tempfile
 import threading
 import time
+from uuid import uuid4
 
 from .assets import AssetError, BC5Assets
 from .board import ModemLink, SpiLink
@@ -54,6 +55,7 @@ class Session:
         self.keys = set()
         self.key_generations = {key: 0 for key in ALL_KEYS}
         self.key_epoch = 0
+        self.session_id = uuid4().hex
         self._key_clients = {}
         self._key_sources = {key: set() for key in ALL_KEYS}
         self.satellite = Satellite()
@@ -339,7 +341,8 @@ class Session:
             else:
                 raise ValueError("Unknown execution action")
             self.log("control", action)
-            return {"ok": True, "message": action, "key_epoch": self.key_epoch}
+            return {"ok": True, "message": action, "key_epoch": self.key_epoch,
+                    "session_id": self.session_id}
 
     def _clear_keys(self) -> None:
         self.keys.clear()
@@ -352,12 +355,12 @@ class Session:
 
     def key(self, key: str, pressed: bool, generation: int | None = None, *,
             client_id: str | None = None, sequence: int | None = None,
-            epoch: int | None = None) -> dict:
+            epoch: int | None = None, session_id: str | None = None) -> dict:
         if not isinstance(key, str) or type(pressed) is not bool:
             raise ValueError("Unknown key or invalid pressed state")
         if generation is not None and (type(generation) is not int or generation < 0):
             raise ValueError("generation must be a nonnegative integer")
-        browser = any(value is not None for value in (client_id, sequence, epoch))
+        browser = any(value is not None for value in (client_id, sequence, epoch, session_id))
         if browser:
             if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", client_id):
                 raise ValueError("client_id must contain 1 to 64 ASCII letters, digits, underscores or hyphens")
@@ -365,6 +368,9 @@ class Session:
                 raise ValueError("sequence must be an integer from 1 to 9007199254740991")
             if type(epoch) is not int or not 0 <= epoch <= 2**53 - 1:
                 raise ValueError("epoch must be a nonnegative safe integer")
+            if session_id is not None and (not isinstance(session_id, str)
+                                          or not re.fullmatch(r"[0-9a-f]{32}", session_id)):
+                raise ValueError("session_id must contain 32 lowercase hexadecimal digits")
             if generation is not None:
                 raise ValueError("Use either browser sequencing or legacy generation")
         with self._lock:
@@ -372,8 +378,10 @@ class Session:
             if key not in self.profile.keys:
                 raise ValueError("Unknown key for this handset")
             response = {"ok": True, "delivered": False, "key_epoch": self.key_epoch,
-                        "generation": self.key_generations[key]}
+                        "session_id": self.session_id, "generation": self.key_generations[key]}
             if browser:
+                if session_id is not None and session_id != self.session_id:
+                    return {**response, "message": "Stale key session ignored"}
                 if epoch != self.key_epoch:
                     return {**response, "message": "Stale key epoch ignored"}
                 if client_id not in self._key_clients:
@@ -441,7 +449,8 @@ class Session:
                 "recorded; initialize the application first")
             self.log("key", message)
             return {"ok": True, "delivered": delivered, "message": message,
-                    "generation": self.key_generations[key], "key_epoch": self.key_epoch}
+                    "generation": self.key_generations[key], "key_epoch": self.key_epoch,
+                    "session_id": self.session_id}
 
     def _button_input(self, key, pressed):
         worker = self.engines["avr"]
@@ -511,6 +520,7 @@ class Session:
                     "running": self.running, "keys": sorted(self.keys),
                     "key_generations": dict(self.key_generations),
                     "key_epoch": self.key_epoch,
+                    "session_id": self.session_id,
                     "satellite": self.satellite.state(), "events": list(self.events),
                     "asset": self.asset, "lcd": lcd, "ui_initialized": self.ui_initialized,
                     "processor_link": self.modem_link.state() if self.modem_link else {"connected": False},

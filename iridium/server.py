@@ -105,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
                                               allow_invalid_crc=self.server.allow_invalid_crc)
                 self.server.session.load(firmware)
                 response = {"ok": True, "message": f"Loaded {filename}", "firmware": firmware.describe(),
-                            "key_epoch": self.server.session.key_epoch}
+                            "key_epoch": self.server.session.key_epoch,
+                            "session_id": self.server.session.session_id}
             else:
                 if self.headers.get_content_type() != "application/json":
                     raise ValueError("Use application/json for control requests")
@@ -128,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/key":
             return session.key(data.get("key"), data.get("pressed"), data.get("generation"),
                                client_id=data.get("client_id"), sequence=data.get("sequence"),
-                               epoch=data.get("epoch"))
+                               epoch=data.get("epoch"), session_id=data.get("session_id"))
         if self.path == "/api/satellite":
             action = data.pop("action", None)
             return session.satellite_action(action, data)

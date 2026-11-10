@@ -96,6 +96,7 @@ class ProtocolTests(unittest.TestCase):
             for state_index, pins_index in ((2, 3), (5, 6)):
                 self.assertEqual(states[state_index]["_links"]["pins"], states[pins_index]["pins"])
                 self.assertEqual(states[state_index]["_links"]["inputs"], states[pins_index]["inputs"])
+                self.assertEqual(states[state_index]["_links"]["modem_power_rises"], states[pins_index]["modem_power_rises"])
             self.assertTrue(states[2]["_links"]["uart_empty"][0])
             self.assertEqual(states[4], {"accepted": 0, "values": [], "dropped": 0})
         states = exchange("bc5", bytes(0x310FBA), [
@@ -104,6 +105,74 @@ class ProtocolTests(unittest.TestCase):
         ])
         self.assertEqual(states[1]["_links"]["serial"], states[2])
         self.assertEqual(states[3]["_links"]["serial"], states[4])
+
+    def test_managed_modem_capture_discards_only_output_before_the_last_power_edge(self):
+        for model, size, ddr, port, mask, uart in (
+                ("9555", 8678, 0x21, 0x22, 0x20, 0),
+                ("9575", 14296, 0x27, 0x28, 0x10, 3)):
+            base = 0x130 if uart == 3 else 0xC0
+            load = 0xE000 | ((mask & 0xF0) << 4)
+            words = [load, 0x9300, ddr, 0x9300, port, 0xE108, 0x9300, base + 1]
+            words += [0xE401, 0x9300, base + 6] + [0] * 200
+            words += [0xE000, 0x9300, port, load, 0x9300, port]
+            words += [0xE402, 0x9300, base + 6, 0xCFFF]
+            code = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+            for mode, commands, expected in (
+                    ("raw", [{"op": "uart_io", "port": uart}], [65, 66]),
+                    ("managed", [{"op": "uart_io", "port": uart, "modem_link": True}], [66]),
+                    ("partial", [{"op": "uart_tx", "port": uart},
+                                 {"op": "uart_io", "port": uart, "modem_link": True}], [66])):
+                with self.subTest(model=model, mode=mode):
+                    states = exchange("avr", code, [{"op": "run", "steps": 1000}, *commands,
+                                                   {"op": "warm_reset"}, {"op": "run", "steps": 1000},
+                                                   {"op": "reset"}, {"op": "run", "steps": 1000}], model=model)
+                    self.assertEqual(states[1]["_links"]["modem_power_rises"], 2)
+                    self.assertEqual(states[1 + len(commands)]["values"], expected)
+                    self.assertEqual(states[-3]["_links"]["modem_power_rises"], 4)
+                    self.assertEqual(states[-1]["_links"]["modem_power_rises"], 6)
+
+    def test_managed_modem_capture_discards_an_interrupted_transmit_frame(self):
+        for model, size, ddr, port, mask, uart in (
+                ("9555", 8678, 0x21, 0x22, 0x20, 0),
+                ("9575", 14296, 0x27, 0x28, 0x10, 3)):
+            base = 0x130 if uart == 3 else 0xC0
+            load = 0xE000 | ((mask & 0xF0) << 4)
+            words = [load, 0x9300, ddr, 0x9300, port, 0xE108, 0x9300, base + 1]
+            words += [0xE401, 0x9300, base + 6]  # Start A; pulse power before its frame completes.
+            words += [0xE000, 0x9300, port, load, 0x9300, port]
+            words += [0] * 200 + [0xE402, 0x9300, base + 6, 0xCFFF]  # Send B after the pulse.
+            code = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+            for managed in (False, True):
+                for early_drain in (False, True):
+                    with self.subTest(model=model, managed=managed, early_drain=early_drain):
+                        drain = {"op": "uart_io", "port": uart, "modem_link": managed}
+                        commands = [{"op": "run", "steps": 11}, drain] if early_drain else []
+                        states = exchange("avr", code, [*commands, {"op": "run", "steps": 1000}, drain], model=model)
+                        if early_drain:
+                            self.assertEqual(states[1]["_links"]["modem_power_rises"], 2)
+                            self.assertEqual(states[2]["values"], [])
+                        self.assertEqual(states[-1]["values"], [66] if managed else [65, 66])
+
+    def test_modem_power_edge_preserves_completed_rx_and_cancels_pending_line_bytes(self):
+        for model, size, ddr, port, mask, uart in (
+                ("9555", 8678, 0x21, 0x22, 0x20, 0),
+                ("9575", 14296, 0x27, 0x28, 0x10, 3)):
+            with self.subTest(model=model):
+                base = 0x130 if uart == 3 else 0xC0
+                load = 0xE000 | ((mask & 0xF0) << 4)
+                words = [load, 0x9300, ddr, 0x9300, port, 0xE100, 0x9300, base + 1]
+                words += [0x9100, 0x200, 0xFF00, 0xCFFC]  # Wait for the host's RAM flag.
+                words += [0xE000, 0x9300, port, load, 0x9300, port, 0x9120, base + 6]
+                words += [0] * 600 + [0x9130, base, 0xCFFF]  # Read status after any remaining frames.
+                code = b"".join(word.to_bytes(2, "little") for word in words).ljust(size, b"\xff")
+                states = exchange("avr", code, [
+                    {"op": "run", "steps": 20}, {"op": "uart_io", "port": uart, "rx": [80, 81, 82]},
+                    {"op": "run", "steps": 100},  # One frame received, one active, one still queued.
+                    {"op": "write", "address": 0x200, "values": [1]}, {"op": "run", "steps": 1000},
+                ], model=model)
+                self.assertEqual(states[2]["accepted"], 3)
+                self.assertEqual(states[-1]["registers"][18], 80)
+                self.assertEqual(states[-1]["registers"][19] & 0x80, 0)
 
     def test_sim_pin_protocol_rejects_wrong_images_and_invalid_arguments_without_mutation(self):
         for image, size in (("ptt", 0xA7BF8), ("bc5", 0x310FBA), ("avr", 0x4000)):
