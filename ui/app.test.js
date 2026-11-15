@@ -59,7 +59,16 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function fixture(keyResponse, stateResponse) {
+function memoryStorage() {
+  const values = new Map();
+  return {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+}
+
+async function fixture(keyResponse, stateResponse, sessionStorage = memoryStorage()) {
   const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map((match) => [match[1], new Element()]));
   const buttons = [...html.matchAll(/data-key="([^"]+)"/g)].map((match) => {
     const button = new Element();
@@ -95,7 +104,7 @@ async function fixture(keyResponse, stateResponse) {
   const requests = [];
   const stateCalls = [];
   const context = vm.createContext({
-    document, window, Intl, crypto, btoa, AbortSignal: { timeout: () => undefined },
+    document, window, Intl, crypto, btoa, sessionStorage, AbortSignal: { timeout: () => undefined },
     setTimeout: () => 1, clearTimeout() {},
     fetch: async (url, options = {}) => {
       if (url === "/api/state") {
@@ -349,6 +358,122 @@ test("returning from pagehide retries cleanup lost while the page was offline", 
   await app.run("keyQueue");
   assert.equal(held, false);
   assert.deepEqual(app.calls.map((call) => call.body.sequence), [1, 2, 2]);
+});
+
+test("a fresh page recovers lost cleanup without releasing other pages' keys", async () => {
+  const storage = memoryStorage();
+  const owners = new Set();
+  const sequences = new Map();
+  const cleanup = deferred();
+  let online = true;
+  let recovering = false;
+  let oldClient;
+  const handle = async (event) => {
+    if (!online) throw new Error("Offline");
+    if (recovering && event.client_id === oldClient) await cleanup.promise;
+    const id = `${event.client_id}:${event.key}`;
+    if (event.sequence > (sequences.get(id) || 0)) {
+      sequences.set(id, event.sequence);
+      if (event.pressed) owners.add(event.client_id);
+      else owners.delete(event.client_id);
+    }
+    return { delivered: true };
+  };
+  const old = await fixture(handle, undefined, storage);
+  const peer = await fixture(handle);
+  oldClient = old.run("clientId");
+  old.run("pressKey('power', 'keyboard:KeyP')");
+  peer.run("pressKey('power', 'keyboard:KeyP')");
+  await Promise.all([old.run("keyQueue"), peer.run("keyQueue")]);
+  online = false;
+  old.window.listeners.get("pagehide")();
+  await new Promise(setImmediate);
+  assert.equal(owners.size, 2);
+  // Another reload while offline must retain the original cleanup identity.
+  const offline = await fixture(handle, undefined, storage);
+  await new Promise(setImmediate);
+  offline.window.listeners.get("pagehide")();
+  online = true;
+  recovering = true;
+  const fresh = await fixture(handle, undefined, storage);
+  assert.notEqual(fresh.run("clientId"), oldClient);
+  assert.equal(fresh.calls.length, 1, "Only one recovery request may be pending");
+  assert.deepEqual(fresh.calls[0].body, old.calls.at(-1).body);
+  fresh.run("pressKey('power', 'keyboard:KeyP')");
+  await fresh.run("keyQueue");
+  cleanup.resolve();
+  await new Promise(setImmediate);
+  assert.deepEqual(owners, new Set([peer.run("clientId"), fresh.run("clientId")]));
+  fresh.run("releaseKey('keyboard:KeyP')");
+  await fresh.run("keyQueue");
+  assert.deepEqual(owners, new Set([peer.run("clientId")]));
+  peer.run("releaseKey('keyboard:KeyP')");
+  await peer.run("keyQueue");
+  assert.equal(owners.size, 0);
+  assert.equal(storage.getItem("iridium-key-releases"), null);
+});
+
+test("a previous page's late cleanup response preserves the new page's failed release", async () => {
+  const storage = memoryStorage();
+  const response = deferred();
+  const old = await fixture((event) => event.pressed ? undefined : response.promise, undefined, storage);
+  old.run("pressKey('1', 'keyboard:Digit1')");
+  await old.run("keyQueue");
+  old.window.listeners.get("pagehide")();
+  const fresh = await fixture((event) => {
+    if (event.client_id !== old.run("clientId") && !event.pressed) throw new Error("Offline");
+  }, undefined, storage);
+  await new Promise(setImmediate);
+  fresh.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+  await fresh.run("keyQueue");
+  const saved = storage.getItem("iridium-key-releases");
+  assert.equal(JSON.parse(saved)[0].client_id, fresh.run("clientId"));
+  response.resolve();
+  await new Promise(setImmediate);
+  assert.equal(storage.getItem("iridium-key-releases"), saved);
+  const next = await fixture(undefined, undefined, storage);
+  await new Promise(setImmediate);
+  assert.equal(next.calls[0].body.client_id, fresh.run("clientId"));
+  assert.equal(storage.getItem("iridium-key-releases"), null);
+});
+
+test("reload discards stored cleanup after reset or server replacement", async () => {
+  for (const state of [{ ...emptyState(), key_epoch: 1 }, { ...emptyState(), session_id: "b".repeat(32) }]) {
+    const storage = memoryStorage();
+    const old = await fixture((event) => {
+      if (!event.pressed) throw new Error("Offline");
+    }, undefined, storage);
+    old.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+    await old.run("keyQueue");
+    assert.notEqual(storage.getItem("iridium-key-releases"), null);
+    const fresh = await fixture(undefined, () => state, storage);
+    assert.equal(fresh.calls.length, 0);
+    assert.equal(storage.getItem("iridium-key-releases"), null);
+  }
+});
+
+test("malformed or unavailable browser storage does not break key release retries", async () => {
+  const invalid = memoryStorage();
+  invalid.setItem("iridium-key-releases", "not JSON");
+  const denied = {
+    getItem() { throw new Error("Storage denied"); },
+    setItem() { throw new Error("Storage denied"); },
+    removeItem() { throw new Error("Storage denied"); },
+  };
+  for (const storage of [invalid, denied]) {
+    let held = false;
+    let fail = true;
+    const app = await fixture((event) => {
+      if (!event.pressed && fail) { fail = false; throw new Error("Offline"); }
+      held = event.pressed;
+    }, undefined, storage);
+    app.run("pressKey('1', 'keyboard:Digit1'); releaseKey('keyboard:Digit1')");
+    await app.run("keyQueue");
+    assert.equal(held, true);
+    await app.run("refreshState()");
+    await app.run("keyQueue");
+    assert.equal(held, false);
+  }
 });
 
 test("an epoch advance cancels old queued and submitted keys without waiting or reviving them", async () => {

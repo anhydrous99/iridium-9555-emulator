@@ -6,6 +6,8 @@ const keyButtons = new Map([...document.querySelectorAll("[data-key]")].map((but
 const heldSources = new Map();
 const submittedKeys = new Map();
 const pendingReleases = new Map();
+const recoveringReleases = new Set();
+const releaseStorageKey = "iridium-key-releases";
 const clientId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
 const pendingActions = new Set();
 let latestState = null;
@@ -58,6 +60,48 @@ async function request(path, options = {}) {
 
 function post(path, body, options = {}) {
   return request(path, { ...options, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+function storedReleases() {
+  try {
+    const events = JSON.parse(sessionStorage.getItem(releaseStorageKey) || "[]");
+    return Array.isArray(events) ? events.filter((event) => event && keyButtons.has(event.key)
+      && event.pressed === false && typeof event.client_id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(event.client_id)
+      && Number.isSafeInteger(event.sequence) && event.sequence > 0
+      && Number.isSafeInteger(event.epoch) && event.epoch >= 0
+      && typeof event.session_id === "string" && /^[0-9a-f]{32}$/.test(event.session_id)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeRelease(event, acknowledged = false) {
+  // Read fresh: a previous page's late response must preserve newer records.
+  const events = storedReleases().filter((saved) => !(saved.client_id === event.client_id && saved.key === event.key
+    && (!acknowledged || saved.session_id === event.session_id && saved.epoch === event.epoch && saved.sequence <= event.sequence)));
+  if (!acknowledged) events.push(event);
+  try {
+    if (events.length) sessionStorage.setItem(releaseStorageKey, JSON.stringify(events));
+    else sessionStorage.removeItem(releaseStorageKey);
+  } catch {
+    // Browser storage can be disabled; the current page still retries in memory.
+  }
+}
+
+function recoverReleases() {
+  if (closed) return;
+  for (const event of storedReleases()) {
+    if (event.session_id !== sessionId || event.epoch !== keyEpoch) {
+      storeRelease(event, true);
+      continue;
+    }
+    const ownerKey = `${event.client_id}:${event.key}`;
+    if (event.client_id === clientId || recoveringReleases.has(ownerKey)) continue;
+    recoveringReleases.add(ownerKey);
+    post("/api/key", event, { keepalive: true }).then(() => storeRelease(event, true))
+      .catch((error) => { element("key-feedback").textContent = `${event.key}: ${error.message}`; })
+      .finally(() => recoveringReleases.delete(ownerKey));
+  }
 }
 
 function node(tag, className, text) {
@@ -422,6 +466,7 @@ async function refreshState(afterMutation = false) {
     element("connection-dot").classList.add("connected");
     element("connection-status").textContent = "Local engine connected";
     renderState(state);
+    recoverReleases();
     for (const pending of pendingReleases.values()) {
       if (!closed && pending.retry) {
         pending.retry = false;
@@ -484,7 +529,9 @@ function submitKey(event, retry = false) {
     renderApplicationStatus(latestState);
     if (!latestState?.running) element("runtime-status").textContent = "PROCESSING KEY";
     try {
+      if (!pressed) storeRelease(event);
       const result = await post("/api/key", event, { keepalive: true });
+      if (!pressed) storeRelease(event, true);
       if (version !== keyQueueVersion) return;
       if (result.session_id !== sessionId) {
         cancelLocalKeys();
@@ -727,7 +774,9 @@ window.addEventListener("pagehide", () => {
     const event = { key, pressed: false, settle: true, client_id: clientId, sequence: ++keySequence, epoch: previous.epoch, session_id: previous.session_id };
     const pending = { event, retry: true };
     pendingReleases.set(key, pending);
+    storeRelease(event);
     post("/api/key", event, { keepalive: true }).then((result) => {
+      storeRelease(event, true);
       if (pendingReleases.get(key) === pending && result.session_id === event.session_id && result.key_epoch === event.epoch) {
         pendingReleases.delete(key);
       }

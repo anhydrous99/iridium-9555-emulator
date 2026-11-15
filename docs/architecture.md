@@ -279,7 +279,12 @@ input state. Failed releases retry after successful polling with their original
 sequence and epoch; a newer key event or an epoch/session change cancels pending
 retries. Presses are never replayed. Navigation cancels unsent events and immediately
 sends keepalive releases with newer sequences and the submitted presses' epochs.
-Unacknowledged cleanup is retained for retry after a cached page is restored.
+Releases are saved to browser session storage before sending. After reload or
+navigation back, successful state polling retries older pages' releases with their
+original client ID, sequence, session and epoch, preserving other pages' ownership.
+Acknowledgments remove only matching records, and a reset or server replacement
+discards stale cleanup. If browser storage is disabled, retries remain available
+within the current page, including restoration from the browser's back/forward cache.
 Session IDs contain 32 lowercase hexadecimal digits. Older API callers may omit
 `session_id`, retaining epoch-only sequencing.
 Client IDs contain 1–64 ASCII letters, digits, underscores or hyphens; sequences
