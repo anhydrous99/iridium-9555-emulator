@@ -14,8 +14,7 @@ UNLOCK_PROMPT = "6980b756650e61476d89955e719c3a0ecc7f844f7e11d464934b712d7e19d7d
 KEYPAD_UNLOCKED = "69f94dcaeae4fe8f4acbf4ea6fc81ba95583f5cd4eddee55aa5330f063d425e8"
 NUMBER_PLUS_TWELVE = "0202fd2bdaff65347166c5507d64b6947fe26117599393a717de476a01e50093"
 PHONE_LOCK_MENU = "398b36e74f824e4fe967d2be48c5e532e9f9919db04ee7b91d56f3df39be17b7"
-# Measured on 9555 firmware only. No 9575 image was available: on that model
-# this picture and the alerts required after the unlock are unmeasured.
+# Measured on both handsets: the 9555 and the 9575 return to this picture.
 PHONE_LOCK_MENU_ON_DISABLE = "a4f878f18a587f98e4d38a5746bbacd686dd7f44262207eef63a036f8d7697b9"
 PHONE_PIN = "1a922175bbb2b084086dbc6ff0798282f0462a0c41be46be883b962cb24b202c"
 FOUR_MASKED_PIN_DIGITS = "aeb4fa4901c1c0c6629b3aa96128630e8117fa30a8182fcaef3f54f953c25fc5"
@@ -133,7 +132,7 @@ class SharedSecurityChecks:
         enter_pin("1234")
         # No card is fitted: with the code accepted, this start goes on to the
         # same alert that the first start requires, and only then to home.
-        # (9555 measured; what a 9575 shows after the unlock is unmeasured.)
+        # (Measured on both handsets; a 9575 also repeats its IERCC alert here.)
         home_after_known_modem_alerts()
         handset.wait_screen(HOME_CAPTIONS, first=113, last=128)
         enter_security()
