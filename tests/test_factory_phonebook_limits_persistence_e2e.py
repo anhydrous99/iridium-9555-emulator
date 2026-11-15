@@ -65,6 +65,19 @@ class MaximumFieldPersistenceChecks(FactoryModemChecks):
                 while self.field_pixels(state, self.cursor_field) == before and elapsed < 2000000:
                     state = self.handset.step(50000)
                     elapsed += 50000
+                # The handset sends a changed field to the display page by
+                # page (8 pixel rows each), so the first changed sample can lie
+                # between two pages of one update. Within the same 2M limit,
+                # wait until two consecutive samples show the same field: the
+                # caller then reads the completed picture, not a half-drawn one.
+                shown = self.field_pixels(state, self.cursor_field)
+                while shown != before and elapsed < 2000000:
+                    state = self.handset.step(50000)
+                    elapsed += 50000
+                    latest = self.field_pixels(state, self.cursor_field)
+                    if latest == shown:
+                        break
+                    shown = latest
                 self.cursor_observations.append({"field": self.cursor_field, "wait": elapsed,
                                                  "visible_change": self.field_pixels(state, self.cursor_field) != before})
             elif settle <= 500000:

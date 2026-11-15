@@ -49,11 +49,22 @@ class PatientMessagesDraftChecks:
     new_numeric = _Limits.new_numeric
     save_and_read_every_character = _Limits.save_and_read_every_character
 
+    def modem_steps(self):
+        return next(cpu["steps"] for cpu in self.handset.state()["processors"]
+                    if cpu["image"] == "trx")
+
     def enter_one(self, key, remaining):
         _Limits.enter_one(self, key, remaining)
         # All processors advance normally with the real contact released.
         # No callback, queue consumer, internal ready flag or modem is changed.
+        before = self.modem_steps()
         self.handset.step(2000000)
+        # The aliased budget check allows the rapid journey 5B instructions.
+        # This released interval is this variant's own addition to that journey
+        # (1002 accepted keys in the 1000-character case), so the instructions
+        # the modem really executed in it, read from its own step counter, are
+        # added to the allowance; the firmware's share of it is unchanged.
+        self._origin += self.modem_steps() - before
         self.healthy()
         self.input_holds[-1]["additional_patient_released_steps"] = 2000000
 
