@@ -15,6 +15,7 @@ import threading
 
 from iridium.assets import Bitmap
 from iridium.firmware import load_firmware
+from iridium.profiles import rebuilt_firmware_hashes
 from iridium.server import Server
 from iridium.session import Session
 
@@ -56,10 +57,13 @@ def factory_firmware(model, directory, *, modem=False):
         raise ValueError(f"Factory firmware directory does not exist: {directory}")
     processors = ("bc5", "avr", "trx") if modem else ("bc5", "avr")
     images = [load_firmware(directory, image=image, model=model)[0] for image in processors]
+    # Firmware rebuilt from source is accepted only by the operator's explicit manifest (IRIDIUM_REBUILT_FIRMWARE).
+    rebuilt = rebuilt_firmware_hashes().get(model, {})
     for image in images:
         expected = FACTORY_HASHES[model][image.image]
-        if image.payload_sha256 != expected:
-            raise ValueError(f"{model} {image.image} is not the pinned factory image: "
+        if image.payload_sha256 not in (expected, rebuilt.get(image.image)):
+            approved = " or the approved rebuilt image" if rebuilt else ""
+            raise ValueError(f"{model} {image.image} is not the pinned factory image{approved}: "
                              f"expected {expected}, got {image.payload_sha256}")
     return images
 

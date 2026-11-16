@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
 from factory_handset import FIRMWARE_ENV, factory_firmware, require_factory_host
+from iridium.profiles import rebuilt_firmware_hashes
 
 
 class FactoryResult(unittest.TextTestResult):
@@ -70,6 +71,8 @@ def main():
                               for test, detail in result.expectedFailures],
         "unexpected_successes": [test.id() for test in result.unexpectedSuccesses],
         "firmware": images,
+        # Empty unless IRIDIUM_REBUILT_FIRMWARE approved rebuilt images for this run.
+        "rebuilt_firmware": rebuilt_firmware_hashes(),
         "scope": "HTTP to native factory BC5/AVR and telephony TRX where requested to LCD; supplied GPS receiver bytes included, RF acquisition and satellite service excluded",
     }, indent=2) + "\n")
     print(f"Factory E2E report: {report}", file=sys.stderr)

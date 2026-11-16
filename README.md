@@ -248,6 +248,29 @@ fix type is read in place of the validity flags, accepting an invalid 3D
 position and rejecting a valid 2D position. See the
 [solution-validity evidence](docs/gps-solution-validity.md).
 
+### Firmware rebuilt from source
+
+The factory fixtures and the release-version provisioning accept only the pinned HT25003 and HL25003 payloads. To
+run the same journeys on firmware rebuilt from source, for example with source-level corrections, name a JSON
+manifest of its payload hashes in `IRIDIUM_REBUILT_FIRMWARE`:
+
+```json
+{"9555": {"bc5": "<sha256>", "avr": "<sha256>", "trx": "<sha256>"},
+ "9575": {"bc5": "<sha256>", "avr": "<sha256>", "trx": "<sha256>"}}
+```
+
+```sh
+IRIDIUM_REBUILT_FIRMWARE=/path/to/rebuilt.json \
+IRIDIUM_TEST_FIRMWARE=/path/to/built/9555 IRIDIUM_TEST_9575_FIRMWARE=/path/to/built/9575 ./test
+```
+
+Each hash is the `payload_sha256` of the image report: the processor payload without its container. An image
+listed for a handset and processor is treated like the released image there: `--initialize-ui` provisions the
+release-version record for it, `./test` and `./test-factory` accept it, and the factory report records the manifest
+under `rebuilt_firmware`. Images that are neither pinned nor listed are refused as before, and a model that the
+manifest does not name keeps its pins. The manifest is the operator's statement for one run; the emulator makes no
+claim about a listed image.
+
 GitHub Actions runs the firmware-free suite on pushes and pull requests with
 Python 3.10, Node 22, and checksum-verified Zig 0.17.0.
 

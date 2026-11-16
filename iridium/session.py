@@ -16,7 +16,7 @@ from .firmware import Firmware
 from .fixtures import GPSPeer, SIMPeer, SyntheticSIM
 from .lcd import ST7541
 from .offline_modem import OfflineModem
-from .profiles import KEY_CODES, PROFILES
+from .profiles import KEY_CODES, PROFILES, rebuilt_firmware_hashes
 from .satellite import Satellite
 
 
@@ -830,12 +830,18 @@ class Session:
             response = self._request(worker, "call_resume", steps=quantum)
 
     def _provision_release_version(self, worker) -> None:
+        # An image counts as release firmware if it is the pinned factory payload or, by explicit opt-in, the
+        # payload that IRIDIUM_REBUILT_FIRMWARE lists for this handset and processor.
+        rebuilt = rebuilt_firmware_hashes().get(self.profile.model, {})
+        loaded = [(image, digest) for image, digest in zip(("bc5", "avr", "trx"), self.profile.release_hashes)
+                  if image in self.firmware]
         if self.modem_image == "ptt" or any(
-                self.firmware[image].payload_sha256 != digest
-                for image, digest in zip(("bc5", "avr", "trx"), self.profile.release_hashes)
-                if image in self.firmware):
+                self.firmware[image].payload_sha256 not in (digest, rebuilt.get(image))
+                for image, digest in loaded):
             self.log("firmware", "Factory release metadata not provisioned for modified images or PTT")
             return
+        if any(self.firmware[image].payload_sha256 != digest for image, digest in loaded):
+            self.log("firmware", "Release metadata provisioned for rebuilt firmware approved by IRIDIUM_REBUILT_FIRMWARE")
         # Replay the updater's PSK_VERSION input; original firmware owns the flash writes.
         words = [ord(char) for char in self.profile.release_manifest] + [0]
         buffer = self._call(worker, 0xFD3A, al=len(words), steps=100000)["last_call"]["al"]

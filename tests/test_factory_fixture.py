@@ -19,7 +19,7 @@ from factory_handset import (
     FACTORY_HASHES, FIRMWARE_ENV, ROOT, FactoryHandset, factory_firmware, require_factory_host,
 )
 from iridium.firmware import parse_firmware
-from iridium.profiles import PROFILES
+from iridium.profiles import PROFILES, REBUILT_FIRMWARE_ENV, rebuilt_firmware_hashes
 
 
 class FactoryFixtureTests(unittest.TestCase):
@@ -42,6 +42,56 @@ class FactoryFixtureTests(unittest.TestCase):
             (directory / filename).write_bytes(data)
             hashes[image] = sha256(data).hexdigest()
         return directory, hashes
+
+    def rebuilt_manifest(self, entries):
+        path = self.directory / "rebuilt.json"
+        path.write_text(entries if isinstance(entries, str) else json.dumps(entries))
+        return patch.dict(os.environ, {REBUILT_FIRMWARE_ENV: str(path)})
+
+    def test_rebuilt_firmware_is_accepted_only_through_the_operators_manifest(self):
+        for model in PROFILES:
+            directory, hashes = self.images(model)
+            other = "9575" if model == "9555" else "9555"
+            with self.subTest(model=model, case="no manifest"), patch.dict(os.environ):
+                os.environ.pop(REBUILT_FIRMWARE_ENV, None)
+                self.assertEqual(rebuilt_firmware_hashes(), {})
+                with self.assertRaisesRegex(ValueError, f"{model} bc5 is not the pinned factory image: expected"):
+                    factory_firmware(model, directory, modem=True)
+            with self.subTest(model=model, case="listed"), self.rebuilt_manifest({model: hashes}):
+                self.assertEqual([image.image for image in factory_firmware(model, directory, modem=True)],
+                                 ["bc5", "avr", "trx"])
+                # A further change to a listed image is not covered by the manifest.
+                path = directory / "trx_seg1_0x10000.bin"
+                original = path.read_bytes()
+                path.write_bytes(b"\x04" + original[1:])
+                try:
+                    with self.assertRaisesRegex(
+                            ValueError, f"{model} trx is not the pinned factory image or the approved rebuilt image"):
+                        factory_firmware(model, directory, modem=True)
+                finally:
+                    path.write_bytes(original)
+            # A manifest for the other handset approves nothing here.
+            with self.subTest(model=model, case="other handset"), \
+                    self.rebuilt_manifest({other: dict.fromkeys(("bc5", "avr", "trx"), "0" * 64)}):
+                with self.assertRaisesRegex(ValueError, f"{model} bc5 is not the pinned factory image: expected"):
+                    factory_firmware(model, directory, modem=True)
+
+    def test_malformed_rebuilt_firmware_manifest_is_refused(self):
+        good = dict.fromkeys(("bc5", "avr", "trx"), "0" * 64)
+        for label, entries in (
+                ("not JSON", "{"), ("not an object", "[]"), ("empty", {}), ("unknown handset", {"9999": good}),
+                ("missing image", {"9555": {"bc5": "0" * 64, "avr": "0" * 64}}),
+                ("extra image", {"9555": good | {"ptt": "0" * 64}}),
+                ("short hash", {"9555": good | {"trx": "0" * 63}}),
+                ("upper-case hash", {"9555": good | {"trx": "A" * 64}}),
+                ("not a string", {"9555": good | {"trx": 5}})):
+            with self.subTest(case=label), self.rebuilt_manifest(entries):
+                with self.assertRaisesRegex(ValueError, REBUILT_FIRMWARE_ENV):
+                    rebuilt_firmware_hashes()
+        with self.subTest(case="missing file"), \
+                patch.dict(os.environ, {REBUILT_FIRMWARE_ENV: str(self.directory / "absent.json")}):
+            with self.assertRaisesRegex(ValueError, REBUILT_FIRMWARE_ENV):
+                rebuilt_firmware_hashes()
 
     def test_factory_host_rejects_unsupported_system_before_starting_workers(self):
         for platform in ("darwin", "win32"):

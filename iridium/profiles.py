@@ -5,6 +5,10 @@ See docs/9575-firmware.md and docs/hardware-evidence.md for their evidence.
 """
 
 from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import re
 
 
 KEY_CODES = {str(n): 0x64 + n for n in range(10)} | {
@@ -104,3 +108,32 @@ PROFILES = {
                         "8b2e5df7b59d04f526facfeb422939ef09d5df11603da0f7ad207262fd30ddc2",
                         "4f7939844993b28cae3031fa3da1b5bdb5c9546045cae1e0f6e42dd2d591e54b")),
 }
+
+
+REBUILT_FIRMWARE_ENV = "IRIDIUM_REBUILT_FIRMWARE"
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def rebuilt_firmware_hashes() -> dict[str, dict[str, str]]:
+    """Payload hashes of firmware rebuilt from source that the operator approves for a handset.
+
+    Only the pinned factory releases are accepted as release firmware unless IRIDIUM_REBUILT_FIRMWARE names a JSON
+    manifest ``{"<model>": {"bc5": <sha256>, "avr": <sha256>, "trx": <sha256>}}``. An image listed there is
+    treated like the released image of that processor: start-up provisions the release-version record for it and
+    the factory test fixture accepts it. This is an explicit opt-in for one run; it makes no claim about the image.
+    """
+    path = os.environ.get(REBUILT_FIRMWARE_ENV)
+    if not path:
+        return {}
+    problem = f"{REBUILT_FIRMWARE_ENV}: {path} must map a supported handset model to the SHA-256 payload hashes of bc5, avr and trx"
+    try:
+        manifest = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{problem} ({error})") from error
+    if not isinstance(manifest, dict) or not manifest:
+        raise ValueError(problem)
+    for model, images in manifest.items():
+        if (model not in PROFILES or not isinstance(images, dict) or set(images) != {"bc5", "avr", "trx"}
+                or not all(isinstance(digest, str) and _SHA256.match(digest) for digest in images.values())):
+            raise ValueError(problem)
+    return manifest
