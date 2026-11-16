@@ -1,12 +1,15 @@
 from dataclasses import replace
+import json
+import os
 from pathlib import Path
+import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
 
 from iridium.engine import EngineError
 from iridium.firmware import parse_firmware
-from iridium.profiles import PROFILES
+from iridium.profiles import PROFILES, REBUILT_FIRMWARE_ENV
 from iridium.session import Session
 
 
@@ -208,6 +211,28 @@ class SessionTests(unittest.TestCase):
         self.session._call.assert_any_call(worker, profile.version_store, al=0x2B3, ah=0xA100,
                                           stack=[len(profile.release_manifest)], steps=1000000)
         self.session._call.assert_called_with(worker, 0x6DFE, al=0xA100, steps=100000)
+
+    def test_rebuilt_firmware_listed_in_the_operators_manifest_receives_release_metadata(self):
+        worker, _ = self.release_fixture()
+        hashes = {image: self.session.firmware[image].payload_sha256 for image in ("bc5", "avr", "trx")}
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "rebuilt.json"
+            manifest.write_text(json.dumps({"9555": hashes}))
+            # The pinned release hashes do not match these images: only the manifest approves them.
+            with patch.dict(os.environ, {REBUILT_FIRMWARE_ENV: str(manifest)}):
+                self.session._provision_release_version(worker)
+            self.assertIn(("write", {"address": 0xA100,
+                                   "values": [ord(char) for char in self.session.profile.release_manifest] + [0]}),
+                          worker.calls)
+            self.assertTrue(any(REBUILT_FIRMWARE_ENV in event["message"] for event in self.session.events))
+            # Listing another payload for one processor approves nothing.
+            worker.calls.clear()
+            self.session._call.reset_mock()
+            manifest.write_text(json.dumps({"9555": hashes | {"trx": "0" * 64}}))
+            with patch.dict(os.environ, {REBUILT_FIRMWARE_ENV: str(manifest)}):
+                self.session._provision_release_version(worker)
+            self.session._call.assert_not_called()
+            self.assertFalse(any(op == "write" for op, _ in worker.calls))
 
     def test_modified_component_payloads_and_ptt_do_not_receive_factory_metadata(self):
         worker, profile = self.release_fixture()
